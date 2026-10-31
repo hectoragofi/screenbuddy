@@ -42,21 +42,80 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
             "serverInfo": {"name": "screenbuddy", "version": env!("CARGO_PKG_VERSION")}
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": [{
-            "name": "draw",
-            "description": crate::llm::DRAW_DESC,
-            "inputSchema": crate::llm::draw_schema()
-        }]})),
+        "tools/list" => {
+            let mut tools = vec![json!({
+                "name": "draw",
+                "description": crate::llm::DRAW_DESC,
+                "inputSchema": crate::llm::draw_schema()
+            })];
+            if desktop_exe().is_some() {
+                tools.push(json!({
+                    "name": "desktop",
+                    "description": crate::desktop::DESC,
+                    "inputSchema": crate::desktop::schema()
+                }));
+            }
+            Ok(json!({"tools": tools}))
+        }
         "tools/call" => {
             let p = &req["params"];
-            if p["name"] != "draw" {
-                return Err((-32602, format!("unknown tool {}", p["name"])));
-            }
-            let (text, is_error) = validate(&p["arguments"]);
+            let (text, is_error) = match p["name"].as_str() {
+                Some("draw") => validate(&p["arguments"]),
+                Some("desktop") => desktop(&p["arguments"]),
+                _ => return Err((-32602, format!("unknown tool {}", p["name"]))),
+            };
             Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
         }
         m => Err((-32601, format!("method not found: {m}"))),
     }
+}
+
+fn desktop_exe() -> Option<std::path::PathBuf> {
+    crate::config::load().0.desktop_exe()
+}
+
+/// Runs an agent-desktop command; actions are approved by the parent
+/// screenbuddy process over the loopback port it passed in the environment.
+fn desktop(input: &Value) -> (String, bool) {
+    let Some(exe) = desktop_exe() else {
+        return ("error: agent-desktop is not installed".into(), true);
+    };
+    let (args, intent) = match crate::desktop::parse(input) {
+        Ok(v) => v,
+        Err(e) => return (format!("error: {e}"), true),
+    };
+    if !crate::desktop::is_read_only(&args) && !ask_parent(&intent, &args.join(" ")) {
+        return (
+            "The user declined this action. Stop and tell them briefly.".into(),
+            true,
+        );
+    }
+    let out = crate::desktop::run(&exe, &args);
+    let ok = serde_json::from_str::<Value>(&out)
+        .ok()
+        .and_then(|v| v["ok"].as_bool())
+        .unwrap_or(true);
+    (out, !ok)
+}
+
+fn ask_parent(intent: &str, detail: &str) -> bool {
+    use std::io::{BufReader, Write};
+    let Some(port) = std::env::var("SCREENBUDDY_APPROVAL_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let req = json!({"intent": intent, "detail": detail}).to_string();
+    if writeln!(stream, "{req}").is_err() {
+        return false;
+    }
+    let mut reply = String::new();
+    let _ = BufReader::new(&stream).read_line(&mut reply);
+    reply.trim() == "allow"
 }
 
 fn validate(args: &Value) -> (String, bool) {

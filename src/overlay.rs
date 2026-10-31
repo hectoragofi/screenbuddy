@@ -41,7 +41,7 @@ pub struct Shape {
     pub color: [u8; 3],
 }
 
-const ACCENT: [u8; 3] = [255, 69, 58];
+const ACCENT: [u8; 3] = [10, 132, 255];
 
 fn parse_color(s: &str) -> Option<[u8; 3]> {
     let s = s.trim().to_ascii_lowercase();
@@ -137,7 +137,13 @@ fn font() -> Option<&'static fontdue::Font> {
     static FONT: OnceLock<Option<fontdue::Font>> = OnceLock::new();
     FONT.get_or_init(|| {
         let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-        for name in ["segoeuib.ttf", "segoeui.ttf", "arialbd.ttf", "arial.ttf"] {
+        for name in [
+            "seguisb.ttf",
+            "segoeuib.ttf",
+            "segoeui.ttf",
+            "arialbd.ttf",
+            "arial.ttf",
+        ] {
             if let Ok(bytes) = std::fs::read(format!(r"{windir}\Fonts\{name}")) {
                 if let Ok(f) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
                     return Some(f);
@@ -210,8 +216,8 @@ struct Label {
 
 fn label_box(s: &Shape, scale: f32, m: Rect) -> Option<Label> {
     let text = s.label.clone()?;
-    let px = 15.0 * scale;
-    let pad = 7.0 * scale;
+    let px = 14.0 * scale;
+    let pad = 8.0 * scale;
     let w = text_width(&text, px) + pad * 2.0;
     let h = px * 1.35 + pad;
     let gap = 6.0 * scale;
@@ -302,7 +308,7 @@ fn halo_stroke(pm: &mut Pixmap, path: &tiny_skia::Path, color: [u8; 3], w: f32, 
 }
 
 fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
-    let w = 4.0 * scale;
+    let w = 3.0 * scale;
     match s.kind {
         Kind::Arrow => {
             let (dx, dy) = (s.x2 - s.x, s.y2 - s.y);
@@ -337,7 +343,7 @@ fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
             let Some(r) = tiny_skia::Rect::from_xywh(s.x, s.y, s.w.max(1.0), s.h.max(1.0)) else {
                 return;
             };
-            let p = rounded_rect(r, 6.0 * scale);
+            let p = rounded_rect(r, 8.0 * scale);
             if s.kind == Kind::Highlight {
                 pm.fill_path(&p, &paint(rgba(s.color, 0.22)), FillRule::Winding, t, None);
                 pm.stroke_path(
@@ -376,7 +382,7 @@ fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
         draw_text(
             pm,
             &l.text,
-            l.x + tx + 7.0 * scale,
+            l.x + tx + 8.0 * scale,
             l.y + ty + (l.h - px * 1.35) / 2.0,
             px,
             ink,
@@ -430,10 +436,38 @@ fn register_class(name: &str, proc_: WNDPROC, cursor: PCWSTR) {
     }
 }
 
+const FADE_TIMER: usize = 1;
+
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCHITTEST {
             return LRESULT(HTTRANSPARENT as isize);
+        }
+        if msg == WM_TIMER && wp.0 == FADE_TIMER {
+            // Fade in: ease the layer's constant alpha up to opaque.
+            let a = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) + 36).min(255);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, a);
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: a as u8,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                hwnd,
+                None,
+                None,
+                None,
+                None,
+                None,
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+            if a >= 255 {
+                let _ = KillTimer(Some(hwnd), FADE_TIMER);
+            }
+            return LRESULT(0);
         }
         DefWindowProcW(hwnd, msg, wp, lp)
     }
@@ -495,11 +529,6 @@ impl Overlay {
             self.shapes.clear();
         }
         self.shapes.extend(call.shapes);
-        self.render();
-    }
-
-    pub fn clear(&mut self) {
-        self.shapes.clear();
         self.render();
     }
 
@@ -595,7 +624,7 @@ unsafe fn present(hwnd: HWND, pm: &Pixmap, x: i32, y: i32) {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: 255,
+                SourceConstantAlpha: 0,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let pos = POINT { x, y };
@@ -615,6 +644,8 @@ unsafe fn present(hwnd: HWND, pm: &Pixmap, x: i32, y: i32) {
             SelectObject(mem, old);
             let _ = DeleteObject(dib.into());
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = SetTimer(Some(hwnd), FADE_TIMER, 15, None);
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),

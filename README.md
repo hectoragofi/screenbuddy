@@ -15,9 +15,13 @@ Native Windows screen assistant in Rust. Press a hotkey, ask about what's on scr
 | Send · newline · cancel/close | `Enter` · `Shift+Enter` · `Esc` |
 | Close the palette | press the hotkey again, `Esc`, or `✕` |
 
-In the palette header, `⟳` takes a new screenshot (the palette and the drawings are left out of it) and `⌫` clears the drawings. If the palette covers what the model drew, it moves to a corner out of the way. Follow-up questions keep the conversation going.
+The palette is a Spotlight-style bar, centered in the upper part of the screen. It grows into a card as the answer streams in. Clicking the screenshot thumbnail retakes the screenshot. Clicking elsewhere dismisses the palette, unless something is drawn on screen, so you can still click the thing it pointed at. The model only draws when pointing actually helps you find something. If the palette covers what it drew, the palette moves out of the way. Follow-up questions keep the conversation going.
 
 The tray menu has: edit settings, reload settings, open the history folder, start with Windows, and quit.
+
+## Doing things for you (agent-desktop)
+
+If [agent-desktop](https://github.com/vercel-labs/agent-desktop) is installed (`npm install -g agent-desktop`), screenbuddy can operate apps when you ask it to, like "send this in Slack" or "turn on dark mode". It works through the accessibility tree, not pixels. Read-only commands (`snapshot`, `list-apps`, …) run on their own. Every action shows an **Allow / Don't Allow** card first: Enter allows, Esc denies, and "Allow for this conversation" skips the card until you close the palette. This works with all three providers; with the Claude subscription, approvals go from the MCP server back to the palette over a loopback socket. Turn it off with `[agent_desktop] enabled = false`.
 
 ## Settings
 

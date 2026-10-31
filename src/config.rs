@@ -37,6 +37,13 @@ model = "anthropic/claude-opus-5-5"
 tools = true
 max_tokens = 8000
 
+[agent_desktop]
+# Let screenbuddy operate apps when you ask it to (https://github.com/vercel-labs/agent-desktop).
+# Install: npm install -g agent-desktop. Every action asks for your approval first.
+enabled = true
+# Path to agent-desktop.exe. Empty = find it on PATH or in the global npm folder.
+command = ""
+
 [claude_cli]
 # Uses your Claude subscription through the Claude Code CLI.
 command = "claude"
@@ -55,6 +62,7 @@ pub struct Config {
     pub anthropic: AnthropicCfg,
     pub openai: OpenAiCfg,
     pub claude_cli: ClaudeCliCfg,
+    pub agent_desktop: AgentDesktopCfg,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -80,6 +88,22 @@ pub struct OpenAiCfg {
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
+pub struct AgentDesktopCfg {
+    pub enabled: bool,
+    pub command: String,
+}
+
+impl Default for AgentDesktopCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: String::new(),
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct ClaudeCliCfg {
     pub command: String,
     pub model: String,
@@ -96,6 +120,7 @@ impl Default for Config {
             anthropic: AnthropicCfg::default(),
             openai: OpenAiCfg::default(),
             claude_cli: ClaudeCliCfg::default(),
+            agent_desktop: AgentDesktopCfg::default(),
         }
     }
 }
@@ -135,6 +160,15 @@ impl Default for ClaudeCliCfg {
 }
 
 impl Config {
+    /// The agent-desktop binary, if enabled and installed.
+    pub fn desktop_exe(&self) -> Option<std::path::PathBuf> {
+        if self.agent_desktop.enabled {
+            crate::desktop::resolve(&self.agent_desktop.command)
+        } else {
+            None
+        }
+    }
+
     pub fn provider_label(&self) -> String {
         match self.provider.as_str() {
             "openai" => format!("openai · {}", self.openai.model),

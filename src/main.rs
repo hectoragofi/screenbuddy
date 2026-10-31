@@ -2,6 +2,7 @@
 
 mod capture;
 mod config;
+mod desktop;
 mod llm;
 mod mcp;
 mod overlay;
@@ -202,6 +203,19 @@ fn headless(q: &str) -> i32 {
 [draw {input} -> {r:?}]"
                 );
                 let _ = reply.send(r);
+            }
+            llm::Ev::Approve(intent, detail, reply) => {
+                let yes = std::env::args().any(|a| a == "--yes");
+                println!(
+                    "
+[approve? {intent} :: {detail} -> {}]",
+                    if yes {
+                        "allowed"
+                    } else {
+                        "denied (pass --yes)"
+                    }
+                );
+                let _ = reply.send(yes);
             }
             llm::Ev::Error(e) => {
                 println!(

@@ -10,18 +10,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
-pub const SYSTEM_PROMPT: &str = "You are screenbuddy, a desktop assistant that can see the user's screen. \
-The user pressed a hotkey and attached a screenshot of what they are looking at. \
-Answer the question directly and concisely in Markdown; skip preamble. \
-When pointing at something on screen helps (where to click, which element, what is wrong), call the `draw` tool \
-to annotate the user's screen. Coordinates are screenshot pixels with the origin at the top-left; the screenshot size \
-is given with the image. Use a few precise annotations with short labels (1-4 words). Arrows point from the label \
-toward the target, with x2,y2 on the target. Do not mention coordinates in your text.";
+pub const SYSTEM_PROMPT: &str = "You are screenbuddy, a calm, precise assistant built into the user's desktop. With each question you get a screenshot of what the user is looking at. Answer like a thoughtful expert sitting next to them: lead with the answer, keep it short (one to three sentences unless they ask for more), and use Markdown only when it genuinely helps, such as numbered steps or code. No preamble, no restating the question, no sign-offs.
 
-pub const DRAW_DESC: &str = "Draw annotations on the user's screen on top of the area shown in the screenshot. \
-Coordinates are in screenshot pixels, origin top-left. Kinds: arrow (x,y tail -> x2,y2 head on the target), \
-box (x,y,w,h outline), highlight (x,y,w,h translucent fill), circle (x,y center, r radius), text (label at x,y). \
-Annotations stay until cleared.";
+You can also point at things on their screen with the `draw` tool, but most questions do not need it. Do not draw for explanations, summaries, translations, opinions, code or writing help, or anything you can answer clearly in words. Draw only when the user wants to find something in the interface (where is X, what do I click, which one, how do I do this here) and pointing will save them from searching. When you do draw, mark exactly one target (at most three for multi-step instructions), prefer a box or circle around it with a 1-3 word label, and keep your text short since the drawing does the work. Never mention coordinates or the tool itself.";
+
+pub const DRAW_DESC: &str = "Point at something on the user's screen. Use only when the user needs to locate a UI element and words alone would leave them searching; never for decoration or emphasis. Coordinates are screenshot pixels, origin top-left. Kinds: box (x,y,w,h outline around the target; the default choice), circle (x,y center, r), highlight (x,y,w,h translucent fill for a text span or region), arrow (x,y tail -> x2,y2 head on a small target), text (a label at x,y). One shape is usually right.";
+
+fn anthropic_tools(desktop: bool) -> Value {
+    let mut tools = vec![json!({
+        "name": "draw",
+        "description": DRAW_DESC,
+        "input_schema": draw_schema(),
+        "eager_input_streaming": true
+    })];
+    if desktop {
+        tools.push(json!({
+            "name": "desktop",
+            "description": crate::desktop::DESC,
+            "input_schema": crate::desktop::schema(),
+            "eager_input_streaming": true
+        }));
+    }
+    Value::Array(tools)
+}
 
 pub fn draw_schema() -> Value {
     json!({
@@ -57,6 +68,8 @@ pub enum Ev {
     Status(String),
     /// A `draw` tool call; the reply channel returns the tool result text.
     Draw(Value, Sender<Result<String, String>>),
+    /// An agent-desktop action awaiting the user's approval: (intent, command line, reply).
+    Approve(String, String, Sender<bool>),
     Error(String),
     Done(Conversation),
 }
@@ -106,6 +119,50 @@ impl Out {
     fn status(&self, s: impl Into<String>) {
         self.send(Ev::Status(s.into()));
     }
+    /// Asks the user to approve an action; false on deny or timeout.
+    pub fn approve(&self, intent: &str, detail: &str) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.send(Ev::Approve(intent.to_string(), detail.to_string(), tx));
+        rx.recv_timeout(std::time::Duration::from_secs(300))
+            .unwrap_or(false)
+    }
+
+    /// Runs one `desktop` tool call: read-only commands directly, actions after approval.
+    fn desktop(&self, input: &Value, exe: &std::path::Path) -> (String, bool) {
+        let (args, intent) = match crate::desktop::parse(input) {
+            Ok(v) => v,
+            Err(e) => return (format!("error: {e}"), true),
+        };
+        if !crate::desktop::is_read_only(&args) {
+            if !self.approve(&intent, &args.join(" ")) {
+                return (
+                    "The user declined this action. Stop and tell them briefly.".into(),
+                    true,
+                );
+            }
+            self.status("acting…");
+        }
+        let out = crate::desktop::run(exe, &args);
+        let ok = serde_json::from_str::<Value>(&out)
+            .ok()
+            .and_then(|v| v["ok"].as_bool())
+            .unwrap_or(true);
+        self.status("thinking…");
+        (out, !ok)
+    }
+
+    /// Dispatches a tool call by name.
+    fn tool(&self, name: &str, input: Value, exe: Option<&std::path::Path>) -> (String, bool) {
+        match (name, exe) {
+            ("draw", _) => match self.draw(input) {
+                Ok(t) => (t, false),
+                Err(e) => (e, true),
+            },
+            ("desktop", Some(exe)) => self.desktop(&input, exe),
+            _ => ("error: unknown tool".into(), true),
+        }
+    }
+
     /// Sends a draw call to the UI thread and waits for its result.
     fn draw(&self, input: Value) -> Result<String, String> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -145,11 +202,16 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn system_prompt(cfg: &Config) -> String {
-    if cfg.extra_instructions.trim().is_empty() {
-        SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{SYSTEM_PROMPT}\n\n{}", cfg.extra_instructions.trim())
+    let mut p = SYSTEM_PROMPT.to_string();
+    if cfg.desktop_exe().is_some() {
+        p.push_str("\n\n");
+        p.push_str(crate::desktop::PROMPT);
     }
+    if !cfg.extra_instructions.trim().is_empty() {
+        p.push_str("\n\n");
+        p.push_str(cfg.extra_instructions.trim());
+    }
+    p
 }
 
 fn question_text(turn: &Turn) -> String {
@@ -222,6 +284,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
         .push(json!({"role": "user", "content": content}));
 
     let client = http()?;
+    let exe = turn.cfg.desktop_exe();
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     let mut wrote_text = false;
     for _round in 0..8 {
@@ -232,12 +295,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
             "messages": conv.anthropic,
             "stream": true,
             "output_config": {"effort": cfg.effort},
-            "tools": [{
-                "name": "draw",
-                "description": DRAW_DESC,
-                "input_schema": draw_schema(),
-                "eager_input_streaming": true
-            }],
+            "tools": anthropic_tools(exe.is_some()),
         });
         let mut req = client
             .post(&url)
@@ -266,7 +324,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
                 "content_block_start" => {
                     let block = ev["content_block"].clone();
                     match block["type"].as_str() {
-                        Some("tool_use") => out.status("drawing…"),
+                        Some("tool_use") if block["name"] == "draw" => out.status("drawing…"),
                         Some("text") => {
                             if wrote_text && !blocks.values().any(|b| b["type"] == "text") {
                                 out.delta("\n\n");
@@ -312,14 +370,11 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
                             let (text, is_err) = match parsed {
                                 Ok(input) => {
                                     b["input"] = input.clone();
-                                    if b["name"] == "draw" {
-                                        match out.draw(input) {
-                                            Ok(t) => (t, false),
-                                            Err(e) => (e, true),
-                                        }
-                                    } else {
-                                        ("Unknown tool".to_string(), true)
-                                    }
+                                    out.tool(
+                                        b["name"].as_str().unwrap_or(""),
+                                        input,
+                                        exe.as_deref(),
+                                    )
                                 }
                                 Err(e) => {
                                     // Keep the history valid: the block needs an object input.
@@ -412,6 +467,7 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
         .push(json!({"role": "user", "content": content}));
 
     let client = http()?;
+    let exe = turn.cfg.desktop_exe();
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let mut wrote_text = false;
     for _round in 0..8 {
@@ -422,7 +478,13 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             "max_tokens": cfg.max_tokens,
         });
         if cfg.tools {
-            body["tools"] = json!([{"type": "function", "function": {"name": "draw", "description": DRAW_DESC, "parameters": draw_schema()}}]);
+            let mut tools = vec![
+                json!({"type": "function", "function": {"name": "draw", "description": DRAW_DESC, "parameters": draw_schema()}}),
+            ];
+            if exe.is_some() {
+                tools.push(json!({"type": "function", "function": {"name": "desktop", "description": crate::desktop::DESC, "parameters": crate::desktop::schema()}}));
+            }
+            body["tools"] = json!(tools);
         }
         let mut req = client.post(&url).header("content-type", "application/json");
         if !key.is_empty() {
@@ -498,17 +560,11 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             .collect();
         conv.openai.push(json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) }, "tool_calls": tool_calls}));
         for (id, name, args) in calls.values() {
-            let result = if name == "draw" {
-                match serde_json::from_str::<Value>(if args.trim().is_empty() {
-                    "{}"
-                } else {
-                    args
-                }) {
-                    Ok(input) => out.draw(input).unwrap_or_else(|e| format!("error: {e}")),
-                    Err(e) => format!("error: arguments were not valid JSON ({e})"),
-                }
-            } else {
-                "error: unknown tool".to_string()
+            let input =
+                serde_json::from_str::<Value>(if args.trim().is_empty() { "{}" } else { args });
+            let result = match input {
+                Ok(input) => out.tool(name, input, exe.as_deref()).0,
+                Err(e) => format!("error: arguments were not valid JSON ({e})"),
             };
             conv.openai
                 .push(json!({"role": "tool", "tool_call_id": id, "content": result}));
@@ -526,7 +582,26 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
 
     let cfg = &turn.cfg.claude_cli;
     let exe = std::env::current_exe()?;
-    let mcp = json!({"mcpServers": {"screenbuddy": {"type": "stdio", "command": exe.to_string_lossy(), "args": ["--mcp"]}}}).to_string();
+    // Actions requested through the MCP server are approved here, over a
+    // loopback socket, so the user sees the same Allow / Don't Allow card.
+    let done = Arc::new(AtomicBool::new(false));
+    let mut env = serde_json::Map::new();
+    let desktop = turn.cfg.desktop_exe().is_some();
+    if desktop {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        env.insert(
+            "SCREENBUDDY_APPROVAL_PORT".into(),
+            json!(listener.local_addr()?.port().to_string()),
+        );
+        spawn_approval_server(listener, out.clone(), done.clone());
+    }
+    let _stop = StopOnDrop(done);
+    let mcp = json!({"mcpServers": {"screenbuddy": {"type": "stdio", "command": exe.to_string_lossy(), "args": ["--mcp"], "env": env}}}).to_string();
+    let allowed = if desktop {
+        "mcp__screenbuddy__draw mcp__screenbuddy__desktop"
+    } else {
+        "mcp__screenbuddy__draw"
+    };
     let build = |program: &str| {
         let mut c = Command::new(program);
         c.args([
@@ -541,7 +616,7 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
         .args(["--system-prompt", &system_prompt(&turn.cfg)])
         .args(["--tools", ""])
         .args(["--strict-mcp-config", "--mcp-config", &mcp])
-        .args(["--allowedTools", "mcp__screenbuddy__draw"]);
+        .args(["--allowedTools", allowed]);
         if !cfg.model.trim().is_empty() {
             c.args(["--model", cfg.model.trim()]);
         }
@@ -619,7 +694,10 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
                 match e["type"].as_str().unwrap_or("") {
                     "message_start" => streamed_this_msg = false,
                     "content_block_start" if e["content_block"]["type"] == "tool_use" => {
-                        out.status("drawing…")
+                        let draw = e["content_block"]["name"]
+                            .as_str()
+                            .is_some_and(|n| n.ends_with("draw"));
+                        out.status(if draw { "drawing…" } else { "thinking…" })
                     }
                     "content_block_start" if e["content_block"]["type"] == "thinking" => {
                         out.status("thinking…")
@@ -692,4 +770,36 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
         anyhow::bail!("claude exited with {status}: {tail}");
     }
     Ok(())
+}
+
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Answers approval requests from `screenbuddy --mcp`: one JSON line
+/// {"intent","detail"} in, "allow" or "deny" out.
+fn spawn_approval_server(listener: std::net::TcpListener, out: Out, done: Arc<AtomicBool>) {
+    let _ = listener.set_nonblocking(true);
+    std::thread::spawn(move || {
+        while !done.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut line = String::new();
+                    let _ = BufReader::new(&stream).read_line(&mut line);
+                    let req: Value = serde_json::from_str(&line).unwrap_or_default();
+                    let ok = out.approve(
+                        req["intent"].as_str().unwrap_or("perform an action"),
+                        req["detail"].as_str().unwrap_or(""),
+                    );
+                    let _ = stream.write_all(if ok { b"allow\n" } else { b"deny\n" });
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(40)),
+            }
+        }
+    });
 }
