@@ -29,6 +29,10 @@ fn main() {
         std::process::exit(headless(&q));
     }
     if win::already_running() {
+        // `screenbuddy --open` asks the running instance to open its palette.
+        if std::env::args().any(|a| a == "--open") {
+            win::signal_running(win::HK_ASK);
+        }
         return;
     }
     win::set_dpi_awareness();

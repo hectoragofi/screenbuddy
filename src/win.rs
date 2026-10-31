@@ -92,6 +92,17 @@ pub fn create_main_window() -> anyhow::Result<HWND> {
     }
 }
 
+/// Posts a hotkey message to the already-running instance's message window.
+pub fn signal_running(id: i32) {
+    let cls = wide("screenbuddy_main");
+    unsafe {
+        if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, PCWSTR(cls.as_ptr()), PCWSTR::null()) {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+            let _ = PostMessageW(Some(h), WM_HOTKEY, WPARAM(id as usize), LPARAM(0));
+        }
+    }
+}
+
 pub fn main_hwnd() -> HWND {
     HWND(HWND_MAIN.load(Ordering::Relaxed) as *mut _)
 }
