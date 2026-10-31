@@ -49,6 +49,9 @@ command = ""
 command = "claude"
 # Optional model alias or id, e.g. "opus" or "sonnet". Empty = CLI default.
 model = ""
+# Keep one Claude process ready after the palette closes so the next question
+# starts instantly (~100 MB while warm). 0 = nothing runs while idle.
+keep_warm_minutes = 10
 "#;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -107,6 +110,7 @@ impl Default for AgentDesktopCfg {
 pub struct ClaudeCliCfg {
     pub command: String,
     pub model: String,
+    pub keep_warm_minutes: u32,
 }
 
 impl Default for Config {
@@ -155,6 +159,7 @@ impl Default for ClaudeCliCfg {
         Self {
             command: "claude".into(),
             model: String::new(),
+            keep_warm_minutes: 10,
         }
     }
 }

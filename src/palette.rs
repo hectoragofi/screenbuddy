@@ -197,9 +197,19 @@ fn apply_chrome(hwnd: HWND) {
     use windows::Win32::Graphics::Dwm::*;
     unsafe {
         let dark: i32 = 1;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&dark as *const i32).cast(), 4);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const i32).cast(),
+            4,
+        );
         let round = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, (&round as *const DWM_WINDOW_CORNER_PREFERENCE).cast(), 4);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&round as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            4,
+        );
     }
 }
 
@@ -214,7 +224,6 @@ fn thumbnail(ctx: &egui::Context, jpeg: &[u8]) -> Option<egui::TextureHandle> {
 fn status_text(s: &str) -> &'static str {
     match s {
         "drawing…" => "Pointing it out",
-        "starting claude…" | "sending…" => "Connecting",
         "acting…" => "Working",
         _ => "Thinking",
     }
@@ -229,6 +238,8 @@ impl Palette {
     ) -> Self {
         let mut cap = cap;
         let jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
+        let conv = Conversation::default();
+        llm::prewarm(&cfg, &conv);
         Self {
             cfg,
             cap,
@@ -236,7 +247,7 @@ impl Palette {
             thumb: None,
             input: String::new(),
             exchanges: Vec::new(),
-            conv: Some(Conversation::default()),
+            conv: Some(conv),
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
             status: String::new(),
@@ -314,7 +325,11 @@ impl Palette {
                 self.jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
                 self.cap = cap;
                 self.thumb = thumbnail(ctx, &self.jpeg);
-                self.conv = Some(Conversation::default());
+                self.conv = Some({
+                    let c = Conversation::default();
+                    llm::prewarm(&self.cfg, &c);
+                    c
+                });
                 self.overlay = None;
                 self.exchanges.clear();
                 self.history_dir = None;

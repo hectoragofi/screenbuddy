@@ -82,6 +82,8 @@ pub struct Conversation {
     pub openai: Vec<Value>,
     pub cli_session: Option<String>,
     pub image_sent: bool,
+    /// Warm Claude CLI process (claude-cli provider only).
+    pub cli: CliSlot,
 }
 
 pub struct Image {
@@ -575,33 +577,166 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
 
 // ---------------------------------------------------------------- Claude Code CLI
 
-fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()> {
+/// A running `claude -p` in stream-json mode. Started when the palette opens
+/// (so Node is warm by the time the user hits Enter) and reused for
+/// follow-ups; killed when the palette closes.
+pub struct CliProc {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<String>,
+    stderr: Arc<std::sync::Mutex<String>>,
+    approver: Arc<std::sync::Mutex<Option<Out>>>,
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for CliProc {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        let _ = self.child.kill();
+    }
+}
+
+impl CliProc {
+    fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    fn stderr_tail(&self) -> String {
+        let s = self.stderr.lock().unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        lines[lines.len().saturating_sub(6)..].join("\n")
+    }
+}
+
+/// Shared slot for the warm CLI process, carried inside `Conversation`.
+pub type CliSlot = Arc<std::sync::Mutex<Option<CliProc>>>;
+
+/// Starts the Claude CLI in the background so the first answer starts fast.
+pub fn prewarm(cfg: &Config, conv: &Conversation) {
+    if cfg.provider != "claude-cli" {
+        return;
+    }
+    let cfg = cfg.clone();
+    let slot = conv.cli.clone();
+    let resume = conv.cli_session.clone();
+    std::thread::spawn(move || {
+        let mut guard = slot.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        // Fast path: a fresh spare kept warm since the last palette closed.
+        if resume.is_none() {
+            if let Some(p) = take_spare(&cfg) {
+                *guard = Some(p);
+                return;
+            }
+        }
+        match spawn_cli(&cfg, resume.as_deref()) {
+            Ok(p) => *guard = Some(p),
+            Err(e) => crate::config::log(&format!("claude prewarm failed: {e:#}")),
+        }
+    });
+}
+
+/// A fresh, unused CLI process kept between palette sessions so the next
+/// question starts instantly. Expires after `claude_cli.keep_warm_minutes`.
+struct Spare {
+    proc: CliProc,
+    born: std::time::Instant,
+    sig: String,
+}
+
+static SPARE: std::sync::Mutex<Option<Spare>> = std::sync::Mutex::new(None);
+
+fn spare_sig(cfg: &Config) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        cfg.claude_cli.command,
+        cfg.claude_cli.model,
+        system_prompt(cfg),
+        cfg.desktop_exe().is_some()
+    )
+}
+
+fn take_spare(cfg: &Config) -> Option<CliProc> {
+    let mut s = SPARE.lock().unwrap().take()?;
+    (s.sig == spare_sig(cfg) && s.proc.alive()).then_some(s.proc)
+}
+
+/// Called after the palette closes: keeps one fresh process warm for a while.
+pub fn refill_spare(cfg: &Config) {
+    let minutes = cfg.claude_cli.keep_warm_minutes;
+    if cfg.provider != "claude-cli" || minutes == 0 {
+        *SPARE.lock().unwrap() = None;
+        return;
+    }
+    let cfg = cfg.clone();
+    std::thread::spawn(move || {
+        let sig = spare_sig(&cfg);
+        {
+            let mut slot = SPARE.lock().unwrap();
+            if let Some(s) = slot.as_mut() {
+                if s.sig == sig && s.proc.alive() {
+                    s.born = std::time::Instant::now(); // still unused: extend
+                } else {
+                    *slot = None;
+                }
+            }
+            if slot.is_none() {
+                match spawn_cli(&cfg, None) {
+                    Ok(proc) => {
+                        *slot = Some(Spare {
+                            proc,
+                            born: std::time::Instant::now(),
+                            sig,
+                        })
+                    }
+                    Err(e) => {
+                        crate::config::log(&format!("claude spare failed: {e:#}"));
+                        return;
+                    }
+                }
+            }
+        }
+        let ttl = std::time::Duration::from_secs(minutes as u64 * 60);
+        std::thread::sleep(ttl);
+        let mut slot = SPARE.lock().unwrap();
+        if slot.as_ref().is_some_and(|s| s.born.elapsed() >= ttl) {
+            *slot = None; // dropping kills it; idle RAM goes back to ~0
+            crate::win::trim_memory();
+        }
+    });
+}
+
+fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let cfg = &turn.cfg.claude_cli;
+    let full_cfg = cfg;
+    let cfg = &full_cfg.claude_cli;
     let exe = std::env::current_exe()?;
+    let done = Arc::new(AtomicBool::new(false));
+    let approver: Arc<std::sync::Mutex<Option<Out>>> = Default::default();
     // Actions requested through the MCP server are approved here, over a
     // loopback socket, so the user sees the same Allow / Don't Allow card.
-    let done = Arc::new(AtomicBool::new(false));
     let mut env = serde_json::Map::new();
-    let desktop = turn.cfg.desktop_exe().is_some();
+    let desktop = full_cfg.desktop_exe().is_some();
     if desktop {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         env.insert(
             "SCREENBUDDY_APPROVAL_PORT".into(),
             json!(listener.local_addr()?.port().to_string()),
         );
-        spawn_approval_server(listener, out.clone(), done.clone());
+        spawn_approval_server(listener, approver.clone(), done.clone());
     }
-    let _stop = StopOnDrop(done);
     let mcp = json!({"mcpServers": {"screenbuddy": {"type": "stdio", "command": exe.to_string_lossy(), "args": ["--mcp"], "env": env}}}).to_string();
     let allowed = if desktop {
         "mcp__screenbuddy__draw mcp__screenbuddy__desktop"
     } else {
         "mcp__screenbuddy__draw"
     };
+    let system = system_prompt(full_cfg);
     let build = |program: &str| {
         let mut c = Command::new(program);
         c.args([
@@ -613,14 +748,14 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
             "--verbose",
             "--include-partial-messages",
         ])
-        .args(["--system-prompt", &system_prompt(&turn.cfg)])
+        .args(["--system-prompt", &system])
         .args(["--tools", ""])
         .args(["--strict-mcp-config", "--mcp-config", &mcp])
         .args(["--allowedTools", allowed]);
         if !cfg.model.trim().is_empty() {
             c.args(["--model", cfg.model.trim()]);
         }
-        if let Some(id) = &conv.cli_session {
+        if let Some(id) = resume {
             c.args(["--resume", id]);
         }
         c.stdin(Stdio::piped())
@@ -629,7 +764,6 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
             .creation_flags(CREATE_NO_WINDOW);
         c
     };
-    out.status("starting claude…");
     let mut child = match build(&cfg.command).spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !cfg.command.ends_with(".cmd") => {
@@ -644,6 +778,63 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
         }
         Err(e) => return Err(e.into()),
     };
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(e) = child.stderr.take() {
+        let buf = stderr.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(e).lines() {
+                let Ok(line) = line else { break };
+                let mut b = buf.lock().unwrap();
+                if b.len() < 64_000 {
+                    b.push_str(&line);
+                    b.push('\n');
+                }
+            }
+        });
+    }
+    Ok(CliProc {
+        child,
+        stdin,
+        lines,
+        stderr,
+        approver,
+        done,
+    })
+}
+
+fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()> {
+    // Use the warm process if there is one; otherwise start (or resume) now.
+    let mut proc = {
+        let mut guard = conv.cli.lock().unwrap();
+        match guard.take() {
+            Some(mut p) => {
+                if p.alive() {
+                    p
+                } else {
+                    spawn_cli(&turn.cfg, conv.cli_session.as_deref())?
+                }
+            }
+            None => spawn_cli(&turn.cfg, conv.cli_session.as_deref())?,
+        }
+    };
+    *proc.approver.lock().unwrap() = Some(out.clone());
 
     let mut content = Vec::new();
     if let Some(img) = &turn.image {
@@ -651,37 +842,30 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
     }
     content.push(json!({"type": "text", "text": question_text(turn)}));
     let line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string();
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        stdin.write_all(line.as_bytes())?;
-        stdin.write_all(b"\n")?;
-    } // dropping stdin closes it → CLI answers this one message then exits
+    proc.stdin.write_all(line.as_bytes())?;
+    proc.stdin.write_all(b"\n")?;
+    proc.stdin.flush()?;
 
-    let stderr = child.stderr.take();
-    let err_reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut e) = stderr {
-            let _ = std::io::Read::read_to_string(&mut e, &mut s);
-        }
-        s
-    });
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
     let mut streamed_this_msg = false;
     let mut wrote_text = false;
-    let mut result_err = None;
-    for line in BufReader::new(stdout).lines() {
+    loop {
         if turn.cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            return Ok(());
+            return Ok(()); // dropping `proc` kills the CLI mid-answer
         }
-        let Ok(line) = line else { break };
+        let line = match proc
+            .lines
+            .recv_timeout(std::time::Duration::from_millis(100))
+        {
+            Ok(l) => l,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if wrote_text {
+                    return Ok(());
+                }
+                let _ = proc.child.wait();
+                anyhow::bail!("claude exited unexpectedly: {}", proc.stderr_tail());
+            }
+        };
         let Ok(ev) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -740,49 +924,32 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
                 streamed_this_msg = false;
             }
             "result" => {
-                if ev["is_error"].as_bool() == Some(true) {
-                    result_err = Some(
-                        ev["result"]
-                            .as_str()
-                            .unwrap_or("claude reported an error")
-                            .to_string(),
-                    );
-                }
+                *proc.approver.lock().unwrap() = None;
+                let err = (ev["is_error"].as_bool() == Some(true)).then(|| {
+                    ev["result"]
+                        .as_str()
+                        .unwrap_or("claude reported an error")
+                        .to_string()
+                });
+                // Keep the process warm for the next follow-up.
+                *conv.cli.lock().unwrap() = Some(proc);
+                return match err {
+                    Some(e) => Err(anyhow::anyhow!("{e}")),
+                    None => Ok(()),
+                };
             }
             _ => {}
         }
     }
-    let status = child.wait()?;
-    let stderr = err_reader.join().unwrap_or_default();
-    if let Some(e) = result_err {
-        anyhow::bail!("{e}");
-    }
-    if !status.success() && !wrote_text {
-        let tail: String = stderr
-            .lines()
-            .rev()
-            .take(6)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        anyhow::bail!("claude exited with {status}: {tail}");
-    }
-    Ok(())
-}
-
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
 }
 
 /// Answers approval requests from `screenbuddy --mcp`: one JSON line
-/// {"intent","detail"} in, "allow" or "deny" out.
-fn spawn_approval_server(listener: std::net::TcpListener, out: Out, done: Arc<AtomicBool>) {
+/// {"intent","detail"} in, "allow" or "deny" out. Denies when no turn is active.
+fn spawn_approval_server(
+    listener: std::net::TcpListener,
+    approver: Arc<std::sync::Mutex<Option<Out>>>,
+    done: Arc<AtomicBool>,
+) {
     let _ = listener.set_nonblocking(true);
     std::thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
@@ -792,10 +959,13 @@ fn spawn_approval_server(listener: std::net::TcpListener, out: Out, done: Arc<At
                     let mut line = String::new();
                     let _ = BufReader::new(&stream).read_line(&mut line);
                     let req: Value = serde_json::from_str(&line).unwrap_or_default();
-                    let ok = out.approve(
-                        req["intent"].as_str().unwrap_or("perform an action"),
-                        req["detail"].as_str().unwrap_or(""),
-                    );
+                    let out = approver.lock().unwrap().clone();
+                    let ok = out.is_some_and(|o| {
+                        o.approve(
+                            req["intent"].as_str().unwrap_or("perform an action"),
+                            req["detail"].as_str().unwrap_or(""),
+                        )
+                    });
                     let _ = stream.write_all(if ok { b"allow\n" } else { b"deny\n" });
                 }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(40)),

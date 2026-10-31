@@ -93,6 +93,7 @@ impl App {
         };
         drop(shot); // free the raw pixels before the window opens
         let out = palette::run(self.cfg.clone(), cap, self.cfg_error.clone());
+        llm::refill_spare(&self.cfg);
         win::trim_memory();
         out
     }
