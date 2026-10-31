@@ -1,0 +1,22 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/screenbuddy.exe "screenbuddy-${GITHUB_REF_NAME}-x86_64.exe"
+          gh release create "$GITHUB_REF_NAME" "screenbuddy-${GITHUB_REF_NAME}-x86_64.exe" --generate-notes --title "screenbuddy $GITHUB_REF_NAME"
