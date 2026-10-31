@@ -7,6 +7,7 @@ mod llm;
 mod mcp;
 mod overlay;
 mod palette;
+mod settings;
 mod tray;
 mod util;
 mod win;
@@ -138,6 +139,13 @@ fn run() -> anyhow::Result<()> {
                 AppEvent::Menu(id) => match id.as_str() {
                     tray::ASK => app.ask(false),
                     tray::REGION => app.ask(true),
+                    tray::SETTINGS => {
+                        let o = settings::run();
+                        app.hotkeys = Default::default(); // Settings unregistered them
+                        app.reload();
+                        win::trim_memory();
+                        o
+                    }
                     tray::RELOAD => {
                         app.reload();
                         if let Some(e) = &app.cfg_error {
@@ -201,7 +209,7 @@ fn headless(q: &str) -> i32 {
             llm::Ev::Delta(t) => print!("{t}"),
             llm::Ev::Status(s) => eprintln!("[{s}]"),
             llm::Ev::Draw(input, reply) => {
-                let r = overlay::parse_draw(&input, &cap)
+                let r = overlay::parse_draw(&input, &cap, [10, 132, 255])
                     .map(|c| format!("Drew {} annotation(s).", c.shapes.len()));
                 println!(
                     "

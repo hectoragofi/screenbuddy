@@ -41,6 +41,7 @@ pub struct Shape {
     pub color: [u8; 3],
 }
 
+#[cfg(test)]
 const ACCENT: [u8; 3] = [10, 132, 255];
 
 fn parse_color(s: &str) -> Option<[u8; 3]> {
@@ -75,7 +76,7 @@ pub struct DrawCall {
 }
 
 /// Parses a `draw` tool input (screenshot pixel coords) into screen shapes.
-pub fn parse_draw(input: &Value, cap: &Capture) -> Result<DrawCall, String> {
+pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Result<DrawCall, String> {
     let clear = input.get("clear").and_then(Value::as_bool).unwrap_or(false);
     let list = match input.get("shapes") {
         Some(Value::Array(a)) => a.clone(),
@@ -125,7 +126,7 @@ pub fn parse_draw(input: &Value, cap: &Capture) -> Result<DrawCall, String> {
                 .get("color")
                 .and_then(Value::as_str)
                 .and_then(parse_color)
-                .unwrap_or(ACCENT),
+                .unwrap_or(default_color),
         });
     }
     Ok(DrawCall { clear, shapes })
@@ -880,7 +881,7 @@ mod tests {
 
     #[test]
     fn maps_to_screen() {
-        let c = parse_draw(&json!({"shapes":[{"kind":"box","x":10,"y":20,"w":100,"h":50,"label":"here","color":"blue"}]}), &cap()).unwrap();
+        let c = parse_draw(&json!({"shapes":[{"kind":"box","x":10,"y":20,"w":100,"h":50,"label":"here","color":"blue"}]}), &cap(), ACCENT).unwrap();
         let s = &c.shapes[0];
         assert_eq!((s.x, s.y, s.w, s.h), (1940.0, 40.0, 200.0, 100.0));
         assert_eq!(s.color, [10, 132, 255]);
@@ -888,8 +889,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_shapes() {
-        assert!(parse_draw(&json!({"shapes":[{"kind":"arrow","x":1,"y":1}]}), &cap()).is_err());
-        assert!(parse_draw(&json!({"shapes":[{"kind":"blob","x":1,"y":1}]}), &cap()).is_err());
+        assert!(parse_draw(&json!({"shapes":[{"kind":"arrow","x":1,"y":1}]}), &cap(), ACCENT).is_err());
+        assert!(parse_draw(&json!({"shapes":[{"kind":"blob","x":1,"y":1}]}), &cap(), ACCENT).is_err());
     }
 
     #[test]
@@ -897,6 +898,7 @@ mod tests {
         let c = parse_draw(
             &json!({"shapes":[{"kind":"arrow","x":10,"y":10,"x2":200,"y2":120,"label":"Click"}]}),
             &cap(),
+            ACCENT,
         )
         .unwrap();
         let mut pm = Pixmap::new(800, 400).unwrap();

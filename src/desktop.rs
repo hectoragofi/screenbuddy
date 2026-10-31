@@ -175,6 +175,62 @@ pub fn run(exe: &std::path::Path, args: &[String]) -> String {
     out
 }
 
+/// Per-conversation context: an agent-desktop session (keeps refs scoped and
+/// carries the cursor overlay) plus the cursor look from settings.
+#[derive(Clone, Debug)]
+pub struct Ctx {
+    pub session: String,
+    pub cursor: Option<Cursor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Cursor {
+    pub fill: String,
+    pub rim: String,
+    pub accent: String,
+    pub label: bool,
+}
+
+pub fn new_session_id() -> String {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("screenbuddy-{:x}", n & 0xffff_ffff_ffff)
+}
+
+impl Ctx {
+    pub fn from_config(cfg: &crate::config::Config, session: String) -> Self {
+        let a = &cfg.agent_desktop;
+        let cursor = a.cursor.then(|| Cursor {
+            fill: a.cursor_fill.clone(),
+            rim: a.cursor_rim.clone(),
+            accent: a.cursor_accent.clone(),
+            label: a.cursor_label,
+        });
+        Self { session, cursor }
+    }
+}
+
+/// Runs a command inside the conversation's session. Before an action, the
+/// agent's cursor overlay is (re)enabled with the step's intent as its label.
+pub fn exec(exe: &std::path::Path, args: &[String], intent: &str, ctx: &Ctx) -> String {
+    let mut args = args.to_vec();
+    if !args.iter().any(|a| a == "--session") {
+        args.push("--session".into());
+        args.push(ctx.session.clone());
+    }
+    if let Some(c) = ctx.cursor.as_ref().filter(|_| !is_read_only(&args)) {
+        let mut ov: Vec<String> = ["cursor-overlay", "enable", "--session", &ctx.session, "--fill", &c.fill, "--rim", &c.rim, "--accent", &c.accent]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if c.label && !intent.trim().is_empty() {
+            ov.push("--label".into());
+            ov.push(intent.to_string());
+        }
+        let _ = run(exe, &ov);
+    }
+    run(exe, &args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,19 +10,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
-pub const SYSTEM_PROMPT: &str = "You are screenbuddy, a calm, precise assistant built into the user's desktop. With each question you get a screenshot of what the user is looking at. Answer like a thoughtful expert sitting next to them: lead with the answer, keep it short (one to three sentences unless they ask for more), and use Markdown only when it genuinely helps, such as numbered steps or code. No preamble, no restating the question, no sign-offs.
+pub const SYSTEM_PROMPT: &str = "You are screenbuddy, a calm, precise assistant built into the user's desktop. With each question you get a screenshot of what the user is looking at. Answer like a thoughtful expert sitting next to them: lead with the answer, keep it short (one to three sentences unless they ask for more), and use Markdown only when it genuinely helps, such as numbered steps or code. No preamble, no restating the question, no sign-offs.";
 
-You can also point at things on their screen with the `draw` tool, but most questions do not need it. Do not draw for explanations, summaries, translations, opinions, code or writing help, or anything you can answer clearly in words. Draw only when the user wants to find something in the interface (where is X, what do I click, which one, how do I do this here) and pointing will save them from searching. When you do draw, mark exactly one target (at most three for multi-step instructions), prefer a box or circle around it with a 1-3 word label, and keep your text short since the drawing does the work. Never mention coordinates or the tool itself.";
+pub const DRAW_PROMPT: &str = "You can also point at things on their screen with the `draw` tool, but most questions do not need it. Do not draw for explanations, summaries, translations, opinions, code or writing help, or anything you can answer clearly in words. Draw only when the user wants to find something in the interface (where is X, what do I click, which one, how do I do this here) and pointing will save them from searching. When you do draw, mark exactly one target (at most three for multi-step instructions), prefer a box or circle around it with a 1-3 word label, and keep your text short since the drawing does the work. Never mention coordinates or the tool itself.";
 
 pub const DRAW_DESC: &str = "Point at something on the user's screen. Use only when the user needs to locate a UI element and words alone would leave them searching; never for decoration or emphasis. Coordinates are screenshot pixels, origin top-left. Kinds: box (x,y,w,h outline around the target; the default choice), circle (x,y center, r), highlight (x,y,w,h translucent fill for a text span or region), arrow (x,y tail -> x2,y2 head on a small target), text (a label at x,y). One shape is usually right.";
 
-fn anthropic_tools(desktop: bool) -> Value {
-    let mut tools = vec![json!({
-        "name": "draw",
-        "description": DRAW_DESC,
-        "input_schema": draw_schema(),
-        "eager_input_streaming": true
-    })];
+fn anthropic_tools(draw: bool, desktop: bool) -> Value {
+    let mut tools = Vec::new();
+    if draw {
+        tools.push(json!({
+            "name": "draw",
+            "description": DRAW_DESC,
+            "input_schema": draw_schema(),
+            "eager_input_streaming": true
+        }));
+    }
     if desktop {
         tools.push(json!({
             "name": "desktop",
@@ -84,6 +87,8 @@ pub struct Conversation {
     pub image_sent: bool,
     /// Warm Claude CLI process (claude-cli provider only).
     pub cli: CliSlot,
+    /// agent-desktop session id for this conversation.
+    pub desktop_session: String,
 }
 
 pub struct Image {
@@ -105,11 +110,12 @@ pub struct Turn {
 pub struct Out {
     tx: Sender<Ev>,
     ctx: egui::Context,
+    dctx: Option<crate::desktop::Ctx>,
 }
 
 impl Out {
     pub fn new(tx: Sender<Ev>, ctx: egui::Context) -> Self {
-        Self { tx, ctx }
+        Self { tx, ctx, dctx: None }
     }
     fn send(&self, ev: Ev) {
         let _ = self.tx.send(ev);
@@ -144,7 +150,8 @@ impl Out {
             }
             self.status("acting…");
         }
-        let out = crate::desktop::run(exe, &args);
+        let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx { session: crate::desktop::new_session_id(), cursor: None });
+        let out = crate::desktop::exec(exe, &args, &intent, &dctx);
         let ok = serde_json::from_str::<Value>(&out)
             .ok()
             .and_then(|v| v["ok"].as_bool())
@@ -177,6 +184,12 @@ impl Out {
 pub fn spawn(turn: Turn, out: Out) {
     std::thread::spawn(move || {
         let mut conv = turn.conv.clone();
+        if conv.desktop_session.is_empty() {
+            conv.desktop_session = crate::desktop::new_session_id();
+        }
+        let mut out = out;
+        out.dctx = Some(crate::desktop::Ctx::from_config(&turn.cfg, conv.desktop_session.clone()));
+        let out = out;
         let res = match turn.cfg.provider.as_str() {
             "openai" => openai(&turn, &mut conv, &out),
             "claude-cli" => claude_cli(&turn, &mut conv, &out),
@@ -205,6 +218,10 @@ fn b64(bytes: &[u8]) -> String {
 
 fn system_prompt(cfg: &Config) -> String {
     let mut p = SYSTEM_PROMPT.to_string();
+    if cfg.drawing.enabled {
+        p.push_str("\n\n");
+        p.push_str(DRAW_PROMPT);
+    }
     if cfg.desktop_exe().is_some() {
         p.push_str("\n\n");
         p.push_str(crate::desktop::PROMPT);
@@ -297,7 +314,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
             "messages": conv.anthropic,
             "stream": true,
             "output_config": {"effort": cfg.effort},
-            "tools": anthropic_tools(exe.is_some()),
+            "tools": anthropic_tools(turn.cfg.drawing.enabled, exe.is_some()),
         });
         let mut req = client
             .post(&url)
@@ -480,13 +497,16 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             "max_tokens": cfg.max_tokens,
         });
         if cfg.tools {
-            let mut tools = vec![
-                json!({"type": "function", "function": {"name": "draw", "description": DRAW_DESC, "parameters": draw_schema()}}),
-            ];
+            let mut tools = Vec::new();
+            if turn.cfg.drawing.enabled {
+                tools.push(json!({"type": "function", "function": {"name": "draw", "description": DRAW_DESC, "parameters": draw_schema()}}));
+            }
             if exe.is_some() {
                 tools.push(json!({"type": "function", "function": {"name": "desktop", "description": crate::desktop::DESC, "parameters": crate::desktop::schema()}}));
             }
-            body["tools"] = json!(tools);
+            if !tools.is_empty() {
+                body["tools"] = json!(tools);
+            }
         }
         let mut req = client.post(&url).header("content-type", "application/json");
         if !key.is_empty() {
@@ -725,17 +745,25 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
     if desktop {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         env.insert(
+            "SCREENBUDDY_DESKTOP_SESSION".into(),
+            json!(crate::desktop::new_session_id()),
+        );
+        env.insert(
             "SCREENBUDDY_APPROVAL_PORT".into(),
             json!(listener.local_addr()?.port().to_string()),
         );
         spawn_approval_server(listener, approver.clone(), done.clone());
     }
     let mcp = json!({"mcpServers": {"screenbuddy": {"type": "stdio", "command": exe.to_string_lossy(), "args": ["--mcp"], "env": env}}}).to_string();
-    let allowed = if desktop {
-        "mcp__screenbuddy__draw mcp__screenbuddy__desktop"
-    } else {
-        "mcp__screenbuddy__draw"
-    };
+    let mut allowed_list = Vec::new();
+    if full_cfg.drawing.enabled {
+        allowed_list.push("mcp__screenbuddy__draw");
+    }
+    if desktop {
+        allowed_list.push("mcp__screenbuddy__desktop");
+    }
+    let allowed = if allowed_list.is_empty() { "none".to_string() } else { allowed_list.join(" ") };
+    let allowed = allowed.as_str();
     let system = system_prompt(full_cfg);
     let build = |program: &str| {
         let mut c = Command::new(program);

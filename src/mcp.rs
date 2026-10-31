@@ -90,7 +90,9 @@ fn desktop(input: &Value) -> (String, bool) {
             true,
         );
     }
-    let out = crate::desktop::run(&exe, &args);
+    let cfg = crate::config::load().0;
+    let session = std::env::var("SCREENBUDDY_DESKTOP_SESSION").unwrap_or_else(|_| crate::desktop::new_session_id());
+    let out = crate::desktop::exec(&exe, &args, &intent, &crate::desktop::Ctx::from_config(&cfg, session));
     let ok = serde_json::from_str::<Value>(&out)
         .ok()
         .and_then(|v| v["ok"].as_bool())

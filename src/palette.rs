@@ -15,7 +15,6 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Logical sizes.
-const WIDTH: f32 = 680.0;
 const BAR_H: f32 = 60.0;
 const MAX_H: f32 = 560.0;
 const PAD: f32 = 18.0;
@@ -26,7 +25,6 @@ const TEXT: Color32 = Color32::from_rgb(236, 236, 240);
 const TEXT_2: Color32 = Color32::from_rgb(152, 152, 160);
 const TEXT_3: Color32 = Color32::from_rgb(105, 105, 112);
 const HAIRLINE: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
-const ACCENT: Color32 = Color32::from_rgb(10, 132, 255);
 const ERROR: Color32 = Color32::from_rgb(255, 128, 118);
 
 pub enum Outcome {
@@ -100,16 +98,21 @@ pub struct Palette {
     /// An agent-desktop action waiting for Allow / Don't Allow.
     pending: Option<(String, String, std::sync::mpsc::Sender<bool>)>,
     allow_all: bool,
+    accent: Color32,
+    width: f32,
 }
 
 /// Opens the palette and blocks until it closes.
 pub fn run(cfg: Config, cap: Capture, notice: Option<String>) -> Outcome {
     let outcome = Arc::new(std::sync::Mutex::new(Outcome::Closed));
+    let accent = accent_of(&cfg);
+    let text_size = cfg.appearance.text_size.clamp(11.0, 22.0);
+    let width = cfg.appearance.width.clamp(480.0, 1100.0);
     let out2 = outcome.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("screenbuddy")
-            .with_inner_size([WIDTH, BAR_H])
+            .with_inner_size([width, BAR_H])
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
@@ -122,7 +125,7 @@ pub fn run(cfg: Config, cap: Capture, notice: Option<String>) -> Outcome {
         "screenbuddy",
         options,
         Box::new(move |cc| {
-            setup_style(&cc.egui_ctx);
+            setup_style(&cc.egui_ctx, accent, text_size);
             win::set_ctx(Some(cc.egui_ctx.clone()));
             Ok(Box::new(Palette::new(cfg, cap, notice, out2)))
         }),
@@ -137,7 +140,7 @@ pub fn run(cfg: Config, cap: Capture, notice: Option<String>) -> Outcome {
 
 /// Segoe UI Variable (Windows 11) or Segoe UI, with Segoe UI Symbol as glyph
 /// fallback and Cascadia/Consolas for code. Read from the Windows font folder.
-fn setup_fonts(ctx: &egui::Context) {
+pub fn setup_fonts(ctx: &egui::Context) {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     let read = |file: &str| std::fs::read(format!(r"{windir}\Fonts\{file}")).ok();
     let mut defs = egui::FontDefinitions::default();
@@ -164,25 +167,30 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(defs);
 }
 
-fn setup_style(ctx: &egui::Context) {
+pub fn accent_of(cfg: &Config) -> Color32 {
+    let [r, g, b] = config::hex_rgb(&cfg.appearance.accent).unwrap_or([10, 132, 255]);
+    Color32::from_rgb(r, g, b)
+}
+
+pub fn setup_style(ctx: &egui::Context, accent: Color32, text_size: f32) {
     setup_fonts(ctx);
     let mut v = egui::Visuals::dark();
     v.panel_fill = Color32::TRANSPARENT;
     v.window_fill = Color32::TRANSPARENT;
     v.extreme_bg_color = Color32::from_white_alpha(10);
     v.code_bg_color = Color32::from_white_alpha(16);
-    v.selection.bg_fill = ACCENT.linear_multiply(0.45);
-    v.selection.stroke.color = ACCENT;
-    v.hyperlink_color = ACCENT;
+    v.selection.bg_fill = accent.linear_multiply(0.45);
+    v.selection.stroke.color = accent;
+    v.hyperlink_color = accent;
     v.override_text_color = Some(TEXT);
-    v.text_cursor.stroke.color = ACCENT;
+    v.text_cursor.stroke.color = accent;
     v.widgets.noninteractive.bg_stroke.color = HAIRLINE;
     ctx.set_visuals(v);
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 7.0);
         s.text_styles = [
-            (TextStyle::Heading, FontId::proportional(19.0)),
-            (TextStyle::Body, FontId::proportional(15.0)),
+            (TextStyle::Heading, FontId::proportional(text_size + 4.0)),
+            (TextStyle::Body, FontId::proportional(text_size)),
             (TextStyle::Button, FontId::proportional(14.0)),
             (TextStyle::Small, FontId::proportional(12.5)),
             (TextStyle::Monospace, FontId::monospace(13.5)),
@@ -193,7 +201,7 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 /// Windows 11 chrome: rounded corners and the system shadow.
-fn apply_chrome(hwnd: HWND) {
+pub fn apply_chrome(hwnd: HWND) {
     use windows::Win32::Graphics::Dwm::*;
     unsafe {
         let dark: i32 = 1;
@@ -240,6 +248,8 @@ impl Palette {
         let jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
         let conv = Conversation::default();
         llm::prewarm(&cfg, &conv);
+        let accent = accent_of(&cfg);
+        let width = cfg.appearance.width.clamp(480.0, 1100.0);
         Self {
             cfg,
             cap,
@@ -264,6 +274,8 @@ impl Palette {
             history_dir: None,
             pending: None,
             allow_all: false,
+            accent,
+            width,
         }
     }
 
@@ -340,7 +352,8 @@ impl Palette {
     }
 
     fn draw(&mut self, input: serde_json::Value) -> Result<String, String> {
-        let call = overlay::parse_draw(&input, &self.cap)?;
+        let color = config::hex_rgb(&self.cfg.drawing.color).unwrap_or([10, 132, 255]);
+        let call = overlay::parse_draw(&input, &self.cap, color)?;
         let n = call.shapes.len();
         if self.overlay.is_none() {
             let ov = Overlay::new(self.cap.monitor.rect, self.cap.monitor.scale)
@@ -454,7 +467,7 @@ impl Palette {
                     let _ = reply.send(r);
                 }
                 Ev::Approve(intent, detail, reply) => {
-                    if self.allow_all {
+                    if self.allow_all || self.cfg.agent_desktop.approval == "never" {
                         let _ = reply.send(true);
                     } else {
                         self.pending = Some((intent, detail, reply));
@@ -528,8 +541,19 @@ impl Palette {
             let _ = GetWindowRect(hwnd, &mut r);
             let w = r.right - r.left;
             let work = capture::monitor_at(self.cap.cursor.0, self.cap.cursor.1).work;
-            let x = work.x + (work.w - w) / 2;
-            let y = work.y + (work.h as f32 * 0.2) as i32;
+            let s = self.cap.monitor.scale;
+            let (x, y) = match self.cfg.appearance.position.as_str() {
+                "cursor" => {
+                    let gap = (16.0 * s) as i32;
+                    let max_h = (MAX_H * s) as i32;
+                    let (cx, cy) = self.cap.cursor;
+                    let x = (cx - w / 2).clamp(work.x, (work.x + work.w - w).max(work.x));
+                    let y = if cy + gap + max_h <= work.y + work.h { cy + gap } else { (cy - gap - max_h).max(work.y) };
+                    (x, y)
+                }
+                "center" => (work.x + (work.w - w) / 2, work.y + (work.h - (MAX_H * s) as i32).max(0) / 2),
+                _ => (work.x + (work.w - w) / 2, work.y + (work.h as f32 * 0.2) as i32),
+            };
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE);
             let _ = SetForegroundWindow(hwnd);
         }
@@ -576,6 +600,7 @@ impl Palette {
         if focused {
             self.was_focused = true;
         } else if self.was_focused
+            && self.cfg.appearance.dismiss_on_blur
             && !self.busy()
             && self.overlay.as_ref().is_none_or(|o| o.is_empty())
         {
@@ -618,7 +643,14 @@ impl Palette {
                 .font(TextStyle::Heading)
                 .frame(egui::Frame::NONE)
                 .desired_width(f32::INFINITY);
-            let resp = ui.add(edit);
+            let gear_w = 26.0;
+            let resp = ui.add_sized([ui.available_width() - gear_w, 28.0], edit);
+            let gear = ui
+                .add(egui::Button::new(RichText::new("⚙").color(TEXT_3).size(16.0)).frame(false))
+                .on_hover_text("Settings");
+            if gear.clicked() {
+                self.open_settings(ui.ctx());
+            }
             if !resp.has_focus() && self.frames < 8 {
                 resp.request_focus();
             }
@@ -635,6 +667,8 @@ impl Palette {
         let busy = self.busy();
         let mut open_settings = false;
         let mut decision: Option<(bool, bool)> = None;
+        let accent = self.accent;
+        let once = self.cfg.agent_desktop.approval == "once";
         let out = egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, true])
@@ -694,10 +728,14 @@ impl Palette {
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 if ui
-                                    .link(RichText::new("Allow for this conversation").size(13.0))
+                                    .link(RichText::new("Always allow").size(13.0))
+                                    .on_hover_text("Never ask again. Change this in Settings → Agent.")
                                     .clicked()
                                 {
                                     decision = Some((true, true));
+                                }
+                                if once {
+                                    ui.label(RichText::new("Allowing covers the rest of this conversation").color(TEXT_3).size(12.0));
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -705,7 +743,7 @@ impl Palette {
                                         let allow = egui::Button::new(
                                             RichText::new("Allow").color(Color32::WHITE),
                                         )
-                                        .fill(ACCENT)
+                                        .fill(accent)
                                         .corner_radius(7)
                                         .min_size(egui::vec2(84.0, 28.0));
                                         if ui.add(allow).clicked() {
@@ -733,15 +771,33 @@ impl Palette {
             self.decide(allow, all);
         }
         if open_settings {
-            crate::tray::handle_passive(crate::tray::SETTINGS);
+            self.open_settings(ui.ctx());
         }
     }
 
-    fn decide(&mut self, allow: bool, all: bool) {
+    /// Resolves the pending approval. `always` switches approvals off for good.
+    fn decide(&mut self, allow: bool, always: bool) {
         if let Some((_, _, reply)) = self.pending.take() {
             let _ = reply.send(allow);
         }
-        self.allow_all |= all;
+        if allow && self.cfg.agent_desktop.approval == "once" {
+            self.allow_all = true;
+        }
+        if always {
+            self.allow_all = true;
+            self.cfg.agent_desktop.approval = "never".into();
+            let (mut disk, _) = config::load();
+            disk.agent_desktop.approval = "never".into();
+            if let Err(e) = config::save(&disk) {
+                config::log(&format!("saving approval mode failed: {e}"));
+            }
+        }
+    }
+
+    /// Closes the palette and opens the Settings window.
+    fn open_settings(&mut self, ctx: &egui::Context) {
+        win::push(AppEvent::Menu(crate::tray::SETTINGS.into()));
+        self.close(ctx);
     }
 
     /// Grows/shrinks the window smoothly toward its content height.
@@ -759,7 +815,7 @@ impl Palette {
                 self.height = target;
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                WIDTH,
+                self.width,
                 self.height.round(),
             )));
             ctx.request_repaint();

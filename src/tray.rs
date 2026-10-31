@@ -72,7 +72,7 @@ pub fn create(hotkey: &str, region_hotkey: &str) -> anyhow::Result<Tray> {
             None,
         ),
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id(SETTINGS, "Edit settings…", true, None),
+        &MenuItem::with_id(SETTINGS, "Settings…", true, None),
         &MenuItem::with_id(RELOAD, "Reload settings", true, None),
         &MenuItem::with_id(HISTORY, "Open history folder", true, None),
         &autostart,
@@ -112,11 +112,6 @@ pub enum Passive {
 /// Menu actions that work regardless of whether the palette is open.
 pub fn handle_passive(id: &str) -> Passive {
     match id {
-        SETTINGS => {
-            let _ = crate::config::load(); // ensure the file exists
-            win::shell_open(&crate::config::config_path());
-            Passive::Handled
-        }
         HISTORY => {
             win::shell_open(&crate::config::history_dir());
             Passive::Handled
