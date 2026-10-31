@@ -15,34 +15,27 @@ Native Windows screen assistant in Rust. Press a hotkey, ask about what's on scr
 | Send · newline · cancel/close | `Enter` · `Shift+Enter` · `Esc` |
 | Close the palette | press the hotkey again, `Esc`, or `✕` |
 
-In the palette header, `⟳` takes a new screenshot (the palette and the drawings are left out of it) and `⌫` clears the drawings. If the palette covers what the model drew, it moves to a corner out of the way. Follow-up questions keep the conversation going.
+The palette is a Spotlight-style bar, centered in the upper part of the screen. It grows into a card as the answer streams in. Clicking the screenshot thumbnail retakes the screenshot. Clicking elsewhere dismisses the palette, unless something is drawn on screen, so you can still click the thing it pointed at. The model only draws when pointing actually helps you find something. If the palette covers what it drew, the palette moves out of the way. Follow-up questions keep the conversation going.
 
 The tray menu has: edit settings, reload settings, open the history folder, start with Windows, and quit.
 
+## Doing things for you (agent-desktop)
+
+If [agent-desktop](https://github.com/vercel-labs/agent-desktop) is installed, just ask screenbuddy to do something: "open Notepad and type hi", "turn on dark mode", "reply 'on my way' in Slack". There's an **Install** button in Settings → Agent (it runs `npm install -g agent-desktop`). It works through the accessibility tree, not pixels. Reading apps (`snapshot`, `list-apps`, …) never asks.
+
+Permission for actions (Settings → Agent):
+
+- **Ask once per chat** (default): approve the first action, and the rest of that conversation runs on its own.
+- **Ask every time**: one Allow / Don't Allow card per click or keystroke.
+- **Never ask**: acts right away. "Always allow" on the approval card switches to this.
+
+While it acts, the agent has its own cursor (agent-desktop's cursor overlay) with a short label saying what it's doing. You can pick the body, outline and highlight colors, or turn it off. Each conversation runs in its own agent-desktop session.
+
 ## Settings
 
-`%APPDATA%\screenbuddy\config.toml` is created on first run. It's re-read every time you press the hotkey, so there's nothing to restart.
+Tray → **Settings…**, or the ⚙ in the palette. Sections: General (shortcuts with press-to-record, open at login, history), Model (provider, keys, model, effort, warm-process time), Appearance (accent, position, width, text size, close on blur), Drawing (on/off, color), Agent (install, permission, cursor), Advanced (custom instructions, config file, log, reset). Changes save immediately.
 
-```toml
-provider = "anthropic"            # anthropic | openai | claude-cli
-hotkey = "Ctrl+Shift+Space"
-region_hotkey = "Ctrl+Shift+R"
-history = false                   # save screenshot + chat.md per session
-
-[anthropic]                       # api_key or ANTHROPIC_API_KEY
-model = "claude-opus-5-5"
-effort = "medium"
-fallbacks = true                  # server-side refusal fallback (beta)
-
-[openai]                          # any OpenAI-compatible endpoint
-base_url = "https://openrouter.ai/api/v1"   # or DeepSeek, Ollama http://localhost:11434/v1
-model = "anthropic/claude-opus-5-5"
-tools = true                      # set false for models without tool calls
-
-[claude_cli]                      # Claude subscription via Claude Code
-command = "claude"
-model = ""                        # e.g. "opus"
-```
+Everything is stored in `%APPDATA%\screenbuddy\config.toml`, which you can also edit by hand. It's re-read every time you press the hotkey.
 
 ## Providers
 
