@@ -156,7 +156,9 @@ pub fn thumb(r: Rect, max_edge: u32) -> anyhow::Result<(u32, u32, Vec<u8>)> {
             anyhow::bail!("thumbnail capture failed");
         }
         let luma = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|p| ((p[2] as u32 * 77 + p[1] as u32 * 150 + p[0] as u32 * 29) >> 8) as u8)
             .collect();
         Ok((tw as u32, th as u32, luma))

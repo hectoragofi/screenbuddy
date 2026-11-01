@@ -54,17 +54,17 @@ impl Frame {
     fn scale_y(&self) -> f32 {
         self.src.h as f32 / self.h.max(1) as f32
     }
-    pub fn to_screen(&self, x: f32, y: f32) -> (f32, f32) {
+    pub fn to_screen(self, x: f32, y: f32) -> (f32, f32) {
         (self.src.x as f32 + x * self.scale(), self.src.y as f32 + y * self.scale_y())
     }
-    pub fn from_screen(&self, x: f32, y: f32) -> (f32, f32) {
+    pub fn image_point(&self, x: f32, y: f32) -> (f32, f32) {
         ((x - self.src.x as f32) / self.scale(), (y - self.src.y as f32) / self.scale_y())
     }
     /// A screen rectangle in this image's pixels, clipped to the image.
     pub fn rect_in(&self, r: Rect) -> Option<(f32, f32, f32, f32)> {
         let c = uia::intersect(r, self.src)?;
-        let (x0, y0) = self.from_screen(c.x as f32, c.y as f32);
-        let (x1, y1) = self.from_screen((c.x + c.w) as f32, (c.y + c.h) as f32);
+        let (x0, y0) = self.image_point(c.x as f32, c.y as f32);
+        let (x1, y1) = self.image_point((c.x + c.w) as f32, (c.y + c.h) as f32);
         Some((x0, y0, x1 - x0, y1 - y0))
     }
 }
@@ -358,7 +358,7 @@ fn resolve(mut input: Value, base: Frame, zooms: &[Frame], els: &[Element]) -> R
             for (kx, ky) in [("x", "y"), ("x2", "y2")] {
                 if let (Some(x), Some(y)) = (num(obj, kx), num(obj, ky)) {
                     let (sx, sy) = z.to_screen(x, y);
-                    let (bx, by) = base.from_screen(sx, sy);
+                    let (bx, by) = base.image_point(sx, sy);
                     obj.insert(kx.into(), round(bx));
                     obj.insert(ky.into(), round(by));
                 }
@@ -771,7 +771,7 @@ mod tests {
     fn frame_roundtrip() {
         let b = base();
         let (sx, sy) = b.to_screen(100.0, 50.0);
-        let (x, y) = b.from_screen(sx, sy);
+        let (x, y) = b.image_point(sx, sy);
         assert!((x - 100.0).abs() < 1e-3 && (y - 50.0).abs() < 1e-3);
         let (rx, ry, rw, rh) = b.rect_in(Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }).unwrap();
         assert!((rx - 143.0).abs() < 0.01 && (ry - 80.4).abs() < 0.01, "{rx},{ry}");
