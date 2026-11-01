@@ -10,7 +10,9 @@ mod overlay;
 mod palette;
 mod settings;
 mod tray;
+mod uia;
 mod util;
+mod vision;
 mod win;
 
 use win::AppEvent;
@@ -103,6 +105,7 @@ impl App {
             }
         };
         drop(shot); // free the raw pixels before the window opens
+        vision::set_capture(&cap, &self.cfg);
         palette::run(self.cfg.clone(), cap, self.cfg_error.clone())
     }
 }
@@ -190,6 +193,12 @@ fn headless(q: &str) -> i32 {
             return 1;
         }
     };
+    vision::set_capture(&cap, &cfg);
+    if std::env::args().any(|a| a == "--uia") {
+        let t = std::time::Instant::now();
+        let list = vision::context(&cfg);
+        println!("[uia {} ms]{list}", t.elapsed().as_millis());
+    }
     println!(
         "[{} | {}x{} jpeg {} KB]",
         cfg.provider_label(),

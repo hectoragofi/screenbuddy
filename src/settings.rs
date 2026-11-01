@@ -381,6 +381,19 @@ impl Settings {
                 ui.add_space(4.0);
             });
         }
+        group(ui, "Seeing your screen", |ui| {
+            row(ui, "Read app structure", Some("Sends element names and positions from the accessibility tree, so pointers land exactly"), |ui| {
+                toggle(ui, &mut self.cfg.vision.ui_tree, accent);
+            });
+            sep(ui);
+            row(ui, "Zoom in", Some("Lets it look at small text at full resolution"), |ui| {
+                toggle(ui, &mut self.cfg.vision.zoom, accent);
+            });
+            sep(ui);
+            row(ui, "Guide mode", Some("\"Walk me through…\": points at each step and waits for you"), |ui| {
+                toggle(ui, &mut self.cfg.vision.guide, accent);
+            });
+        });
     }
 
     fn agent(&mut self, ui: &mut egui::Ui, accent: Color32) {

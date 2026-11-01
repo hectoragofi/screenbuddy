@@ -65,9 +65,11 @@ pub fn draw_schema() -> Value {
                         "h": {"type": "number"},
                         "r": {"type": "number", "description": "circle radius"},
                         "label": {"type": "string", "description": "short label, 1-4 words or a short formula; LaTeX in $...$ is rendered"},
-                        "color": {"type": "string", "description": "red, orange, yellow, green, blue, purple, pink, white or #rrggbb"}
+                        "color": {"type": "string", "description": "red, orange, yellow, green, blue, purple, pink, white or #rrggbb"},
+                        "element": {"type": "string", "description": "id of a UI element from the element list (e.g. e12); the shape snaps to its bounds and x,y,w,h may be omitted"},
+                        "zoom": {"type": "string", "description": "zoom id (e.g. z1) when the coordinates are pixels of that zoom image"}
                     },
-                    "required": ["kind", "x", "y"]
+                    "required": ["kind"]
                 }
             }
         },
@@ -183,7 +185,7 @@ impl Out {
     fn delta(&self, s: impl Into<String>) {
         self.send(Ev::Delta(s.into()));
     }
-    fn status(&self, s: impl Into<String>) {
+    pub(crate) fn status(&self, s: impl Into<String>) {
         self.send(Ev::Status(s.into()));
     }
     /// Asks the user to approve an action; false on deny or timeout.
@@ -233,7 +235,8 @@ impl Out {
     }
 
     /// Sends a draw call to the UI thread and waits for its result.
-    fn draw(&self, input: Value) -> Result<String, String> {
+    pub(crate) fn draw(&self, input: Value) -> Result<String, String> {
+        let input = crate::vision::resolve_draw(input)?;
         let (tx, rx) = std::sync::mpsc::channel();
         let _hold = self.watch.hold();
         self.send(Ev::Draw(input, tx));
@@ -251,6 +254,7 @@ pub fn spawn(turn: Turn, out: Out) {
         let mut out = out;
         out.dctx = Some(crate::desktop::Ctx::from_config(&turn.cfg, conv.desktop_session.clone()));
         let out = out;
+        crate::vision::turn_started(&out, &turn.cancel);
         let res = match turn.cfg.provider.as_str() {
             "openai" => openai(&turn, &mut conv, &out),
             "claude-cli" => claude_cli(&turn, &mut conv, &out),
@@ -305,6 +309,7 @@ fn system_prompt(cfg: &Config) -> String {
         p.push_str("\n\n");
         p.push_str(DRAW_PROMPT);
     }
+    p.push_str(&crate::vision::prompt(cfg));
     if cfg.desktop_exe().is_some() {
         p.push_str("\n\n");
         p.push_str(crate::desktop::PROMPT);
@@ -319,8 +324,11 @@ fn system_prompt(cfg: &Config) -> String {
 fn question_text(turn: &Turn) -> String {
     match &turn.image {
         Some(img) => format!(
-            "[Screenshot attached: {}x{} px]\n\n{}",
-            img.w, img.h, turn.question
+            "[Screenshot attached: {}x{} px]{}\n\n{}",
+            img.w,
+            img.h,
+            crate::vision::context(&turn.cfg),
+            turn.question
         ),
         None => turn.question.clone(),
     }
@@ -419,7 +427,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
     let exe = turn.cfg.desktop_exe();
     let url = format!("{}/v1/messages", cfg.base_url.trim_end_matches('/'));
     let mut wrote_text = false;
-    for _round in 0..8 {
+    for _round in 0..crate::vision::MAX_ROUNDS {
         let mut body = json!({
             "model": cfg.model,
             "max_tokens": cfg.max_tokens,
@@ -427,7 +435,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
             "messages": conv.anthropic,
             "stream": true,
             "output_config": {"effort": cfg.effort},
-            "tools": anthropic_tools(turn.cfg.drawing.enabled, exe.is_some()),
+            "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some()), &turn.cfg),
         });
         let mut req = client
             .post(&url)
@@ -446,6 +454,8 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
         let mut stop_reason = String::new();
         let mut stream_err: Option<String> = None;
         let mut tool_results: Vec<Value> = Vec::new();
+        // zoom/watch run after the stream ends (watch can block for minutes).
+        let mut deferred: Vec<(usize, Value, String, Value)> = Vec::new();
 
         let ended = sse_lines(resp, &turn.cancel, &out.watch, STALL, |data| {
             let Ok(ev) = serde_json::from_str::<Value>(data) else {
@@ -499,6 +509,13 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
                                 serde_json::from_str::<Value>(&raw)
                             };
                             let id = b["id"].clone();
+                            let name = b["name"].as_str().unwrap_or("").to_string();
+                            if let (true, Ok(input)) = (crate::vision::is_tool(&name), &parsed) {
+                                b["input"] = input.clone();
+                                deferred.push((tool_results.len(), id, name, input.clone()));
+                                tool_results.push(Value::Null);
+                                return Ok(true);
+                            }
                             let (text, is_err) = match parsed {
                                 Ok(input) => {
                                     b["input"] = input.clone();
@@ -556,6 +573,10 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
         conv.anthropic.push(
             json!({"role": "assistant", "content": blocks.into_values().collect::<Vec<_>>()}),
         );
+        for (i, id, name, input) in deferred {
+            let r = crate::vision::handle(&name, &input, out);
+            tool_results[i] = json!({"type": "tool_result", "tool_use_id": id, "content": r.anthropic(), "is_error": r.is_error});
+        }
         match stop_reason.as_str() {
             "tool_use" if !tool_results.is_empty() => {
                 conv.anthropic
@@ -605,7 +626,7 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
     let exe = turn.cfg.desktop_exe();
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let mut wrote_text = false;
-    for _round in 0..8 {
+    for _round in 0..crate::vision::MAX_ROUNDS {
         let mut body = json!({
             "model": cfg.model,
             "messages": conv.openai,
@@ -620,6 +641,7 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             if exe.is_some() {
                 tools.push(json!({"type": "function", "function": {"name": "desktop", "description": crate::desktop::DESC, "parameters": crate::desktop::schema()}}));
             }
+            tools.extend(crate::vision::openai_tools(&turn.cfg));
             if !tools.is_empty() {
                 body["tools"] = json!(tools);
             }
@@ -700,15 +722,29 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             .map(|(id, name, args)| json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}}))
             .collect();
         conv.openai.push(json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) }, "tool_calls": tool_calls}));
+        let mut images = Vec::new();
         for (id, name, args) in calls.values() {
             let input =
                 serde_json::from_str::<Value>(if args.trim().is_empty() { "{}" } else { args });
             let result = match input {
+                Ok(input) if crate::vision::is_tool(name) => {
+                    let r = crate::vision::handle(name, &input, out);
+                    if let Some(img) = r.openai_image() {
+                        images.push(json!({"type": "text", "text": format!("Image returned by {name}:")}));
+                        images.push(img);
+                        format!("{} (image in the next message)", r.text)
+                    } else {
+                        r.text
+                    }
+                }
                 Ok(input) => out.tool(name, input, exe.as_deref()).0,
                 Err(e) => format!("error: arguments were not valid JSON ({e})"),
             };
             conv.openai
                 .push(json!({"role": "tool", "tool_call_id": id, "content": result}));
+        }
+        if !images.is_empty() {
+            conv.openai.push(json!({"role": "user", "content": images}));
         }
     }
     Ok(())
@@ -956,6 +992,7 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
         );
         spawn_approval_server(listener, approver.clone(), done.clone());
     }
+    crate::vision::cli_env(&mut env);
     let mcp = json!({"mcpServers": {"screenbuddy": {"type": "stdio", "command": exe.to_string_lossy(), "args": ["--mcp"], "env": env}}}).to_string();
     let mut allowed_list = Vec::new();
     if full_cfg.drawing.enabled {
@@ -964,6 +1001,7 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
     if desktop {
         allowed_list.push("mcp__screenbuddy__desktop");
     }
+    allowed_list.extend(crate::vision::cli_allowed(full_cfg));
     let allowed = if allowed_list.is_empty() { "none".to_string() } else { allowed_list.join(" ") };
     let allowed = allowed.as_str();
     let system = system_prompt(full_cfg);
