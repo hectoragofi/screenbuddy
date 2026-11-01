@@ -16,6 +16,7 @@ pub struct Config {
     pub extra_instructions: String,
     pub appearance: AppearanceCfg,
     pub drawing: DrawingCfg,
+    pub vision: VisionCfg,
     pub anthropic: AnthropicCfg,
     pub openai: OpenAiCfg,
     pub claude_cli: ClaudeCliCfg,
@@ -85,6 +86,23 @@ pub struct DrawingCfg {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
+pub struct VisionCfg {
+    /// Send element names and bounds from the accessibility tree with the screenshot.
+    pub ui_tree: bool,
+    /// Let the assistant re-capture a region at full resolution.
+    pub zoom: bool,
+    /// Step-by-step guide mode: wait for you to act, then look again.
+    pub guide: bool,
+}
+
+impl Default for VisionCfg {
+    fn default() -> Self {
+        Self { ui_tree: true, zoom: true, guide: true }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct AnthropicCfg {
     /// Empty = ANTHROPIC_API_KEY environment variable.
     pub api_key: String,
@@ -147,6 +165,7 @@ impl Default for Config {
             extra_instructions: String::new(),
             appearance: AppearanceCfg::default(),
             drawing: DrawingCfg::default(),
+            vision: VisionCfg::default(),
             anthropic: AnthropicCfg::default(),
             openai: OpenAiCfg::default(),
             claude_cli: ClaudeCliCfg::default(),

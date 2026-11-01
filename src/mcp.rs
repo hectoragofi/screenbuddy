@@ -55,6 +55,7 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
                     "inputSchema": crate::desktop::schema()
                 }));
             }
+            tools.extend(crate::vision::mcp_tools());
             Ok(json!({"tools": tools}))
         }
         "tools/call" => {
@@ -62,6 +63,7 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
             let (text, is_error) = match p["name"].as_str() {
                 Some("draw") => validate(&p["arguments"]),
                 Some("desktop") => desktop(&p["arguments"]),
+                Some(n) if crate::vision::is_tool(n) => return Ok(crate::vision::mcp_call(n, &p["arguments"])),
                 _ => return Err((-32602, format!("unknown tool {}", p["name"]))),
             };
             Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
@@ -125,8 +127,9 @@ fn validate(args: &Value) -> (String, bool) {
         return ("error: `shapes` must be an array".into(), true);
     };
     for (i, s) in shapes.iter().enumerate() {
-        if s["kind"].as_str().is_none() || s["x"].as_f64().is_none() || s["y"].as_f64().is_none() {
-            return (format!("error: shape {i} needs kind, x, y"), true);
+        let placed = s["element"].is_string() || (s["x"].as_f64().is_some() && s["y"].as_f64().is_some());
+        if s["kind"].as_str().is_none() || !placed {
+            return (format!("error: shape {i} needs kind and x, y (or element)"), true);
         }
     }
     (

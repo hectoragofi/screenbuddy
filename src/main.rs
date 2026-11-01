@@ -12,8 +12,10 @@ mod overlay;
 mod palette;
 mod settings;
 mod tray;
+mod uia;
 mod util;
 mod voice;
+mod vision;
 mod win;
 
 use win::AppEvent;
@@ -98,12 +100,21 @@ impl App {
     /// `grab`: pick up text selected in the foreground app (hotkey presses only).
     fn ask(&mut self, region: bool, grab: bool, mut start: palette::Start) -> palette::Outcome {
         self.reload();
+        // Start the Claude CLI now, in parallel with capture + window creation.
+        llm::warm_on_hotkey(&self.cfg);
         let mode = self.cfg.context.selection.as_str();
         if grab && mode != "off" {
             if let Some((text, app)) = context::selected_text(mode == "uia+copy") {
                 start.chips.insert(0, context::Chip::selection(&text, &app));
             }
         }
+        let out = self.open_palette(region, start);
+        llm::refill_spare(&self.cfg);
+        win::trim_memory();
+        out
+    }
+
+    fn open_palette(&mut self, region: bool, start: palette::Start) -> palette::Outcome {
         let shot = match capture::grab_monitor_under_cursor() {
             Ok(s) => s,
             Err(e) => {
@@ -127,10 +138,8 @@ impl App {
             }
         };
         drop(shot); // free the raw pixels before the window opens
-        let out = palette::run_with(self.cfg.clone(), cap, self.cfg_error.clone(), start);
-        llm::refill_spare(&self.cfg);
-        win::trim_memory();
-        out
+        vision::set_capture(&cap, &self.cfg);
+        palette::run_with(self.cfg.clone(), cap, self.cfg_error.clone(), start)
     }
 }
 
@@ -237,6 +246,12 @@ fn headless(q: &str) -> i32 {
             return 1;
         }
     };
+    vision::set_capture(&cap, &cfg);
+    if std::env::args().any(|a| a == "--uia") {
+        let t = std::time::Instant::now();
+        let list = vision::context(&cfg);
+        println!("[uia {} ms]{list}", t.elapsed().as_millis());
+    }
     println!(
         "[{} | {}x{} jpeg {} KB]",
         cfg.provider_label(),

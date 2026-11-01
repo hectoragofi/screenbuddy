@@ -64,7 +64,9 @@ struct Friendly {
 
 fn friendly(raw: &str) -> Friendly {
     let lower = raw.to_ascii_lowercase();
-    let (text, settings) = if lower.contains("api key") && lower.contains("no ") {
+    let (text, settings) = if raw.starts_with(llm::INTERRUPTED) {
+        ("The answer stopped partway.", false)
+    } else if lower.contains("api key") && lower.contains("no ") {
         ("Add an API key to get started.", true)
     } else if lower.contains("401")
         || lower.contains("authentication")
@@ -85,7 +87,12 @@ fn friendly(raw: &str) -> Friendly {
     };
     Friendly {
         text: text.into(),
-        detail: raw.chars().take(160).collect(),
+        detail: raw
+            .strip_prefix(llm::INTERRUPTED)
+            .unwrap_or(raw)
+            .chars()
+            .take(160)
+            .collect(),
         settings,
     }
 }
@@ -135,6 +142,8 @@ pub struct Palette {
     voice_dl: Option<Arc<std::sync::Mutex<voice::Download>>>,
     /// Start recording on the first frame / once the model is downloaded.
     voice_pending: bool,
+    /// egui time (s) at which to hand cold pages back to the OS; see `trim_when_idle`.
+    trim_at: f64,
 }
 
 /// Opens the palette and blocks until it closes.
@@ -181,6 +190,10 @@ pub fn run_with(cfg: Config, cap: Capture, notice: Option<String>, start: Start)
 
 /// Segoe UI Variable (Windows 11) or Segoe UI, with Segoe UI Symbol as glyph
 /// fallback and Cascadia/Consolas for code. Read from the Windows font folder.
+/// Seconds after opening at which start-up memory (GL driver init, shader
+/// compilation, font loading) is trimmed from the working set.
+const TRIM_AFTER_OPEN: f64 = 1.0;
+
 pub fn setup_fonts(ctx: &egui::Context) {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     let read = |file: &str| std::fs::read(format!(r"{windir}\Fonts\{file}")).ok();
@@ -274,6 +287,9 @@ fn status_text(s: &str) -> &'static str {
     match s {
         "drawing…" => "Pointing it out",
         "acting…" => "Working",
+        "zooming…" => "Looking closer",
+        "looking…" => "Looking",
+        "watching…" => "Watching for your next step · Esc stops",
         _ => "Thinking",
     }
 }
@@ -329,6 +345,7 @@ impl Palette {
             transcribing: None,
             voice_dl: None,
             voice_pending: start.voice,
+            trim_at: TRIM_AFTER_OPEN,
         }
     }
 
@@ -386,6 +403,32 @@ impl Palette {
         );
     }
 
+    /// Most of the open palette's working set is touched once while the GL
+    /// driver and egui start up (or while an answer streams) and then never
+    /// again. Trimming once things are idle returns those pages; anything still
+    /// in use soft-faults back in from RAM, so there is no visible cost.
+    fn trim_when_idle(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if self.frames < 3 {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(TRIM_AFTER_OPEN));
+        } else if now >= self.trim_at && !self.busy() {
+            self.trim_at = f64::INFINITY;
+            win::trim_memory();
+        }
+    }
+
+    /// Asks the last question again after it failed or was stopped. The
+    /// worker already rolled the conversation back to before that question.
+    fn retry(&mut self, ctx: &egui::Context) {
+        if self.busy() || self.exchanges.last().is_none_or(|x| x.error.is_none()) {
+            return;
+        }
+        let Some(x) = self.exchanges.pop() else { return };
+        let typed = std::mem::replace(&mut self.input, x.question);
+        self.send(ctx);
+        self.input = typed;
+    }
+
     /// Takes a fresh screenshot (palette + overlay are excluded from capture)
     /// and starts a new conversation about it.
     fn recapture(&mut self, ctx: &egui::Context) {
@@ -395,6 +438,7 @@ impl Palette {
         match capture::grab_monitor_under_cursor().and_then(|shot| capture::encode(&shot, None)) {
             Ok(mut cap) => {
                 cap.cursor = self.cap.cursor;
+                crate::vision::set_capture(&cap, &self.cfg);
                 self.save_history();
                 self.jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
                 self.cap = cap;
@@ -523,7 +567,13 @@ impl Palette {
                         x.answer.push_str(&t);
                     }
                 }
-                Ev::Status(s) => self.status = s,
+                Ev::Status(s) => {
+                    // Guide mode: the user clicks into their app; don't treat that as dismissal.
+                    if s == "watching…" {
+                        self.was_focused = false;
+                    }
+                    self.status = s
+                }
                 Ev::Draw(input, reply) => {
                     let r = self.draw(input);
                     if let Err(e) = &r {
@@ -544,6 +594,7 @@ impl Palette {
                     }
                 }
                 Ev::Done(conv) => {
+                    self.trim_at = 0.0; // the answer's working memory is now cold
                     self.conv = Some(conv);
                     self.status.clear();
                     keep = false;
@@ -1000,6 +1051,7 @@ impl Palette {
         let n = self.exchanges.len();
         let busy = self.busy();
         let mut open_settings = false;
+        let mut retry = false;
         let mut decision: Option<(bool, bool)> = None;
         let accent = self.accent;
         let once = self.cfg.agent_desktop.approval == "once";
@@ -1025,19 +1077,25 @@ impl Palette {
                             .render_math_fn(Some(&render))
                             .show(ui, &mut self.md, &crate::math::normalize(&x.answer));
                     }
-                    if last && busy && x.answer.is_empty() && self.pending.is_none() {
+                    let watching = self.status == "watching…";
+                    if last && busy && (x.answer.is_empty() || watching) && self.pending.is_none() {
                         // Soft pulsing status instead of a spinner.
                         let a = 0.45 + 0.35 * ((time * 3.2).sin() as f32 * 0.5 + 0.5);
-                        ui.label(
-                            RichText::new(status_text(&self.status))
-                                .color(TEXT_2.gamma_multiply(a)),
-                        );
+                        let (color, text) = if watching {
+                            (accent.gamma_multiply(a + 0.2), format!("◉ {}", status_text(&self.status)))
+                        } else {
+                            (TEXT_2.gamma_multiply(a), status_text(&self.status).to_string())
+                        };
+                        ui.label(RichText::new(text).color(color));
                     }
                     if let Some(e) = &x.error {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(&e.text).color(ERROR));
                             if e.settings && ui.link("Open settings").clicked() {
                                 open_settings = true;
+                            }
+                            if last && !busy && ui.link("Try again").clicked() {
+                                retry = true;
                             }
                         });
                         if e.text != "Stopped." {
@@ -1112,6 +1170,9 @@ impl Palette {
         }
         if open_settings {
             self.open_settings(ui.ctx());
+        }
+        if retry {
+            self.retry(ui.ctx());
         }
     }
 
@@ -1263,8 +1324,11 @@ impl eframe::App for Palette {
                 });
         }
         self.animate_height(&ctx);
+        self.trim_when_idle(&ctx);
         if self.busy() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            // Guide mode can wait for minutes: pulse slowly instead of at 30 fps.
+            let ms = if self.status == "watching…" { 250 } else { 33 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
     }
 }
