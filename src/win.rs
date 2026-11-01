@@ -13,6 +13,7 @@ use windows::core::PCWSTR;
 
 pub const HK_ASK: i32 = 1;
 pub const HK_REGION: i32 = 2;
+pub const HK_VOICE: i32 = 3;
 const WM_WAKE: u32 = WM_APP + 1;
 
 #[derive(Debug, Clone)]
@@ -20,6 +21,8 @@ pub enum AppEvent {
     Hotkey(i32),
     TrayClick,
     Menu(String),
+    /// A file sent from Explorer's "Ask screenbuddy" menu.
+    OpenFile(std::path::PathBuf),
 }
 
 static QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());
@@ -57,6 +60,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 LRESULT(0)
             }
             WM_WAKE => LRESULT(0),
+            WM_COPYDATA => match crate::context::path_from_copydata(lp) {
+                Some(p) => {
+                    push(AppEvent::OpenFile(p));
+                    LRESULT(1)
+                }
+                None => LRESULT(0),
+            },
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
@@ -192,6 +202,30 @@ pub fn register_hotkeys(ask: &str, region: &str) -> Vec<String> {
         }
     }
     errs
+}
+
+/// (Re)registers the push-to-talk hotkey; "" unregisters it.
+pub fn register_voice_hotkey(spec: &str) -> Option<String> {
+    let hwnd = main_hwnd();
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), HK_VOICE);
+    }
+    if spec.trim().is_empty() {
+        return None;
+    }
+    match parse_hotkey(spec) {
+        Ok((mods, vk)) => unsafe {
+            RegisterHotKey(Some(hwnd), HK_VOICE, mods, vk)
+                .is_err()
+                .then(|| format!("hotkey {spec} is taken by another app"))
+        },
+        Err(e) => Some(e),
+    }
+}
+
+/// True while the non-modifier key of a hotkey spec is physically held.
+pub fn hotkey_held(spec: &str) -> bool {
+    parse_hotkey(spec).is_ok_and(|(_, vk)| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0)
 }
 
 /// Our windows are hidden from screen capture (so re-captures stay clean)

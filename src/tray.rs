@@ -9,6 +9,7 @@ pub const REGION: &str = "region";
 pub const SETTINGS: &str = "settings";
 pub const RELOAD: &str = "reload";
 pub const HISTORY: &str = "history";
+pub const BROWSE: &str = "browse-history";
 pub const AUTOSTART: &str = "autostart";
 pub const QUIT: &str = "quit";
 
@@ -74,6 +75,7 @@ pub fn create(hotkey: &str, region_hotkey: &str) -> anyhow::Result<Tray> {
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(SETTINGS, "Settings…", true, None),
         &MenuItem::with_id(RELOAD, "Reload settings", true, None),
+        &MenuItem::with_id(BROWSE, "Browse history…", true, None),
         &MenuItem::with_id(HISTORY, "Open history folder", true, None),
         &autostart,
         &PredefinedMenuItem::separator(),

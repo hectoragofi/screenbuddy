@@ -31,6 +31,7 @@ enum Page {
     Model,
     Appearance,
     Drawing,
+    Voice,
     Agent,
     Advanced,
 }
@@ -40,6 +41,7 @@ const PAGES: &[(Page, &str, &str)] = &[
     (Page::Model, "◆", "Model"),
     (Page::Appearance, "◐", "Appearance"),
     (Page::Drawing, "✎", "Drawing"),
+    (Page::Voice, "◉", "Voice"),
     (Page::Agent, "➤", "Agent"),
     (Page::Advanced, "⚙", "Advanced"),
 ];
@@ -65,7 +67,13 @@ struct Settings {
     outcome: Arc<Mutex<Outcome>>,
     quit: bool,
     first: bool,
+    /// Voice model download in progress.
+    voice_dl: Option<Arc<Mutex<crate::voice::Download>>>,
+    voice_error: Option<String>,
 }
+
+/// Set by "Browse history" so the palette opens on the list once Settings closes.
+static BROWSE_AFTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Opens the Settings window and blocks until it closes.
 pub fn run() -> Outcome {
@@ -74,6 +82,7 @@ pub fn run() -> Outcome {
     let out2 = outcome.clone();
     // Our own global hotkeys would swallow the keys being recorded.
     win::register_hotkeys("", "");
+    win::register_voice_hotkey("");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("screenbuddy Settings")
@@ -94,6 +103,9 @@ pub fn run() -> Outcome {
     win::set_ctx(None);
     if let Err(e) = res {
         config::log(&format!("settings failed: {e}"));
+    }
+    if BROWSE_AFTER.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        win::push(AppEvent::Menu(crate::tray::BROWSE.into()));
     }
     std::mem::replace(&mut *outcome.lock().unwrap(), Outcome::Closed)
 }
@@ -116,6 +128,8 @@ impl Settings {
             outcome,
             quit: false,
             first: true,
+            voice_dl: None,
+            voice_error: None,
         }
     }
 
@@ -188,6 +202,7 @@ impl Settings {
             Page::Model => self.model(ui, accent),
             Page::Appearance => self.appearance(ui, accent),
             Page::Drawing => self.drawing(ui, accent),
+            Page::Voice => self.voice(ui, accent),
             Page::Agent => self.agent(ui, accent),
             Page::Advanced => self.advanced(ui, accent),
         }
@@ -213,13 +228,11 @@ impl Settings {
         if let Some(slot) = self.recording {
             if let Some(combo) = capture_hotkey(ui) {
                 match combo {
-                    Ok(s) => {
-                        if slot == 0 {
-                            self.cfg.hotkey = s;
-                        } else {
-                            self.cfg.region_hotkey = s;
-                        }
-                    }
+                    Ok(s) => match slot {
+                        0 => self.cfg.hotkey = s,
+                        1 => self.cfg.region_hotkey = s,
+                        _ => self.cfg.voice.hotkey = s,
+                    },
                     Err(()) => {}
                 }
                 self.recording = None;
@@ -242,12 +255,117 @@ impl Settings {
                 toggle(ui, &mut self.cfg.history, accent);
             });
             sep(ui);
-            row(ui, "History folder", None, |ui| {
+            row(ui, "Past conversations", Some("Search, read and continue them (Ctrl+H in the palette)"), |ui| {
                 if ui.button("Show in Explorer").clicked() {
                     win::shell_open(&config::history_dir());
                 }
+                if ui.add(primary("Browse history", accent)).clicked() {
+                    BROWSE_AFTER.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
         });
+        group(ui, "Context", |ui| {
+            row(ui, "Selected text", Some("Attach text you've selected in the app when you press the shortcut"), |ui| {
+                segmented(ui, &mut self.cfg.context.selection, &[("off", "Off"), ("uia", "Accessibility"), ("uia+copy", "+ Copy fallback")], accent);
+            });
+            sep(ui);
+            row(ui, "Explorer menu", Some("“Ask screenbuddy” when you right-click a file"), |ui| {
+                let mut on = self.cfg.context.explorer_menu;
+                if toggle(ui, &mut on, accent).changed() {
+                    match crate::context::set_explorer_menu(on) {
+                        Ok(()) => self.cfg.context.explorer_menu = on,
+                        Err(e) => self.save_error = Some(format!("Couldn't change the Explorer menu: {e}")),
+                    }
+                }
+            });
+        });
+        if self.cfg.context.selection == "uia+copy" {
+            hint(ui, "The copy fallback briefly sends Ctrl+C to apps that don't expose their selection, then puts your clipboard back.");
+        }
+    }
+
+    fn voice(&mut self, ui: &mut egui::Ui, accent: Color32) {
+        use crate::voice;
+        if let Some(dl) = &self.voice_dl {
+            let d = dl.lock().unwrap().clone();
+            if d.done {
+                self.voice_dl = None;
+                self.voice_error = d.error;
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+        group(ui, "Voice input", |ui| {
+            row(ui, "Push to talk", Some("Speak your question; transcribed on this PC by Whistle"), |ui| {
+                let mut on = self.cfg.voice.enabled;
+                if toggle(ui, &mut on, accent).changed() {
+                    self.cfg.voice.enabled = on;
+                    if on && !voice::model_ready() && self.voice_dl.is_none() {
+                        self.voice_error = None;
+                        self.voice_dl = Some(voice::start_download(Some(ui.ctx().clone())));
+                    }
+                }
+            });
+            sep(ui);
+            let rec = self.recording;
+            row(ui, "Shortcut", Some("Hold to talk, or tap to start and tap again to stop"), |ui| {
+                if hotkey_button(ui, &mut self.cfg.voice.hotkey, rec == Some(2), accent) {
+                    self.recording = if rec == Some(2) { None } else { Some(2) };
+                }
+            });
+            sep(ui);
+            row(ui, "Send automatically", Some("Ask as soon as the transcript is ready"), |ui| {
+                toggle(ui, &mut self.cfg.voice.auto_send, accent);
+            });
+            sep(ui);
+            row(ui, "Language", None, |ui| {
+                combo_text(ui, "voice_lang", &mut self.cfg.voice.language, voice::LANGUAGES);
+            });
+        });
+        if let Some(slot) = self.recording.filter(|&s| s == 2) {
+            if let Some(combo) = capture_hotkey(ui) {
+                if let Ok(s) = combo {
+                    let _ = slot;
+                    self.cfg.voice.hotkey = s;
+                }
+                self.recording = None;
+            }
+            hint(ui, "Press the new shortcut, with at least one of Ctrl, Alt, Shift or Win. Esc cancels.");
+        }
+        group(ui, "Model", |ui| {
+            let status = if !voice::engine_included() {
+                "Speech engine not included in this build".to_string()
+            } else if let Some(dl) = &self.voice_dl {
+                format!("Downloading… {:.0}%", dl.lock().unwrap().progress * 100.0)
+            } else if voice::model_ready() {
+                "Whistle · 16.9 MB · ready".to_string()
+            } else {
+                "Not downloaded".to_string()
+            };
+            row(ui, "Whistle by Cactus Compute", Some(&status), |ui| {
+                if self.voice_dl.is_some() {
+                    ui.spinner();
+                } else if voice::model_ready() {
+                    if ui.button("Remove").clicked() {
+                        if let Err(e) = voice::remove_model() {
+                            self.voice_error = Some(e.to_string());
+                        }
+                    }
+                } else if voice::engine_included() && ui.add(primary("Download", accent)).clicked() {
+                    self.voice_error = None;
+                    self.voice_dl = Some(voice::start_download(Some(ui.ctx().clone())));
+                }
+            });
+            if let Some(dl) = &self.voice_dl {
+                let p = dl.lock().unwrap().progress;
+                ui.add(egui::ProgressBar::new(p).desired_height(6.0));
+            }
+        });
+        if let Some(e) = &self.voice_error {
+            ui.label(RichText::new(format!("Download failed: {e}")).color(Color32::from_rgb(255, 120, 110)));
+        }
+        hint(ui, "Stored in %APPDATA%\\screenbuddy\\models. The microphone is only open while you record; nothing stays loaded afterwards.");
     }
 
     fn model(&mut self, ui: &mut egui::Ui, accent: Color32) {

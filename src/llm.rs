@@ -102,6 +102,7 @@ pub struct Conversation {
     pub desktop_session: String,
 }
 
+#[derive(Clone)]
 pub struct Image {
     pub jpeg: Arc<Vec<u8>>,
     pub w: u32,
@@ -113,6 +114,8 @@ pub struct Turn {
     pub conv: Conversation,
     pub question: String,
     pub image: Option<Image>,
+    /// Extra images attached by the user (e.g. an image file from Explorer).
+    pub attachments: Vec<Image>,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -419,6 +422,9 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
     if let Some(img) = &turn.image {
         content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(&img.jpeg)}}));
     }
+    for img in &turn.attachments {
+        content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(&img.jpeg)}}));
+    }
     content.push(json!({"type": "text", "text": question_text(turn)}));
     conv.anthropic
         .push(json!({"role": "user", "content": content}));
@@ -617,6 +623,9 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
     }
     let mut content = vec![json!({"type": "text", "text": question_text(turn)})];
     if let Some(img) = &turn.image {
+        content.push(json!({"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{}", b64(&img.jpeg))}}));
+    }
+    for img in &turn.attachments {
         content.push(json!({"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{}", b64(&img.jpeg))}}));
     }
     conv.openai
@@ -1110,6 +1119,9 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
     if let Some(img) = &turn.image {
         content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(&img.jpeg)}}));
     }
+    for img in &turn.attachments {
+        content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(&img.jpeg)}}));
+    }
     content.push(json!({"type": "text", "text": question_text(turn)}));
     let line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string();
     let sent = proc
@@ -1377,6 +1389,7 @@ mod tests {
             conv: Default::default(),
             question: "hi".into(),
             image: None,
+            attachments: Vec::new(),
             cancel: Default::default(),
         };
         let mut conv = Conversation::default();
@@ -1402,6 +1415,7 @@ mod tests {
                 w: 1,
                 h: 1,
             }),
+            attachments: Vec::new(),
             cancel: Default::default(),
         };
         let mut conv = turn.conv.clone();

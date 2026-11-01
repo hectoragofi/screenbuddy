@@ -3,6 +3,7 @@
 
 use crate::capture::{self, Capture};
 use crate::config::{self, Config};
+use crate::{context, history, voice};
 use crate::llm::{self, Conversation, Ev};
 use crate::overlay::{self, Overlay};
 use crate::win::{self, AppEvent};
@@ -11,6 +12,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -18,6 +20,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const BAR_H: f32 = 60.0;
 const MAX_H: f32 = 560.0;
 const PAD: f32 = 18.0;
+/// Height of the context-chip row under the bar.
+const CHIPS_H: f32 = 32.0;
 
 // Palette (dark, quiet, one accent).
 const TINT_SOLID: Color32 = Color32::from_rgb(30, 30, 32);
@@ -36,6 +40,19 @@ struct Exchange {
     question: String,
     answer: String,
     error: Option<Friendly>,
+    /// Labels of the context chips sent with this question.
+    attached: Vec<String>,
+}
+
+/// How the palette should open.
+#[derive(Default)]
+pub struct Start {
+    /// Context to send with the first question (selected text, files).
+    pub chips: Vec<context::Chip>,
+    /// Open on the history browser.
+    pub history: bool,
+    /// Start recording right away (push-to-talk hotkey).
+    pub voice: bool,
 }
 
 /// A user-facing error: a short sentence, an optional action, and the raw detail.
@@ -108,12 +125,35 @@ pub struct Palette {
     allow_all: bool,
     accent: Color32,
     width: f32,
+    /// Context chips waiting to go out with the next question.
+    chips: Vec<context::Chip>,
+    /// History browser, while it is showing (the input is its search box).
+    browser: Option<history::Browser>,
+    /// What was typed before the browser opened.
+    draft: String,
+    /// Earlier turns of a reopened chat, sent with the next question.
+    resume: Option<String>,
+    /// When the current chat started (kept when a past chat is continued).
+    created: Option<String>,
+    rec: Option<voice::Recording>,
+    /// Set while recording from a held hotkey: when it was pressed.
+    ptt: Option<Instant>,
+    transcribing: Option<Receiver<Result<String, String>>>,
+    voice_dl: Option<Arc<std::sync::Mutex<voice::Download>>>,
+    /// Start recording on the first frame / once the model is downloaded.
+    voice_pending: bool,
     /// egui time (s) at which to hand cold pages back to the OS; see `trim_when_idle`.
     trim_at: f64,
 }
 
 /// Opens the palette and blocks until it closes.
+#[allow(dead_code)]
 pub fn run(cfg: Config, cap: Capture, notice: Option<String>) -> Outcome {
+    run_with(cfg, cap, notice, Start::default())
+}
+
+/// Like `run`, with extra context or a different starting view.
+pub fn run_with(cfg: Config, cap: Capture, notice: Option<String>, start: Start) -> Outcome {
     let outcome = Arc::new(std::sync::Mutex::new(Outcome::Closed));
     let accent = accent_of(&cfg);
     let text_size = cfg.appearance.text_size.clamp(11.0, 22.0);
@@ -137,7 +177,7 @@ pub fn run(cfg: Config, cap: Capture, notice: Option<String>) -> Outcome {
         Box::new(move |cc| {
             setup_style(&cc.egui_ctx, accent, text_size);
             win::set_ctx(Some(cc.egui_ctx.clone()));
-            Ok(Box::new(Palette::new(cfg, cap, notice, out2)))
+            Ok(Box::new(Palette::new(cfg, cap, notice, out2, start)))
         }),
     );
     win::set_ctx(None);
@@ -260,6 +300,7 @@ impl Palette {
         cap: Capture,
         notice: Option<String>,
         outcome: Arc<std::sync::Mutex<Outcome>>,
+        start: Start,
     ) -> Self {
         let mut cap = cap;
         let jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
@@ -294,6 +335,16 @@ impl Palette {
             allow_all: false,
             accent,
             width,
+            chips: start.chips,
+            browser: start.history.then(history::Browser::open),
+            draft: String::new(),
+            resume: None,
+            created: None,
+            rec: None,
+            ptt: None,
+            transcribing: None,
+            voice_dl: None,
+            voice_pending: start.voice,
             trim_at: TRIM_AFTER_OPEN,
         }
     }
@@ -312,6 +363,13 @@ impl Palette {
         };
         self.input.clear();
         self.notice = None;
+        let chips = std::mem::take(&mut self.chips);
+        let attached: Vec<String> = chips.iter().map(|c| c.label.clone()).collect();
+        let attachments: Vec<llm::Image> = chips.iter().filter_map(|c| c.image.clone()).collect();
+        let mut prompt = context::compose(&chips, &q);
+        if let Some(pre) = self.resume.take() {
+            prompt = pre + &prompt;
+        }
         let image = if conv.image_sent {
             None
         } else {
@@ -323,9 +381,10 @@ impl Palette {
             })
         };
         self.exchanges.push(Exchange {
-            question: q.clone(),
+            question: q,
             answer: String::new(),
             error: None,
+            attached,
         });
         let (tx, rx) = channel();
         self.rx = Some(rx);
@@ -335,8 +394,9 @@ impl Palette {
             llm::Turn {
                 cfg: self.cfg.clone(),
                 conv,
-                question: q,
+                question: prompt,
                 image,
+                attachments,
                 cancel: self.cancel.clone(),
             },
             llm::Out::new(tx, ctx.clone()),
@@ -392,6 +452,8 @@ impl Palette {
                 self.exchanges.clear();
                 self.math.borrow_mut().clear();
                 self.history_dir = None;
+                self.resume = None;
+                self.created = None;
                 self.notice = None;
             }
             Err(e) => self.notice = Some(format!("Couldn't take a new screenshot ({e}).")),
@@ -560,18 +622,172 @@ impl Palette {
         if !shot.exists() {
             let _ = std::fs::write(&shot, &*self.jpeg);
         }
-        let mut md = format!(
-            "# screenbuddy · {}\n\n_{}_\n\n![screenshot](screenshot.jpg)\n\n",
-            crate::util::timestamp(),
-            self.cfg.provider_label()
-        );
-        for x in &self.exchanges {
-            md.push_str(&format!("## {}\n\n{}\n\n", x.question, x.answer));
-            if let Some(e) = &x.error {
-                md.push_str(&format!("> error: {}\n\n", e.detail));
+        let chat = history::Chat {
+            created: self.created.get_or_insert_with(crate::util::timestamp).clone(),
+            provider: self.cfg.provider_label(),
+            exchanges: self
+                .exchanges
+                .iter()
+                .map(|x| history::SavedExchange {
+                    question: x.question.clone(),
+                    answer: x.answer.clone(),
+                    error: x.error.as_ref().map(|e| e.detail.clone()),
+                    attached: x.attached.clone(),
+                })
+                .collect(),
+        };
+        if let Err(e) = history::write(&dir, &chat) {
+            config::log(&format!("saving history failed: {e}"));
+        }
+    }
+
+    /// Shows a saved chat and lets the next question continue it.
+    fn open_chat(&mut self, ctx: &egui::Context, dir: std::path::PathBuf) {
+        if self.busy() {
+            return;
+        }
+        let Some(chat) = history::load(&dir) else {
+            self.notice = Some("Couldn't open that conversation.".into());
+            return;
+        };
+        self.save_history();
+        self.exchanges = chat
+            .exchanges
+            .iter()
+            .map(|x| Exchange {
+                question: x.question.clone(),
+                answer: x.answer.clone(),
+                error: x.error.as_deref().map(friendly),
+                attached: x.attached.clone(),
+            })
+            .collect();
+        self.resume = Some(chat.preamble());
+        self.created = Some(chat.created).filter(|c| !c.is_empty());
+        self.history_dir = Some(dir);
+        self.conv = Some({
+            let c = Conversation::default();
+            llm::prewarm(&self.cfg, &c);
+            c
+        });
+        self.overlay = None;
+        self.math.borrow_mut().clear();
+        self.browser = None;
+        self.input = std::mem::take(&mut self.draft);
+        self.notice = None;
+        ctx.request_repaint();
+    }
+
+    fn toggle_browser(&mut self) {
+        if self.browser.take().is_some() {
+            self.input = std::mem::take(&mut self.draft);
+        } else {
+            self.draft = std::mem::take(&mut self.input);
+            self.browser = Some(history::Browser::open());
+        }
+    }
+
+    // ------------------------------------------------------------ voice
+
+    /// Mic button / hotkey: start recording, or stop if already recording.
+    fn mic(&mut self, ctx: &egui::Context, hold: bool) {
+        if self.rec.is_some() {
+            self.stop_rec();
+            return;
+        }
+        if self.transcribing.is_some() {
+            return;
+        }
+        if !voice::engine_included() {
+            self.notice = Some("Voice input isn't available in this build (speech engine not included).".into());
+            return;
+        }
+        if !voice::model_ready() {
+            if self.voice_dl.is_none() {
+                self.voice_dl = Some(voice::start_download(Some(ctx.clone())));
+            }
+            self.voice_pending = true;
+            self.notice = Some("Downloading the voice model (17 MB, once)…".into());
+            return;
+        }
+        self.voice_pending = false;
+        match voice::Recording::start(&self.cfg.voice.language, ctx.clone()) {
+            Ok(r) => {
+                self.rec = Some(r);
+                self.ptt = hold.then(Instant::now);
+                self.notice = None;
+            }
+            Err(e) => self.notice = Some(e),
+        }
+    }
+
+    fn stop_rec(&mut self) {
+        self.ptt = None;
+        if let Some(r) = self.rec.take() {
+            self.transcribing = Some(r.finish());
+        }
+    }
+
+    /// Hold-to-talk release, model download progress, transcripts.
+    fn pump_voice(&mut self, ctx: &egui::Context) {
+        if let Some(t0) = self.ptt {
+            if self.rec.is_some() && !win::hotkey_held(&self.cfg.voice.hotkey) {
+                if t0.elapsed() < Duration::from_millis(350) {
+                    // A quick tap: keep recording until the next tap or click.
+                    self.ptt = None;
+                } else {
+                    self.stop_rec();
+                }
             }
         }
-        let _ = std::fs::write(dir.join("chat.md"), md);
+        if let Some(dl) = &self.voice_dl {
+            let d = dl.lock().unwrap().clone();
+            if d.done {
+                self.voice_dl = None;
+                match d.error {
+                    Some(e) => {
+                        self.voice_pending = false;
+                        self.notice = Some(format!("Couldn't download the voice model ({e})."));
+                    }
+                    None => {
+                        self.notice = None;
+                        if self.voice_pending {
+                            self.mic(ctx, false);
+                        }
+                    }
+                }
+            } else {
+                self.notice = Some(format!("Downloading the voice model (17 MB, once)… {:.0}%", d.progress * 100.0));
+            }
+        }
+        if let Some(rx) = &self.transcribing {
+            match rx.try_recv() {
+                Ok(r) => {
+                    self.transcribing = None;
+                    match r {
+                        Ok(t) if !t.is_empty() => {
+                            if !self.input.trim().is_empty() {
+                                self.input.push(' ');
+                            }
+                            self.input.push_str(&t);
+                            if self.cfg.voice.auto_send && self.browser.is_none() {
+                                self.send(ctx);
+                            }
+                        }
+                        Ok(_) => self.notice = Some("Didn't catch that.".into()),
+                        Err(e) if e == "discarded" => {}
+                        Err(e) => {
+                            config::log(&format!("voice: {e}"));
+                            self.notice = Some(format!("Voice input failed: {e}"));
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.transcribing = None,
+            }
+        }
+        if self.rec.is_some() || self.transcribing.is_some() || self.voice_dl.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
     }
 
     /// Places the bar Spotlight-style: centered, upper third of the monitor
@@ -616,6 +832,7 @@ impl Palette {
 
     fn close(&mut self, ctx: &egui::Context) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.rec = None; // discards the recording
         self.save_history();
         if self.quit {
             *self.outcome.lock().unwrap() = Outcome::Quit;
@@ -627,8 +844,30 @@ impl Palette {
         let mut requeue = Vec::new();
         while let Some(ev) = win::pop() {
             match ev {
+                // The push-to-talk hotkey records into this palette.
+                AppEvent::Hotkey(win::HK_VOICE) => {
+                    if self.rec.is_some() && self.ptt.is_none() {
+                        self.stop_rec();
+                    } else if self.rec.is_none() {
+                        self.mic(ctx, true);
+                    }
+                }
                 // Pressing the hotkey again (or clicking the tray) toggles the palette off.
                 AppEvent::Hotkey(_) | AppEvent::TrayClick => self.close(ctx),
+                // More files from Explorer join the current question.
+                AppEvent::OpenFile(p) => {
+                    self.chips.push(context::file_chip(&p));
+                    if let Some(h) = self.hwnd {
+                        unsafe {
+                            let _ = SetForegroundWindow(h);
+                        }
+                    }
+                }
+                AppEvent::Menu(id) if id == crate::tray::BROWSE => {
+                    if self.browser.is_none() {
+                        self.toggle_browser();
+                    }
+                }
                 AppEvent::Menu(id) => match crate::tray::handle_passive(&id) {
                     crate::tray::Passive::Handled => {}
                     crate::tray::Passive::Quit => {
@@ -656,6 +895,8 @@ impl Palette {
         } else if self.was_focused
             && self.cfg.appearance.dismiss_on_blur
             && !self.busy()
+            && self.rec.is_none()
+            && self.transcribing.is_none()
             && self.overlay.as_ref().is_none_or(|o| o.is_empty())
         {
             self.close(ctx);
@@ -687,7 +928,13 @@ impl Palette {
                 }
                 ui.add_space(4.0);
             }
-            let hint = if self.exchanges.is_empty() {
+            let hint = if self.rec.is_some() {
+                "Listening…"
+            } else if self.transcribing.is_some() {
+                "Transcribing…"
+            } else if self.browser.is_some() {
+                "Search history"
+            } else if self.exchanges.is_empty() {
                 "Ask about your screen"
             } else {
                 "Ask a follow-up"
@@ -697,8 +944,27 @@ impl Palette {
                 .font(TextStyle::Heading)
                 .frame(egui::Frame::NONE)
                 .desired_width(f32::INFINITY);
-            let gear_w = 26.0;
+            let voice_on = self.cfg.voice.enabled;
+            let gear_w = 26.0 + 34.0 + if voice_on { 34.0 } else { 0.0 };
             let resp = ui.add_sized([ui.available_width() - gear_w, 28.0], edit);
+            let hist = icon_button(ui, Icon::History, self.browser.is_some(), self.accent)
+                .on_hover_text("History (Ctrl+H)");
+            if hist.clicked() {
+                self.toggle_browser();
+            }
+            if voice_on {
+                let tip = if self.rec.is_some() {
+                    "Stop and transcribe"
+                } else {
+                    "Speak your question"
+                };
+                let level = self.rec.as_ref().map(|r| r.level());
+                let mic = icon_button(ui, Icon::Mic(level), self.rec.is_some(), self.accent)
+                    .on_hover_text(format!("{tip} (hold {})", self.cfg.voice.hotkey));
+                if mic.clicked() {
+                    self.mic(ui.ctx(), false);
+                }
+            }
             let gear = ui
                 .add(egui::Button::new(RichText::new("⚙").color(TEXT_3).size(16.0)).frame(false))
                 .on_hover_text("Settings");
@@ -708,11 +974,76 @@ impl Palette {
             if !resp.has_focus() && self.frames < 8 {
                 resp.request_focus();
             }
-            if enter {
+            if enter && self.browser.is_none() {
                 self.send(ui.ctx());
                 resp.request_focus();
             }
         });
+        if !self.chips.is_empty() {
+            self.chip_row(ui);
+        }
+    }
+
+    /// Context chips: what goes along with the next question. ✕ removes one.
+    fn chip_row(&mut self, ui: &mut egui::Ui) {
+        let mut remove = None;
+        ui.horizontal(|ui| {
+            ui.set_height(CHIPS_H - 8.0);
+            ui.add_space(2.0);
+            for (i, c) in self.chips.iter().enumerate() {
+                egui::Frame::new()
+                    .fill(Color32::from_white_alpha(14))
+                    .corner_radius(6)
+                    .inner_margin(Margin { left: 8, right: 4, top: 2, bottom: 2 })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let mark = if c.image.is_some() { "▣" } else if c.label == "Selected text" { "❝" } else { "▤" };
+                        let label: String = if c.label.chars().count() > 28 {
+                            format!("{}…", c.label.chars().take(27).collect::<String>())
+                        } else {
+                            c.label.clone()
+                        };
+                        ui.label(RichText::new(format!("{mark} {label}")).size(12.5).color(TEXT_2))
+                            .on_hover_text(&c.hover);
+                        if ui
+                            .add(egui::Button::new(RichText::new("✕").size(11.0).color(TEXT_3)).frame(false))
+                            .on_hover_text("Remove")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                    });
+            }
+        });
+        if let Some(i) = remove {
+            self.chips.remove(i);
+        }
+    }
+
+    fn top_h(&self) -> f32 {
+        BAR_H + if self.chips.is_empty() { 0.0 } else { CHIPS_H }
+    }
+
+    /// The history list, in place of the conversation.
+    fn history_body(&mut self, ui: &mut egui::Ui, keys: (bool, bool, bool)) {
+        let accent = self.accent;
+        let query = self.input.clone();
+        let max_h = MAX_H - self.top_h() - 24.0;
+        let Some(b) = self.browser.as_mut() else { return };
+        let out = egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(max_h)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                let a = b.show(ui, &query, keys, accent, TEXT_2, TEXT_3);
+                ui.add_space(10.0);
+                a
+            });
+        self.body_h = out.content_size.y;
+        if let Some(history::Action::Open(dir)) = out.inner {
+            let ctx = ui.ctx().clone();
+            self.open_chat(&ctx, dir);
+        }
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
@@ -727,7 +1058,7 @@ impl Palette {
         let out = egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, true])
-            .max_height(MAX_H - BAR_H - 24.0)
+            .max_height(MAX_H - self.top_h() - 24.0)
             .show(ui, |ui| {
                 ui.add_space(10.0);
                 for (i, x) in self.exchanges.iter().enumerate() {
@@ -870,13 +1201,17 @@ impl Palette {
         self.close(ctx);
     }
 
+    fn has_body(&self) -> bool {
+        !self.exchanges.is_empty() || self.notice.is_some() || self.browser.is_some()
+    }
+
     /// Grows/shrinks the window smoothly toward its content height.
     fn animate_height(&mut self, ctx: &egui::Context) {
-        let has_body = !self.exchanges.is_empty() || self.notice.is_some();
+        let has_body = self.has_body();
         let target = if has_body {
-            (BAR_H + 1.0 + self.body_h).min(MAX_H)
+            (self.top_h() + 1.0 + self.body_h).min(MAX_H)
         } else {
-            BAR_H
+            self.top_h()
         };
         let diff = target - self.height;
         if diff.abs() > 0.5 {
@@ -907,6 +1242,34 @@ impl eframe::App for Palette {
         self.pump();
         self.handle_app_events(&ctx);
         self.dismiss_on_blur(&ctx);
+        if self.voice_pending && self.frames == 2 {
+            self.mic(&ctx, true);
+        }
+        self.pump_voice(&ctx);
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::H)) {
+            self.toggle_browser();
+        }
+        let mut keys = (false, false, false);
+        if self.browser.is_some() {
+            keys = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(egui::Modifiers::NONE, Key::Enter),
+                )
+            });
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                self.toggle_browser();
+            }
+        }
+        if self.rec.is_some() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                self.rec = None; // discard
+                self.ptt = None;
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+                self.stop_rec();
+            }
+        }
 
         if self.pending.is_some() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
@@ -945,7 +1308,7 @@ impl eframe::App for Palette {
                 ui.set_width(full.width() - 2.0 * PAD + 4.0);
                 self.bar(ui, enter);
             });
-        if !self.exchanges.is_empty() || self.notice.is_some() {
+        if self.has_body() {
             let y = ui.cursor().top();
             ui.painter()
                 .hline(full.x_range(), y, egui::Stroke::new(1.0, HAIRLINE));
@@ -953,7 +1316,11 @@ impl eframe::App for Palette {
                 .inner_margin(Margin::symmetric(PAD as i8, 0))
                 .show(ui, |ui| {
                     ui.set_width(full.width() - 2.0 * PAD);
-                    self.body(ui);
+                    if self.browser.is_some() {
+                        self.history_body(ui, keys);
+                    } else {
+                        self.body(ui);
+                    }
                 });
         }
         self.animate_height(&ctx);
@@ -981,4 +1348,54 @@ fn lowercase_first(s: &str) -> String {
         Some(f) => std::iter::once(f).chain(c).collect(),
         None => String::new(),
     }
+}
+
+enum Icon {
+    History,
+    /// Microphone; `Some(level)` while recording.
+    Mic(Option<f32>),
+}
+
+/// A small painted icon button (no font glyph dependency).
+fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    let c = rect.center();
+    let p = ui.painter();
+    let fg = if active { Color32::WHITE } else if resp.hovered() { TEXT_2 } else { TEXT_3 };
+    if active {
+        let bg = match icon {
+            Icon::Mic(_) => Color32::from_rgb(220, 60, 60),
+            Icon::History => accent,
+        };
+        p.circle_filled(c, 12.0, bg);
+    } else if resp.hovered() {
+        p.circle_filled(c, 12.0, Color32::from_white_alpha(10));
+    }
+    let st = egui::Stroke::new(1.5, fg);
+    match icon {
+        Icon::History => {
+            p.circle_stroke(c, 7.0, st);
+            p.line_segment([c, c + egui::vec2(0.0, -4.5)], st);
+            p.line_segment([c, c + egui::vec2(3.5, 1.5)], st);
+        }
+        Icon::Mic(level) => {
+            if let Some(l) = level {
+                p.circle_stroke(c, 12.0 + 3.0 * l, egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60).gamma_multiply(0.6)));
+            }
+            let body = egui::Rect::from_center_size(c + egui::vec2(0.0, -2.5), egui::vec2(6.0, 10.0));
+            p.rect_stroke(body, 3, st, egui::StrokeKind::Middle);
+            let arc: Vec<egui::Pos2> = (0..=12)
+                .map(|i| {
+                    let a = std::f32::consts::PI * i as f32 / 12.0;
+                    c + egui::vec2(-5.5 * a.cos(), 5.5 * a.sin() - 1.0)
+                })
+                .collect();
+            p.add(egui::Shape::line(arc, st));
+            p.line_segment([c + egui::vec2(0.0, 4.5), c + egui::vec2(0.0, 7.5)], st);
+        }
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
 }

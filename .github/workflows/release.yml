@@ -37,6 +37,13 @@ jobs:
         with:
           key: release
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/cache@v4
+        with:
+          path: .needle/dl
+          key: needle-${{ hashFiles('scripts/build-needle.sh') }}
+      - name: Build speech engine (Cactus Needle)
+        shell: bash
+        run: bash scripts/build-needle.sh
       - run: cargo build --release --locked
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
