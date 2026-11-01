@@ -71,6 +71,15 @@ impl App {
 
     fn ask(&mut self, region: bool) -> palette::Outcome {
         self.reload();
+        // Start the Claude CLI now, in parallel with capture + window creation.
+        llm::warm_on_hotkey(&self.cfg);
+        let out = self.open_palette(region);
+        llm::refill_spare(&self.cfg);
+        win::trim_memory();
+        out
+    }
+
+    fn open_palette(&mut self, region: bool) -> palette::Outcome {
         let shot = match capture::grab_monitor_under_cursor() {
             Ok(s) => s,
             Err(e) => {
@@ -94,10 +103,7 @@ impl App {
             }
         };
         drop(shot); // free the raw pixels before the window opens
-        let out = palette::run(self.cfg.clone(), cap, self.cfg_error.clone());
-        llm::refill_spare(&self.cfg);
-        win::trim_memory();
-        out
+        palette::run(self.cfg.clone(), cap, self.cfg_error.clone())
     }
 }
 

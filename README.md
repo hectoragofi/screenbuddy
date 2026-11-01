@@ -3,7 +3,7 @@
 Native Windows screen assistant in Rust. Press a hotkey, ask about what's on screen, get a streamed answer, and see arrows and boxes drawn directly over the thing it's talking about.
 
 - **Idle:** the process sleeps in a Win32 message loop. Only the hotkey and tray are alive, the working set is trimmed to almost nothing, and CPU stays at ~0%.
-- **Active:** the egui palette, the overlay and the renderer are created when you press the hotkey. Closing the palette destroys them and gives the memory back.
+- **Active:** the egui palette, the overlay and the renderer are created when you press the hotkey. Closing the palette destroys them and gives the memory back. About a second after it opens (and after each answer), the palette trims start-up pages (GL driver init, shader compile, fonts) from its working set.
 - **Single exe:** no webview and no runtime to install. The CRT is linked statically.
 
 ## Use
@@ -43,7 +43,9 @@ All three providers use the same streaming parser shape and the same `draw` tool
 
 - **Anthropic API:** `POST /v1/messages` with SSE streaming, the screenshot as a base64 JPEG, adaptive thinking, and `effort`. The `draw` tool uses eager input streaming, so shapes appear as soon as each tool call finishes. The thinking blocks the API returns are sent back unchanged in follow-up turns.
 - **OpenAI-compatible:** `POST /chat/completions` with SSE streaming, the image as an `image_url` data URL, and `draw` as a function tool.
-- **Claude subscription:** runs `claude -p --output-format stream-json --input-format stream-json` for each question and passes the image as a content block in stream-json. Follow-ups use `--resume <session>`. `draw` is offered through `--mcp-config` pointing at this exe in `--mcp` stdio mode. The CLI (Node) only uses memory while it's answering. That's the cost of using a subscription with nothing running while idle.
+- **Claude subscription:** runs `claude -p --output-format stream-json --input-format stream-json` for each question and passes the image as a content block in stream-json. Follow-ups use `--resume <session>`. `draw` is offered through `--mcp-config` pointing at this exe in `--mcp` stdio mode. The CLI (Node) only uses memory while it's answering. That's the cost of using a subscription with nothing running while idle. The CLI is started the moment the hotkey fires, in parallel with the screen capture, so it is warm by the time you press Enter; if you close without asking, it is killed (or kept as the spare for `keep_warm_minutes`). It runs in a kill-on-close job object, so Node and the `--mcp` server never outlive it.
+
+If a stream goes silent for 90 s (not counting time spent waiting on you to approve an action), or the connection or `claude` process dies before the answer finishes, the palette says the answer stopped partway and offers **Try again**. The failed turn is rolled back first, so the retry starts from a clean history.
 
 ## Overlay
 

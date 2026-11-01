@@ -2,21 +2,60 @@ name: release
 on:
   push:
     tags: ["v*"]
+    # Builds on main only warm the cache: caches saved by a tag run are scoped
+    # to that tag, so release builds restore the one main saved last.
+    branches: [main]
 permissions:
   contents: write
+env:
+  CARGO_TERM_COLOR: always
 jobs:
-  release:
+  # Tests (debug profile) and the release build compile different artifacts,
+  # so they run side by side instead of one after the other.
+  test:
     runs-on: windows-latest
     steps:
+      # Real-time scanning of every object file is a large share of cold
+      # compile time on Windows runners; the runner is thrown away afterwards.
+      - run: Set-MpPreference -DisableRealtimeMonitoring $true
+        shell: pwsh
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --locked
+  build:
+    runs-on: windows-latest
+    steps:
+      - run: Set-MpPreference -DisableRealtimeMonitoring $true
+        shell: pwsh
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: exe
+          path: target/release/screenbuddy.exe
+          retention-days: 1
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: exe
       - name: Publish release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          cp target/release/screenbuddy.exe "screenbuddy-${GITHUB_REF_NAME}-x86_64.exe"
+          cp screenbuddy.exe "screenbuddy-${GITHUB_REF_NAME}-x86_64.exe"
           gh release create "$GITHUB_REF_NAME" "screenbuddy-${GITHUB_REF_NAME}-x86_64.exe" --generate-notes --title "screenbuddy $GITHUB_REF_NAME"

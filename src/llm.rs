@@ -9,6 +9,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
+
+/// How long a stream (HTTP or the Claude CLI) may stay silent, while nothing is
+/// waiting on the user, before the answer is treated as dead.
+const STALL: Duration = Duration::from_secs(90);
+
+/// Prefix of errors where the answer was cut off by a dead or stalled stream;
+/// the palette offers a retry for these.
+pub const INTERRUPTED: &str = "Interrupted: ";
 
 pub const SYSTEM_PROMPT: &str = "You are screenbuddy, a calm, precise assistant built into the user's desktop. With each question you get a screenshot of what the user is looking at. Answer like a thoughtful expert sitting next to them: lead with the answer, keep it short (one to three sentences unless they ask for more), and use Markdown only when it genuinely helps, such as numbered steps or code. Write math in LaTeX: $...$ inline and $$...$$ on its own line for displayed equations; never put math in code blocks. No preamble, no restating the question, no sign-offs.";
 
@@ -111,11 +120,61 @@ pub struct Out {
     tx: Sender<Ev>,
     ctx: egui::Context,
     dctx: Option<crate::desktop::Ctx>,
+    watch: Watch,
+}
+
+/// Stall detector shared by a turn's worker and its helper threads: the time
+/// of the last sign of life, and how many waits on the user are in progress
+/// (those never count as a stall).
+#[derive(Clone)]
+struct Watch(Arc<std::sync::Mutex<(Instant, usize)>>);
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::Mutex::new((Instant::now(), 0))))
+    }
+}
+
+impl Watch {
+    fn touch(&self) {
+        self.0.lock().unwrap().0 = Instant::now();
+    }
+    /// Pauses stall detection until the guard drops.
+    fn hold(&self) -> Hold {
+        self.0.lock().unwrap().1 += 1;
+        Hold(self.clone())
+    }
+    fn stalled(&self, limit: Duration) -> bool {
+        let w = self.0.lock().unwrap();
+        w.1 == 0 && w.0.elapsed() >= limit
+    }
+}
+
+struct Hold(Watch);
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut w = self.0.0.lock().unwrap();
+        w.1 -= 1;
+        w.0 = Instant::now();
+    }
+}
+
+fn stall_error(limit: Duration) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{INTERRUPTED}no response for {} s, the stream stalled.",
+        limit.as_secs()
+    )
 }
 
 impl Out {
     pub fn new(tx: Sender<Ev>, ctx: egui::Context) -> Self {
-        Self { tx, ctx, dctx: None }
+        Self {
+            tx,
+            ctx,
+            dctx: None,
+            watch: Watch::default(),
+        }
     }
     fn send(&self, ev: Ev) {
         let _ = self.tx.send(ev);
@@ -130,6 +189,7 @@ impl Out {
     /// Asks the user to approve an action; false on deny or timeout.
     pub fn approve(&self, intent: &str, detail: &str) -> bool {
         let (tx, rx) = std::sync::mpsc::channel();
+        let _hold = self.watch.hold();
         self.send(Ev::Approve(intent.to_string(), detail.to_string(), tx));
         rx.recv_timeout(std::time::Duration::from_secs(300))
             .unwrap_or(false)
@@ -175,6 +235,7 @@ impl Out {
     /// Sends a draw call to the UI thread and waits for its result.
     fn draw(&self, input: Value) -> Result<String, String> {
         let (tx, rx) = std::sync::mpsc::channel();
+        let _hold = self.watch.hold();
         self.send(Ev::Draw(input, tx));
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .unwrap_or_else(|_| Err("overlay unavailable".into()))
@@ -195,20 +256,42 @@ pub fn spawn(turn: Turn, out: Out) {
             "claude-cli" => claude_cli(&turn, &mut conv, &out),
             _ => anthropic(&turn, &mut conv, &out),
         };
-        if let Err(e) = res {
-            if !turn.cancel.load(Ordering::Relaxed) {
-                crate::config::log(&format!("provider error: {e:#}"));
-                out.send(Ev::Error(format!("{e:#}")));
-            }
+        let cancelled = turn.cancel.load(Ordering::Relaxed);
+        if let Err(e) = &res
+            && !cancelled
+        {
+            crate::config::log(&format!("provider error: {e:#}"));
+            out.send(Ev::Error(format!("{e:#}")));
+        }
+        if res.is_err() || cancelled {
+            rollback(&turn, &mut conv);
         }
         out.send(Ev::Done(conv));
     });
 }
 
+/// Undoes a failed or cancelled turn so asking again starts from a clean
+/// history: the question, partial answer and any tool rounds are dropped,
+/// and the screenshot is resent if it never reached the model.
+fn rollback(turn: &Turn, conv: &mut Conversation) {
+    conv.anthropic.truncate(turn.conv.anthropic.len());
+    conv.openai.truncate(turn.conv.openai.len());
+    if turn.image.is_some() && conv.cli_session.is_none() {
+        conv.image_sent = false;
+    }
+    let cancelled = turn.cancel.load(Ordering::Relaxed);
+    if !cancelled && turn.cfg.provider == "claude-cli" && conv.cli.lock().unwrap().is_none() {
+        // The CLI died or stalled: start a replacement now so a retry is fast.
+        prewarm(&turn.cfg, conv);
+    }
+}
+
 fn http() -> anyhow::Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(None)
+        .connect_timeout(Duration::from_secs(15))
+        // Per read/write, not total: a backstop behind the stall watchdog in
+        // `sse_lines` so a dead connection can't park its reader thread forever.
+        .timeout(STALL + Duration::from_secs(30))
         .build()?)
 }
 
@@ -260,24 +343,54 @@ fn check_status(resp: reqwest::blocking::Response) -> anyhow::Result<reqwest::bl
     anyhow::bail!("HTTP {status}: {msg}")
 }
 
-/// Iterates SSE `data:` payloads until the stream ends or is cancelled.
+/// Iterates SSE `data:` payloads until `f` returns false (Ok(true)), the
+/// stream ends (Ok(false)), or it is cancelled (Ok(false)). The body is read on
+/// a helper thread so a connection that goes silent for `stall` (while no
+/// tool call is waiting on the user) fails the turn instead of hanging it.
 fn sse_lines(
-    resp: reqwest::blocking::Response,
+    body: impl std::io::Read + Send + 'static,
     cancel: &AtomicBool,
+    watch: &Watch,
+    stall: Duration,
     mut f: impl FnMut(&str) -> anyhow::Result<bool>,
-) -> anyhow::Result<()> {
-    for line in BufReader::new(resp).lines() {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let line = line?;
-        if let Some(data) = line.strip_prefix("data:") {
-            if !f(data.trim_start())? {
+) -> anyhow::Result<bool> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<String>>(256);
+    std::thread::spawn(move || {
+        for line in BufReader::new(body).lines() {
+            let failed = line.is_err();
+            if tx.send(line).is_err() || failed {
                 break;
             }
         }
+    });
+    watch.touch();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let line = line.map_err(|e| anyhow::anyhow!("{INTERRUPTED}{e}"))?;
+                watch.touch();
+                if let Some(data) = line.strip_prefix("data:")
+                    && !f(data.trim_start())?
+                {
+                    return Ok(true);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if watch.stalled(stall) {
+                    return Err(stall_error(stall));
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(false),
+        }
     }
-    Ok(())
+}
+
+/// Error for a stream that closed before its final event.
+fn cut_off() -> anyhow::Error {
+    anyhow::anyhow!("{INTERRUPTED}the connection closed before the answer finished.")
 }
 
 // ---------------------------------------------------------------- Anthropic
@@ -334,7 +447,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
         let mut stream_err: Option<String> = None;
         let mut tool_results: Vec<Value> = Vec::new();
 
-        sse_lines(resp, &turn.cancel, |data| {
+        let ended = sse_lines(resp, &turn.cancel, &out.watch, STALL, |data| {
             let Ok(ev) = serde_json::from_str::<Value>(data) else {
                 return Ok(true);
             };
@@ -437,6 +550,9 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
         if let Some(e) = stream_err {
             anyhow::bail!("{e}");
         }
+        if !ended {
+            return Err(cut_off());
+        }
         conv.anthropic.push(
             json!({"role": "assistant", "content": blocks.into_values().collect::<Vec<_>>()}),
         );
@@ -519,7 +635,7 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
         let mut calls: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
         let mut finish = String::new();
         let mut stream_err = None;
-        sse_lines(resp, &turn.cancel, |data| {
+        let ended = sse_lines(resp, &turn.cancel, &out.watch, STALL, |data| {
             if data == "[DONE]" {
                 return Ok(false);
             }
@@ -568,6 +684,9 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
         if let Some(e) = stream_err {
             anyhow::bail!("{e}");
         }
+        if !ended && finish.is_empty() {
+            return Err(cut_off());
+        }
         if calls.is_empty() {
             conv.openai
                 .push(json!({"role": "assistant", "content": text}));
@@ -607,6 +726,44 @@ pub struct CliProc {
     stderr: Arc<std::sync::Mutex<String>>,
     approver: Arc<std::sync::Mutex<Option<Out>>>,
     done: Arc<AtomicBool>,
+    _job: Option<Job>,
+}
+
+/// A kill-on-close job object holding the CLI and everything it starts (Node,
+/// the `--mcp` server), so dropping a `CliProc` never leaves orphans behind.
+struct Job(windows::Win32::Foundation::HANDLE);
+
+// The handle is only used to close the job.
+unsafe impl Send for Job {}
+
+impl Job {
+    fn wrap(child: &std::process::Child) -> Option<Job> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::System::JobObjects::*;
+        unsafe {
+            let job = Job(CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?);
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of_val(&info) as u32,
+            )
+            .ok()?;
+            AssignProcessToJobObject(job.0, windows::Win32::Foundation::HANDLE(child.as_raw_handle()))
+                .ok()?;
+            Some(job)
+        }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
 }
 
 impl Drop for CliProc {
@@ -644,7 +801,12 @@ pub fn prewarm(cfg: &Config, conv: &Conversation) {
         if guard.is_some() {
             return;
         }
-        // Fast path: a fresh spare kept warm since the last palette closed.
+        // Fast path: a fresh spare kept warm since the last palette closed,
+        // or the one `warm_on_hotkey` is starting right now.
+        let pending = WARMING.lock().unwrap().take();
+        if let Some(h) = pending {
+            let _ = h.join();
+        }
         if resume.is_none() {
             if let Some(p) = take_spare(&cfg) {
                 *guard = Some(p);
@@ -668,6 +830,42 @@ struct Spare {
 
 static SPARE: std::sync::Mutex<Option<Spare>> = std::sync::Mutex::new(None);
 
+/// The spawn started by `warm_on_hotkey`, joined before the spare is taken.
+static WARMING: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Called the moment the hotkey fires: starts the CLI in parallel with the
+/// screen capture and window creation, so Node has a head start before the
+/// palette even exists. The process waits as the spare; the palette takes it.
+/// Pair with `refill_spare` when the palette closes (or never opens): with
+/// `keep_warm_minutes = 0` that kills it again, otherwise it expires on the
+/// usual timer, so an unused early start never outlives the setting.
+pub fn warm_on_hotkey(cfg: &Config) {
+    if cfg.provider != "claude-cli" {
+        return;
+    }
+    let cfg = cfg.clone();
+    let h = std::thread::spawn(move || {
+        let sig = spare_sig(&cfg);
+        let mut slot = SPARE.lock().unwrap();
+        if slot.as_mut().is_some_and(|s| s.sig == sig && s.proc.alive()) {
+            return;
+        }
+        *slot = None;
+        match spawn_cli(&cfg, None) {
+            Ok(proc) => {
+                *slot = Some(Spare {
+                    proc,
+                    born: std::time::Instant::now(),
+                    sig,
+                })
+            }
+            Err(e) => crate::config::log(&format!("claude early start failed: {e:#}")),
+        }
+    });
+    *WARMING.lock().unwrap() = Some(h);
+}
+
 fn spare_sig(cfg: &Config) -> String {
     format!(
         "{}|{}|{}|{}",
@@ -685,6 +883,10 @@ fn take_spare(cfg: &Config) -> Option<CliProc> {
 
 /// Called after the palette closes: keeps one fresh process warm for a while.
 pub fn refill_spare(cfg: &Config) {
+    let pending = WARMING.lock().unwrap().take();
+    if let Some(h) = pending {
+        let _ = h.join(); // an early start must land before we decide its fate
+    }
     let minutes = cfg.claude_cli.keep_warm_minutes;
     if cfg.provider != "claude-cli" || minutes == 0 {
         *SPARE.lock().unwrap() = None;
@@ -806,6 +1008,7 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
         }
         Err(e) => return Err(e.into()),
     };
+    let job = Job::wrap(&child);
     let stdin = child
         .stdin
         .take()
@@ -844,6 +1047,7 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
         stderr,
         approver,
         done,
+        _job: job,
     })
 }
 
@@ -870,30 +1074,37 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
     }
     content.push(json!({"type": "text", "text": question_text(turn)}));
     let line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string();
-    proc.stdin.write_all(line.as_bytes())?;
-    proc.stdin.write_all(b"\n")?;
-    proc.stdin.flush()?;
+    let sent = proc
+        .stdin
+        .write_all(format!("{line}\n").as_bytes())
+        .and_then(|_| proc.stdin.flush());
+    if sent.is_err() {
+        return Err(cli_died(&mut proc)); // the CLI exited before reading the question
+    }
 
     let mut streamed_this_msg = false;
     let mut wrote_text = false;
+    out.watch.touch();
     loop {
         if turn.cancel.load(Ordering::Relaxed) {
             return Ok(()); // dropping `proc` kills the CLI mid-answer
         }
-        let line = match proc
-            .lines
-            .recv_timeout(std::time::Duration::from_millis(100))
-        {
+        let line = match proc.lines.recv_timeout(Duration::from_millis(100)) {
             Ok(l) => l,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if wrote_text {
-                    return Ok(());
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // A hung CLI (or a hung `--mcp` tool call inside it) goes quiet;
+                // dropping `proc` kills the whole process tree.
+                if out.watch.stalled(STALL) {
+                    return Err(stall_error(STALL));
                 }
-                let _ = proc.child.wait();
-                anyhow::bail!("claude exited unexpectedly: {}", proc.stderr_tail());
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // stdout closed without a `result`: the CLI died mid-answer.
+                return Err(cli_died(&mut proc));
             }
         };
+        out.watch.touch();
         let Ok(ev) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -971,6 +1182,17 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
     }
 }
 
+fn cli_died(proc: &mut CliProc) -> anyhow::Error {
+    let _ = proc.child.wait();
+    // Give the stderr reader a moment to collect the last lines.
+    std::thread::sleep(Duration::from_millis(50));
+    let tail = proc.stderr_tail();
+    anyhow::anyhow!(
+        "{INTERRUPTED}claude exited before finishing{}{tail}",
+        if tail.trim().is_empty() { "." } else { ": " }
+    )
+}
+
 /// Answers approval requests from `screenbuddy --mcp`: one JSON line
 /// {"intent","detail"} in, "allow" or "deny" out. Denies when no turn is active.
 fn spawn_approval_server(
@@ -1000,4 +1222,155 @@ fn spawn_approval_server(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Read};
+
+    /// A body that sends `head`, then either ends, fails, or goes silent.
+    struct Body {
+        head: Cursor<Vec<u8>>,
+        tail: Tail,
+    }
+    #[derive(Clone, Copy)]
+    enum Tail {
+        Eof,
+        Fail,
+        Hang,
+    }
+    impl Read for Body {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.head.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            match self.tail {
+                Tail::Eof => Ok(0),
+                Tail::Fail => Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")),
+                Tail::Hang => loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                },
+            }
+        }
+    }
+    fn body(s: &str, tail: Tail) -> Body {
+        Body {
+            head: Cursor::new(s.as_bytes().to_vec()),
+            tail,
+        }
+    }
+    fn run(b: Body, stall: Duration) -> (anyhow::Result<bool>, Vec<String>) {
+        let mut seen = Vec::new();
+        let r = sse_lines(b, &AtomicBool::new(false), &Watch::default(), stall, |d| {
+            seen.push(d.to_string());
+            Ok(d != "stop")
+        });
+        (r, seen)
+    }
+
+    #[test]
+    fn sse_completes_on_final_event() {
+        let (r, seen) = run(body("data: a\n\ndata: stop\ndata: never\n", Tail::Hang), Duration::from_secs(5));
+        assert!(r.unwrap());
+        assert_eq!(seen, ["a", "stop"]);
+    }
+
+    #[test]
+    fn sse_reports_early_close() {
+        let (r, seen) = run(body("data: a\n", Tail::Eof), Duration::from_secs(5));
+        assert!(!r.unwrap(), "closed without the final event");
+        assert_eq!(seen, ["a"]);
+    }
+
+    #[test]
+    fn sse_dropped_connection_is_interrupted() {
+        let (r, _) = run(body("data: a\n", Tail::Fail), Duration::from_secs(5));
+        assert!(r.unwrap_err().to_string().starts_with(INTERRUPTED));
+    }
+
+    #[test]
+    fn sse_stall_times_out() {
+        let t = Instant::now();
+        let (r, seen) = run(body("data: a\n", Tail::Hang), Duration::from_millis(300));
+        assert!(r.unwrap_err().to_string().starts_with(INTERRUPTED));
+        assert_eq!(seen, ["a"]);
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sse_cancel_stops_a_silent_stream() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.store(true, Ordering::Relaxed);
+        });
+        let r = sse_lines(body("", Tail::Hang), &cancel, &Watch::default(), Duration::from_secs(60), |_| Ok(true));
+        assert!(!r.unwrap());
+    }
+
+    #[test]
+    fn waiting_on_the_user_is_not_a_stall() {
+        let w = Watch::default();
+        let limit = Duration::from_millis(100);
+        let hold = w.hold();
+        std::thread::sleep(limit * 2);
+        assert!(!w.stalled(limit));
+        drop(hold); // the wait ending counts as activity
+        assert!(!w.stalled(limit));
+        std::thread::sleep(limit * 2);
+        assert!(w.stalled(limit));
+    }
+
+    #[test]
+    fn cli_that_dies_is_an_error_not_a_hang() {
+        // The test binary itself rejects claude's flags and exits at once,
+        // like a CLI that crashes before answering.
+        let mut cfg = Config::default();
+        cfg.provider = "claude-cli".into();
+        cfg.drawing.enabled = false;
+        cfg.claude_cli.command = std::env::current_exe().unwrap().to_string_lossy().into();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let out = Out::new(tx, egui::Context::default());
+        let turn = Turn {
+            cfg,
+            conv: Default::default(),
+            question: "hi".into(),
+            image: None,
+            cancel: Default::default(),
+        };
+        let mut conv = Conversation::default();
+        let t = Instant::now();
+        let e = claude_cli(&turn, &mut conv, &out).unwrap_err();
+        assert!(e.to_string().starts_with(INTERRUPTED), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn failed_turn_rolls_back_history() {
+        let mut cfg = Config::default();
+        cfg.provider = "anthropic".into();
+        let turn = Turn {
+            cfg,
+            conv: Conversation {
+                image_sent: true,
+                ..Default::default()
+            },
+            question: "q".into(),
+            image: Some(Image {
+                jpeg: Arc::new(vec![]),
+                w: 1,
+                h: 1,
+            }),
+            cancel: Default::default(),
+        };
+        let mut conv = turn.conv.clone();
+        conv.anthropic.push(json!({"role": "user", "content": "q"}));
+        conv.anthropic.push(json!({"role": "assistant", "content": "partial"}));
+        rollback(&turn, &mut conv);
+        assert!(conv.anthropic.is_empty());
+        assert!(!conv.image_sent, "the screenshot must be resent on retry");
+    }
 }
