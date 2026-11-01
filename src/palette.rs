@@ -47,7 +47,9 @@ struct Friendly {
 
 fn friendly(raw: &str) -> Friendly {
     let lower = raw.to_ascii_lowercase();
-    let (text, settings) = if lower.contains("api key") && lower.contains("no ") {
+    let (text, settings) = if raw.starts_with(llm::INTERRUPTED) {
+        ("The answer stopped partway.", false)
+    } else if lower.contains("api key") && lower.contains("no ") {
         ("Add an API key to get started.", true)
     } else if lower.contains("401")
         || lower.contains("authentication")
@@ -68,7 +70,12 @@ fn friendly(raw: &str) -> Friendly {
     };
     Friendly {
         text: text.into(),
-        detail: raw.chars().take(160).collect(),
+        detail: raw
+            .strip_prefix(llm::INTERRUPTED)
+            .unwrap_or(raw)
+            .chars()
+            .take(160)
+            .collect(),
         settings,
     }
 }
@@ -324,6 +331,18 @@ impl Palette {
             },
             llm::Out::new(tx, ctx.clone()),
         );
+    }
+
+    /// Asks the last question again after it failed or was stopped. The
+    /// worker already rolled the conversation back to before that question.
+    fn retry(&mut self, ctx: &egui::Context) {
+        if self.busy() || self.exchanges.last().is_none_or(|x| x.error.is_none()) {
+            return;
+        }
+        let Some(x) = self.exchanges.pop() else { return };
+        let typed = std::mem::replace(&mut self.input, x.question);
+        self.send(ctx);
+        self.input = typed;
     }
 
     /// Takes a fresh screenshot (palette + overlay are excluded from capture)
@@ -669,6 +688,7 @@ impl Palette {
         let n = self.exchanges.len();
         let busy = self.busy();
         let mut open_settings = false;
+        let mut retry = false;
         let mut decision: Option<(bool, bool)> = None;
         let accent = self.accent;
         let once = self.cfg.agent_desktop.approval == "once";
@@ -707,6 +727,9 @@ impl Palette {
                             ui.label(RichText::new(&e.text).color(ERROR));
                             if e.settings && ui.link("Open settings").clicked() {
                                 open_settings = true;
+                            }
+                            if last && !busy && ui.link("Try again").clicked() {
+                                retry = true;
                             }
                         });
                         if e.text != "Stopped." {
@@ -781,6 +804,9 @@ impl Palette {
         }
         if open_settings {
             self.open_settings(ui.ctx());
+        }
+        if retry {
+            self.retry(ui.ctx());
         }
     }
 
