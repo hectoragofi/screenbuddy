@@ -20,6 +20,43 @@ pub struct Config {
     pub openai: OpenAiCfg,
     pub claude_cli: ClaudeCliCfg,
     pub agent_desktop: AgentDesktopCfg,
+    pub context: ContextCfg,
+    pub voice: VoiceCfg,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ContextCfg {
+    /// "Ask screenbuddy" in Explorer's right-click menu for files.
+    pub explorer_menu: bool,
+    /// Text selected in the app when the hotkey fires: "uia+copy" (UI Automation,
+    /// else simulated Ctrl+C with the clipboard restored) | "uia" | "off".
+    pub selection: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct VoiceCfg {
+    /// Push-to-talk with the on-device Whistle model (downloaded on first enable).
+    pub enabled: bool,
+    /// Hold to talk; a quick tap toggles recording instead.
+    pub hotkey: String,
+    /// Send the question as soon as the transcript arrives.
+    pub auto_send: bool,
+    /// "" = detect, or en | de | fr | es | it | nl | pl.
+    pub language: String,
+}
+
+impl Default for ContextCfg {
+    fn default() -> Self {
+        Self { explorer_menu: false, selection: "uia+copy".into() }
+    }
+}
+
+impl Default for VoiceCfg {
+    fn default() -> Self {
+        Self { enabled: false, hotkey: "Ctrl+Alt+Space".into(), auto_send: false, language: String::new() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -114,6 +151,8 @@ impl Default for Config {
             openai: OpenAiCfg::default(),
             claude_cli: ClaudeCliCfg::default(),
             agent_desktop: AgentDesktopCfg::default(),
+            context: ContextCfg::default(),
+            voice: VoiceCfg::default(),
         }
     }
 }
