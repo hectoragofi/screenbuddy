@@ -107,6 +107,62 @@ pub fn grab_monitor_under_cursor() -> anyhow::Result<RawShot> {
     })
 }
 
+/// Grabs an arbitrary virtual-screen rectangle at native resolution. The
+/// returned shot's `monitor.rect` is the rectangle itself, so `encode(&shot,
+/// None)` encodes exactly that area.
+pub fn grab_rect(r: Rect) -> anyhow::Result<RawShot> {
+    let mut monitor = monitor_at(r.x + r.w / 2, r.y + r.h / 2);
+    monitor.rect = r;
+    let bgra = unsafe { bitblt(r)? };
+    Ok(RawShot {
+        monitor,
+        cursor: cursor_pos(),
+        bgra,
+    })
+}
+
+/// Tiny grayscale thumbnail of a screen area (GDI does the averaging), used
+/// for cheap change detection. Returns (width, height, luma).
+pub fn thumb(r: Rect, max_edge: u32) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    let s = (max_edge as f64 / r.w.max(r.h).max(1) as f64).min(1.0);
+    let tw = ((r.w as f64 * s).round() as i32).max(1);
+    let th = ((r.h as f64 * s).round() as i32).max(1);
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let bmp = CreateCompatibleBitmap(screen, tw, th);
+        let old = SelectObject(mem, bmp.into());
+        SetStretchBltMode(mem, HALFTONE);
+        let ok = StretchBlt(mem, 0, 0, tw, th, Some(screen), r.x, r.y, r.w, r.h, SRCCOPY | CAPTUREBLT);
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: tw,
+                biHeight: -th,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (tw * th * 4) as usize];
+        SelectObject(mem, old);
+        let lines = GetDIBits(mem, bmp, 0, th as u32, Some(buf.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        if !ok.as_bool() || lines == 0 {
+            anyhow::bail!("thumbnail capture failed");
+        }
+        let luma = buf
+            .chunks_exact(4)
+            .map(|p| ((p[2] as u32 * 77 + p[1] as u32 * 150 + p[0] as u32 * 29) >> 8) as u8)
+            .collect();
+        Ok((tw as u32, th as u32, luma))
+    }
+}
+
 unsafe fn bitblt(r: Rect) -> anyhow::Result<Vec<u8>> {
     unsafe {
         let screen = GetDC(None);

@@ -234,6 +234,9 @@ fn status_text(s: &str) -> &'static str {
     match s {
         "drawing…" => "Pointing it out",
         "acting…" => "Working",
+        "zooming…" => "Looking closer",
+        "looking…" => "Looking",
+        "watching…" => "Watching for your next step · Esc stops",
         _ => "Thinking",
     }
 }
@@ -335,6 +338,7 @@ impl Palette {
         match capture::grab_monitor_under_cursor().and_then(|shot| capture::encode(&shot, None)) {
             Ok(mut cap) => {
                 cap.cursor = self.cap.cursor;
+                crate::vision::set_capture(&cap, &self.cfg);
                 self.save_history();
                 self.jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
                 self.cap = cap;
@@ -461,7 +465,13 @@ impl Palette {
                         x.answer.push_str(&t);
                     }
                 }
-                Ev::Status(s) => self.status = s,
+                Ev::Status(s) => {
+                    // Guide mode: the user clicks into their app; don't treat that as dismissal.
+                    if s == "watching…" {
+                        self.was_focused = false;
+                    }
+                    self.status = s
+                }
                 Ev::Draw(input, reply) => {
                     let r = self.draw(input);
                     if let Err(e) = &r {
@@ -694,13 +704,16 @@ impl Palette {
                             .render_math_fn(Some(&render))
                             .show(ui, &mut self.md, &crate::math::normalize(&x.answer));
                     }
-                    if last && busy && x.answer.is_empty() && self.pending.is_none() {
+                    let watching = self.status == "watching…";
+                    if last && busy && (x.answer.is_empty() || watching) && self.pending.is_none() {
                         // Soft pulsing status instead of a spinner.
                         let a = 0.45 + 0.35 * ((time * 3.2).sin() as f32 * 0.5 + 0.5);
-                        ui.label(
-                            RichText::new(status_text(&self.status))
-                                .color(TEXT_2.gamma_multiply(a)),
-                        );
+                        let (color, text) = if watching {
+                            (accent.gamma_multiply(a + 0.2), format!("◉ {}", status_text(&self.status)))
+                        } else {
+                            (TEXT_2.gamma_multiply(a), status_text(&self.status).to_string())
+                        };
+                        ui.label(RichText::new(text).color(color));
                     }
                     if let Some(e) = &x.error {
                         ui.horizontal(|ui| {
@@ -897,7 +910,9 @@ impl eframe::App for Palette {
         }
         self.animate_height(&ctx);
         if self.busy() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            // Guide mode can wait for minutes: pulse slowly instead of at 30 fps.
+            let ms = if self.status == "watching…" { 250 } else { 33 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
     }
 }
