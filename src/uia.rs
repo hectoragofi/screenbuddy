@@ -165,7 +165,12 @@ unsafe fn walk(
             }
             let rect = Rect::from_win(el.CachedBoundingRectangle().unwrap_or_default());
             let offscreen = el.CachedIsOffscreen().map(|b| b.as_bool()).unwrap_or(false);
-            if offscreen || rect.w <= 0 || rect.h <= 0 || intersect(rect, area).is_none() {
+            let sized = rect.w > 0 && rect.h > 0;
+            let visible = sized && !offscreen && intersect(rect, area).is_some();
+            // Prune subtrees that are definitely elsewhere; layout wrappers
+            // without bounds (or misreporting offscreen) can still hold
+            // visible children, so those are expanded but not listed.
+            if sized && intersect(rect, area).is_none() {
                 continue;
             }
             let name = clean(&el.CachedName().map(|b| b.to_string()).unwrap_or_default());
@@ -173,7 +178,7 @@ unsafe fn walk(
             let kind = control_type(el.CachedControlType().map(|c| c.0).unwrap_or(0));
             // Skip wrappers that only repeat their parent.
             let repeat = name == pname && rect == prect;
-            if (!name.is_empty() || focusable) && !repeat {
+            if visible && (!name.is_empty() || focusable) && !repeat {
                 found.push(Element {
                     kind,
                     name: name.clone(),
@@ -184,12 +189,13 @@ unsafe fn walk(
             if depth >= MAX_DEPTH {
                 continue;
             }
-            let Ok(kids) = el.FindAllBuildCache(TreeScope_Children, &cond, &cache) else {
+            let kids = el.FindAllBuildCache(TreeScope_Children, &cond, &cache);
+            let Ok(kids) = kids else {
                 continue;
             };
             for i in 0..kids.Length().unwrap_or(0) {
                 if let Ok(k) = kids.GetElement(i) {
-                    queue.push_back((k, depth + 1, name.clone(), rect));
+                    queue.push_back((k, depth + 1, if visible { name.clone() } else { pname.clone() }, if visible { rect } else { prect }));
                 }
             }
         }
