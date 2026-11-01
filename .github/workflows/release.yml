@@ -11,6 +11,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: .needle/dl
+          key: needle-${{ hashFiles('scripts/build-needle.sh') }}
+      - name: Build speech engine (Cactus Needle)
+        shell: bash
+        run: bash scripts/build-needle.sh
       - run: cargo test --locked
       - run: cargo build --release --locked
       - name: Publish release

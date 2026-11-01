@@ -33,7 +33,11 @@ curl -fsL "https://huggingface.co/Cactus-Compute/needle3/resolve/$NEEDLE_REV/LIC
 if [ -z "${LLVM_MINGW:-}" ]; then
   if [ ! -x "$OUT/dl/$MINGW_NAME/bin/x86_64-w64-mingw32-clang++" ] && [ ! -x "$OUT/dl/$MINGW_NAME/bin/x86_64-w64-mingw32-clang++.exe" ]; then
     fetch "https://github.com/mstorsjo/llvm-mingw/releases/download/$MINGW_VER/$MINGW_NAME.zip" "$OUT/dl/llvm-mingw.zip" "$MINGW_SHA"
-    unzip -q -o "$OUT/dl/llvm-mingw.zip" -d "$OUT/dl"
+    if command -v unzip >/dev/null; then
+      unzip -q -o "$OUT/dl/llvm-mingw.zip" -d "$OUT/dl"
+    else
+      powershell -NoProfile -Command "Expand-Archive -Force '$OUT/dl/llvm-mingw.zip' '$OUT/dl'"
+    fi
     rm -f "$OUT/dl/llvm-mingw.zip"
   fi
   LLVM_MINGW="$OUT/dl/$MINGW_NAME"

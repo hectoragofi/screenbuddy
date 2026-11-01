@@ -188,7 +188,6 @@ pub struct Recording {
     stop: Arc<AtomicBool>,
     discard: Arc<AtomicBool>,
     level: Arc<AtomicU32>,
-    pub started: Instant,
     result: Receiver<Result<String, String>>,
     keep: bool,
 }
@@ -238,7 +237,7 @@ impl Recording {
             Ok(Err(e)) => return Err(e),
             Ok(Ok(())) | Err(_) => {}
         }
-        Ok(Self { stop, discard, level, started: Instant::now(), result: rx, keep: false })
+        Ok(Self { stop, discard, level, result: rx, keep: false })
     }
 
     /// Recent input level, 0..=1, for the meter.
@@ -498,5 +497,38 @@ mod tests {
         assert_eq!(LANGUAGES.len(), 8);
         assert!(MODEL_URLS.iter().all(|u| u.ends_with(MODEL_FILE)));
         assert_eq!(MODEL_SHA256.len(), 64);
+    }
+
+    /// Network + disk: `cargo test -- --ignored download`.
+    #[test]
+    #[ignore]
+    fn download_verifies_checksum() {
+        let dest = std::env::temp_dir().join("sb-whistle-test.cact");
+        let st = Mutex::new(Download::default());
+        download(MODEL_URLS[1], &dest, &st, None).unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), MODEL_SIZE);
+        assert!(st.lock().unwrap().progress > 0.99);
+        let _ = std::fs::remove_file(dest);
+    }
+
+    /// Needs a microphone: `cargo test -- --ignored mic`.
+    #[test]
+    #[ignore]
+    fn mic_captures_16k() {
+        let stop = AtomicBool::new(false);
+        let level = AtomicU32::new(0);
+        let (tx, rx) = channel();
+        let mut n = 0usize;
+        let t0 = Instant::now();
+        let mut sink = |pcm: &[f32]| {
+            n += pcm.len();
+            if t0.elapsed().as_millis() > 1000 {
+                stop.store(true, Ordering::Relaxed);
+            }
+        };
+        wasapi::capture(&stop, &level, &mut sink, &tx).unwrap();
+        assert!(rx.recv().unwrap().is_ok());
+        // About one second at 16 kHz.
+        assert!((12_000..24_000).contains(&n), "{n} samples");
     }
 }
