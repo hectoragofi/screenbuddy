@@ -91,6 +91,7 @@ pub struct Palette {
     body_h: f32,
     was_focused: bool,
     md: egui_commonmark::CommonMarkCache,
+    math: std::rc::Rc<std::cell::RefCell<crate::math::MathCache>>,
     notice: Option<String>,
     quit: bool,
     outcome: Arc<std::sync::Mutex<Outcome>>,
@@ -268,6 +269,7 @@ impl Palette {
             body_h: 0.0,
             was_focused: false,
             md: Default::default(),
+            math: Default::default(),
             notice,
             quit: false,
             outcome,
@@ -344,6 +346,7 @@ impl Palette {
                 });
                 self.overlay = None;
                 self.exchanges.clear();
+                self.math.borrow_mut().clear();
                 self.history_dir = None;
                 self.notice = None;
             }
@@ -683,7 +686,13 @@ impl Palette {
                         ui.add_space(2.0);
                     }
                     if !x.answer.is_empty() {
-                        egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.md, &x.answer);
+                        let math = self.math.clone();
+                        let render = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
+                            crate::math::show(ui, &math, tex, inline)
+                        };
+                        egui_commonmark::CommonMarkViewer::new()
+                            .render_math_fn(Some(&render))
+                            .show(ui, &mut self.md, &crate::math::normalize(&x.answer));
                     }
                     if last && busy && x.answer.is_empty() && self.pending.is_none() {
                         // Soft pulsing status instead of a spinner.

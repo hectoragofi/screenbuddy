@@ -211,16 +211,103 @@ struct Label {
     y: f32,
     w: f32,
     h: f32,
-    text: String,
+    line: Line,
     color: [u8; 3],
 }
 
+/// A label's text and formulas laid out on one baseline.
+struct Line {
+    runs: Vec<Run>,
+    width: f32,
+    above: f32,
+    below: f32,
+    math: bool,
+}
+
+enum Run {
+    Text(String, f32),
+    Math(std::sync::Arc<katex_native::raster::Raster>),
+}
+
+fn ink_for(c: [u8; 3]) -> [u8; 3] {
+    let luma = 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
+    if luma > 170.0 { [20, 20, 20] } else { [255, 255, 255] }
+}
+
+fn lay_line(text: &str, px: f32, ink: [u8; 3]) -> Line {
+    let ascent = font()
+        .and_then(|f| f.horizontal_line_metrics(px))
+        .map(|m| m.ascent)
+        .unwrap_or(px * 0.8);
+    let mut line = Line {
+        runs: Vec::new(),
+        width: 0.0,
+        above: ascent,
+        below: px * 1.35 - ascent,
+        math: false,
+    };
+    for piece in crate::math::split(text) {
+        match piece {
+            // Labels are tiny; display style keeps fractions and limits legible.
+            crate::math::Piece::Math { tex, .. } => {
+                if let Some(r) = crate::math::ink(&tex, true, px * 1.05, ink) {
+                    line.above = line.above.max(r.baseline as f32);
+                    line.below = line.below.max(r.height as f32 - r.baseline as f32);
+                    line.width += r.width as f32 + px * 0.15;
+                    line.math = true;
+                    line.runs.push(Run::Math(r));
+                } else {
+                    let w = text_width(&tex, px);
+                    line.width += w;
+                    line.runs.push(Run::Text(tex, w));
+                }
+            }
+            crate::math::Piece::Text(t) => {
+                let w = text_width(&t, px);
+                line.width += w;
+                line.runs.push(Run::Text(t, w));
+            }
+        }
+    }
+    line
+}
+
+/// Blends a straight-RGBA bitmap into a premultiplied pixmap at (x, y).
+fn blit(pm: &mut Pixmap, r: &katex_native::raster::Raster, x: i32, y: i32) {
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let pixels = pm.pixels_mut();
+    for row in 0..r.height as i32 {
+        for col in 0..r.width as i32 {
+            let (tx, ty) = (x + col, y + row);
+            if tx < 0 || ty < 0 || tx >= pw || ty >= ph {
+                continue;
+            }
+            let i = ((row * r.width as i32 + col) * 4) as usize;
+            let a = r.rgba[i + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let p = &mut pixels[(ty * pw + tx) as usize];
+            let inv = 255 - a;
+            let blend = |src: u8, d: u8| ((a * src as u32 + d as u32 * inv) / 255) as u8;
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(
+                blend(r.rgba[i], p.red()),
+                blend(r.rgba[i + 1], p.green()),
+                blend(r.rgba[i + 2], p.blue()),
+                blend(255, p.alpha()),
+            )
+            .unwrap_or(*p);
+        }
+    }
+}
+
 fn label_box(s: &Shape, scale: f32, m: Rect) -> Option<Label> {
-    let text = s.label.clone()?;
-    let px = 14.0 * scale;
+    let text = s.label.as_deref()?;
+    let px = 15.0 * scale;
     let pad = 8.0 * scale;
-    let w = text_width(&text, px) + pad * 2.0;
-    let h = px * 1.35 + pad;
+    let line = lay_line(text, px, ink_for(s.color));
+    let w = line.width + pad * 2.0;
+    let h = line.above + line.below + pad;
     let gap = 6.0 * scale;
     let (x, y) = match s.kind {
         // Label at the arrow's tail, pushed away from the head.
@@ -254,7 +341,7 @@ fn label_box(s: &Shape, scale: f32, m: Rect) -> Option<Label> {
         y,
         w,
         h,
-        text,
+        line,
         color: s.color,
     })
 }
@@ -369,25 +456,32 @@ fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
         let Some(r) = tiny_skia::Rect::from_xywh(l.x, l.y, l.w, l.h) else {
             return;
         };
-        let p = rounded_rect(r, l.h / 2.0);
+        let radius = if l.line.math { 10.0 * scale } else { l.h / 2.0 };
+        let p = rounded_rect(r, radius);
         pm.fill_path(&p, &paint(rgba(l.color, 0.95)), FillRule::Winding, t, None);
         let px = 15.0 * scale;
         let (tx, ty) = (t.tx, t.ty);
-        let [r8, g8, b8] = l.color;
-        let luma = 0.299 * r8 as f32 + 0.587 * g8 as f32 + 0.114 * b8 as f32;
-        let ink = if luma > 170.0 {
-            [20, 20, 20]
-        } else {
-            [255, 255, 255]
-        };
-        draw_text(
-            pm,
-            &l.text,
-            l.x + tx + 8.0 * scale,
-            l.y + ty + (l.h - px * 1.35) / 2.0,
-            px,
-            ink,
-        );
+        let ink = ink_for(l.color);
+        let line_h = l.line.above + l.line.below;
+        let base = l.y + ty + (l.h - line_h) / 2.0 + l.line.above;
+        let ascent = font()
+            .and_then(|f| f.horizontal_line_metrics(px))
+            .map(|m| m.ascent)
+            .unwrap_or(px * 0.8);
+        let mut pen = l.x + tx + 8.0 * scale;
+        for run in &l.line.runs {
+            match run {
+                Run::Text(text, w) => {
+                    draw_text(pm, text, pen, base - ascent, px, ink);
+                    pen += w;
+                }
+                Run::Math(r) => {
+                    let x = (pen + px * 0.075).round() as i32;
+                    blit(pm, r, x, (base - r.baseline as f32).round() as i32);
+                    pen += r.width as f32 + px * 0.15;
+                }
+            }
+        }
     }
 }
 
@@ -912,5 +1006,37 @@ mod tests {
             );
         }
         assert!(pm.data().chunks_exact(4).any(|p| p[3] > 0));
+    }
+
+    #[test]
+    fn math_labels_render() {
+        let m = Rect { x: 0, y: 0, w: 900, h: 300 };
+        let mk = |kind, x, y, label: &str| Shape {
+            kind,
+            x,
+            y,
+            w: 200.0,
+            h: 60.0,
+            x2: 0.0,
+            y2: 0.0,
+            r: 0.0,
+            label: Some(label.into()),
+            color: ACCENT,
+        };
+        let shapes = [
+            mk(Kind::Box, 40.0, 120.0, r"$f'(x) = \frac{3e^{3x}}{3x}$"),
+            mk(Kind::Text, 420.0, 40.0, r"so $x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}$ here"),
+            mk(Kind::Text, 420.0, 200.0, "plain label"),
+        ];
+        let mut pm = Pixmap::new(900, 300).unwrap();
+        pm.fill(Color::from_rgba8(40, 40, 44, 255));
+        for sh in &shapes {
+            let l = label_box(sh, 1.5, m).unwrap();
+            assert!(l.line.math || sh.label.as_deref() == Some("plain label"));
+            draw_shape(&mut pm, sh, 1.5, m, Transform::identity());
+        }
+        if let Ok(out) = std::env::var("SCREENBUDDY_MATH_PNG") {
+            pm.save_png(out).unwrap();
+        }
     }
 }

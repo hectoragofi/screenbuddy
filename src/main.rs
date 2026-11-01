@@ -4,6 +4,7 @@ mod capture;
 mod config;
 mod desktop;
 mod llm;
+mod math;
 mod mcp;
 mod overlay;
 mod palette;

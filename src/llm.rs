@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 
-pub const SYSTEM_PROMPT: &str = "You are screenbuddy, a calm, precise assistant built into the user's desktop. With each question you get a screenshot of what the user is looking at. Answer like a thoughtful expert sitting next to them: lead with the answer, keep it short (one to three sentences unless they ask for more), and use Markdown only when it genuinely helps, such as numbered steps or code. No preamble, no restating the question, no sign-offs.";
+pub const SYSTEM_PROMPT: &str = "You are screenbuddy, a calm, precise assistant built into the user's desktop. With each question you get a screenshot of what the user is looking at. Answer like a thoughtful expert sitting next to them: lead with the answer, keep it short (one to three sentences unless they ask for more), and use Markdown only when it genuinely helps, such as numbered steps or code. Write math in LaTeX: $...$ inline and $$...$$ on its own line for displayed equations; never put math in code blocks. No preamble, no restating the question, no sign-offs.";
 
-pub const DRAW_PROMPT: &str = "You can also point at things on their screen with the `draw` tool, but most questions do not need it. Do not draw for explanations, summaries, translations, opinions, code or writing help, or anything you can answer clearly in words. Draw only when the user wants to find something in the interface (where is X, what do I click, which one, how do I do this here) and pointing will save them from searching. When you do draw, mark exactly one target (at most three for multi-step instructions), prefer a box or circle around it with a 1-3 word label, and keep your text short since the drawing does the work. Never mention coordinates or the tool itself.";
+pub const DRAW_PROMPT: &str = "You can also point at things on their screen with the `draw` tool, but most questions do not need it. Do not draw for explanations, summaries, translations, opinions, code or writing help, or anything you can answer clearly in words. Draw only when the user wants to find something in the interface (where is X, what do I click, which one, how do I do this here) and pointing will save them from searching. When you do draw, mark exactly one target (at most three for multi-step instructions), prefer a box or circle around it with a 1-3 word label, and keep your text short since the drawing does the work. Labels and text shapes render LaTeX in $...$, so for a math problem on screen you may write the key formula or result right next to it with a text shape. Never mention coordinates or the tool itself.";
 
 pub const DRAW_DESC: &str = "Point at something on the user's screen. Use only when the user needs to locate a UI element and words alone would leave them searching; never for decoration or emphasis. Coordinates are screenshot pixels, origin top-left. Kinds: box (x,y,w,h outline around the target; the default choice), circle (x,y center, r), highlight (x,y,w,h translucent fill for a text span or region), arrow (x,y tail -> x2,y2 head on a small target), text (a label at x,y). One shape is usually right.";
 
@@ -55,7 +55,7 @@ pub fn draw_schema() -> Value {
                         "w": {"type": "number"},
                         "h": {"type": "number"},
                         "r": {"type": "number", "description": "circle radius"},
-                        "label": {"type": "string", "description": "short label, 1-4 words"},
+                        "label": {"type": "string", "description": "short label, 1-4 words or a short formula; LaTeX in $...$ is rendered"},
                         "color": {"type": "string", "description": "red, orange, yellow, green, blue, purple, pink, white or #rrggbb"}
                     },
                     "required": ["kind", "x", "y"]
