@@ -3,7 +3,7 @@
 
 use crate::capture::{self, Capture};
 use crate::config::{self, Config};
-use crate::{context, history, voice};
+use crate::{context, history, mention, voice};
 use crate::llm::{self, Conversation, Ev};
 use crate::overlay::{self, Overlay};
 use crate::win::{self, AppEvent};
@@ -146,6 +146,14 @@ pub struct Palette {
     trim_at: f64,
     /// The user dragged the palette; its spot is saved on close.
     moved: bool,
+    /// The `@` menu, while an `@word` is being typed.
+    mention: Option<mention::Menu>,
+    /// Mentions still being fetched (web pages, screenshots, clipboard).
+    attaching: Vec<mention::Pending>,
+    /// Send as soon as `attaching` is done.
+    send_when_ready: bool,
+    /// Give the input focus back on the next frame.
+    refocus: bool,
 }
 
 /// Opens the palette and blocks until it closes.
@@ -351,6 +359,10 @@ impl Palette {
             voice_pending: start.voice,
             trim_at: TRIM_AFTER_OPEN,
             moved: false,
+            mention: None,
+            attaching: Vec::new(),
+            send_when_ready: false,
+            refocus: false,
         }
     }
 
@@ -359,6 +371,14 @@ impl Palette {
     }
 
     fn send(&mut self, ctx: &egui::Context) {
+        if let Some((start, url)) = mention::typed_url(&format!("{} ", self.input.trim_end())) {
+            self.input.truncate(start);
+            self.attaching.push(mention::resolve_url(url));
+        }
+        if !self.attaching.is_empty() {
+            self.send_when_ready = !self.input.trim().is_empty();
+            return;
+        }
         let q = self.input.trim().to_string();
         if q.is_empty() || self.busy() {
             return;
@@ -913,6 +933,143 @@ impl Palette {
         }
     }
 
+    /// Collects finished mentions as chips; sends a question that was waiting on them.
+    fn pump_mentions(&mut self, ctx: &egui::Context) {
+        if let Some((start, url)) = mention::typed_url(&self.input) {
+            self.input.truncate(start);
+            self.attaching.push(mention::resolve_url(url));
+        }
+        let mut i = 0;
+        while i < self.attaching.len() {
+            match self.attaching[i].try_recv() {
+                Ok(r) => {
+                    match r {
+                        Ok(chip) => self.chips.push(chip),
+                        Err(e) => self.notice = Some(e),
+                    }
+                    self.attaching.remove(i);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.attaching.remove(i);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => i += 1,
+            }
+        }
+        if !self.attaching.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.send_when_ready {
+            self.send_when_ready = false;
+            self.send(ctx);
+        }
+    }
+
+    /// Opens/closes the `@` menu as the input changes and handles its keys.
+    fn mention_keys(&mut self, ctx: &egui::Context) {
+        let token = if self.browser.is_none() && self.rec.is_none() {
+            mention::active_token(&self.input).map(|(s, q)| (s, q.to_string()))
+        } else {
+            None
+        };
+        let Some((start, q)) = token else {
+            self.mention = None;
+            return;
+        };
+        let menu = self
+            .mention
+            .get_or_insert_with(|| mention::Menu::open(&self.cfg, self.cap.monitor.rect));
+        let n = menu.filtered(&q).len();
+        let (up, down, pick, esc) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, Key::Tab)
+                    || (n > 0 && i.consume_key(egui::Modifiers::NONE, Key::Enter)),
+                i.consume_key(egui::Modifiers::NONE, Key::Escape),
+            )
+        });
+        if n > 0 {
+            if up {
+                menu.selected = (menu.selected + n - 1) % n;
+            }
+            if down {
+                menu.selected = (menu.selected + 1) % n;
+            }
+            menu.selected = menu.selected.min(n - 1);
+        }
+        if esc {
+            self.input.truncate(start);
+            self.mention = None;
+        } else if pick && n > 0 {
+            let sel = menu.selected;
+            self.pick_mention(start, &q, sel);
+        }
+    }
+
+    fn pick_mention(&mut self, start: usize, q: &str, idx: usize) {
+        let Some(item) = self.mention.as_ref().and_then(|m| m.filtered(q).get(idx).map(|i| (*i).clone())) else {
+            return;
+        };
+        if item.disabled {
+            self.notice = Some(item.desc);
+            return;
+        }
+        self.input.truncate(start);
+        self.mention = None;
+        self.refocus = true;
+        if let Some(rx) = mention::resolve(item.kind, self.hwnd) {
+            self.attaching.push(rx);
+        }
+        // A file dialog took focus; don't treat that as clicking away.
+        self.was_focused = false;
+    }
+
+    /// The `@` menu, in place of the conversation.
+    fn mention_body(&mut self, ui: &mut egui::Ui) {
+        let Some((start, q)) = mention::active_token(&self.input).map(|(s, q)| (s, q.to_string())) else {
+            return;
+        };
+        let Some(menu) = self.mention.as_ref() else { return };
+        let accent = self.accent;
+        let selected = menu.selected;
+        let mut clicked = None;
+        let out = egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(MAX_H - self.top_h() - 24.0)
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                let items = menu.filtered(&q);
+                if items.is_empty() {
+                    ui.label(RichText::new("No matches").color(TEXT_3));
+                }
+                for (i, it) in items.iter().enumerate() {
+                    let fill = if i == selected { Color32::from_white_alpha(14) } else { Color32::TRANSPARENT };
+                    let r = egui::Frame::new()
+                        .fill(fill)
+                        .corner_radius(6)
+                        .inner_margin(Margin::symmetric(8, 5))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let name = RichText::new(format!("@{}", it.name)).strong();
+                                ui.label(if it.disabled { name.color(TEXT_3) } else { name.color(accent) });
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(&it.desc).color(if it.disabled { TEXT_3 } else { TEXT_2 }));
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+                    if r.clicked() {
+                        clicked = Some(i);
+                    }
+                }
+                ui.add_space(8.0);
+            });
+        self.body_h = out.content_size.y;
+        if let Some(i) = clicked {
+            self.pick_mention(start, &q, i);
+        }
+    }
+
     fn handle_app_events(&mut self, ctx: &egui::Context) {
         let mut requeue = Vec::new();
         while let Some(ev) = win::pop() {
@@ -1072,6 +1229,10 @@ impl Palette {
             if gear.clicked() {
                 self.open_settings(ui.ctx());
             }
+            if self.refocus {
+                self.refocus = false;
+                resp.request_focus();
+            }
             if !resp.has_focus() && self.frames < 8 {
                 resp.request_focus();
             }
@@ -1080,7 +1241,7 @@ impl Palette {
                 resp.request_focus();
             }
         });
-        if !self.chips.is_empty() {
+        if !self.chips.is_empty() || !self.attaching.is_empty() {
             self.chip_row(ui);
         }
     }
@@ -1115,6 +1276,10 @@ impl Palette {
                         }
                     });
             }
+            if !self.attaching.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Attaching…").size(12.5).color(TEXT_3));
+            }
         });
         if let Some(i) = remove {
             self.chips.remove(i);
@@ -1122,7 +1287,7 @@ impl Palette {
     }
 
     fn top_h(&self) -> f32 {
-        BAR_H + if self.chips.is_empty() { 0.0 } else { CHIPS_H }
+        BAR_H + if self.chips.is_empty() && self.attaching.is_empty() { 0.0 } else { CHIPS_H }
     }
 
     /// The history list, in place of the conversation.
@@ -1303,7 +1468,7 @@ impl Palette {
     }
 
     fn has_body(&self) -> bool {
-        !self.exchanges.is_empty() || self.notice.is_some() || self.browser.is_some()
+        !self.exchanges.is_empty() || self.notice.is_some() || self.browser.is_some() || self.mention.is_some()
     }
 
     /// Grows/shrinks the window smoothly toward its content height.
@@ -1350,6 +1515,8 @@ impl eframe::App for Palette {
             self.mic(&ctx, true);
         }
         self.pump_voice(&ctx);
+        self.pump_mentions(&ctx);
+        self.mention_keys(&ctx);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::H)) {
             self.toggle_browser();
         }
@@ -1427,6 +1594,8 @@ impl eframe::App for Palette {
                     ui.set_width(full.width() - 2.0 * PAD);
                     if self.browser.is_some() {
                         self.history_body(ui, keys);
+                    } else if self.mention.is_some() {
+                        self.mention_body(ui);
                     } else {
                         self.body(ui);
                     }
