@@ -116,6 +116,7 @@ pub struct Palette {
     was_focused: bool,
     md: egui_commonmark::CommonMarkCache,
     math: std::rc::Rc<std::cell::RefCell<crate::math::MathCache>>,
+    diagrams: crate::diagram::DiagramCache,
     notice: Option<String>,
     quit: bool,
     outcome: Arc<std::sync::Mutex<Outcome>>,
@@ -339,6 +340,7 @@ impl Palette {
             was_focused: false,
             md: Default::default(),
             math: Default::default(),
+            diagrams: Default::default(),
             notice,
             quit: false,
             outcome,
@@ -476,6 +478,7 @@ impl Palette {
                 self.overlay = None;
                 self.exchanges.clear();
                 self.math.borrow_mut().clear();
+                self.diagrams.clear();
                 self.history_dir = None;
                 self.resume = None;
                 self.created = None;
@@ -696,6 +699,7 @@ impl Palette {
         });
         self.overlay = None;
         self.math.borrow_mut().clear();
+        self.diagrams.clear();
         self.browser = None;
         self.input = std::mem::take(&mut self.draft);
         self.notice = None;
@@ -1339,9 +1343,19 @@ impl Palette {
                         let render = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
                             crate::math::show(ui, &math, tex, inline)
                         };
-                        egui_commonmark::CommonMarkViewer::new()
-                            .render_math_fn(Some(&render))
-                            .show(ui, &mut self.md, &crate::math::normalize(&x.answer));
+                        let theme = crate::diagram::Theme { bg: TINT_SOLID, fg: TEXT, muted: TEXT_2, accent };
+                        for seg in crate::diagram::split(&x.answer) {
+                            match seg {
+                                crate::diagram::Seg::Md(md) => {
+                                    egui_commonmark::CommonMarkViewer::new()
+                                        .render_math_fn(Some(&render))
+                                        .show(ui, &mut self.md, &crate::math::normalize(md));
+                                }
+                                crate::diagram::Seg::Mermaid(src) => {
+                                    crate::diagram::show(ui, &mut self.diagrams, &mut self.md, src, theme);
+                                }
+                            }
+                        }
                     }
                     let watching = self.status == "watching…";
                     if last && busy && (x.answer.is_empty() || watching) && self.pending.is_none() {

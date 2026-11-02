@@ -4,6 +4,7 @@ mod capture;
 mod config;
 mod context;
 mod desktop;
+mod diagram;
 mod history;
 mod llm;
 mod math;
