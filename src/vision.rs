@@ -45,11 +45,7 @@ pub struct Frame {
 
 impl Frame {
     pub fn of(cap: &Capture) -> Self {
-        Self {
-            src: cap.src,
-            w: cap.img_w,
-            h: cap.img_h,
-        }
+        Self { src: cap.src, w: cap.img_w, h: cap.img_h }
     }
     /// Screen pixels per image pixel.
     pub fn scale(&self) -> f32 {
@@ -59,16 +55,10 @@ impl Frame {
         self.src.h as f32 / self.h.max(1) as f32
     }
     pub fn to_screen(self, x: f32, y: f32) -> (f32, f32) {
-        (
-            self.src.x as f32 + x * self.scale(),
-            self.src.y as f32 + y * self.scale_y(),
-        )
+        (self.src.x as f32 + x * self.scale(), self.src.y as f32 + y * self.scale_y())
     }
     pub fn image_point(&self, x: f32, y: f32) -> (f32, f32) {
-        (
-            (x - self.src.x as f32) / self.scale(),
-            (y - self.src.y as f32) / self.scale_y(),
-        )
+        ((x - self.src.x as f32) / self.scale(), (y - self.src.y as f32) / self.scale_y())
     }
     /// A screen rectangle in this image's pixels, clipped to the image.
     pub fn rect_in(&self, r: Rect) -> Option<(f32, f32, f32, f32)> {
@@ -87,11 +77,7 @@ pub struct ToolOut {
 
 impl ToolOut {
     fn text(t: impl Into<String>, is_error: bool) -> Self {
-        Self {
-            text: t.into(),
-            image: None,
-            is_error,
-        }
+        Self { text: t.into(), image: None, is_error }
     }
     /// Anthropic `tool_result.content`.
     pub fn anthropic(&self) -> Value {
@@ -166,10 +152,7 @@ pub fn set_capture(cap: &Capture, cfg: &Config) {
         let raw: Vec<isize> = roots.iter().map(|h| h.0 as isize).collect();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let roots = raw
-                .into_iter()
-                .map(|h| windows::Win32::Foundation::HWND(h as *mut _))
-                .collect();
+            let roots = raw.into_iter().map(|h| windows::Win32::Foundation::HWND(h as *mut _)).collect();
             let _ = tx.send(uia::snapshot(roots, area, uia::budget()));
         });
         s.pending = Some(rx);
@@ -322,9 +305,7 @@ fn select(els: Vec<Element>, max: usize) -> Vec<Element> {
 fn format_elements(els: &[Element], base: Frame) -> String {
     let mut lines = Vec::new();
     for (i, e) in els.iter().enumerate() {
-        let Some((x, y, w, h)) = base.rect_in(e.rect) else {
-            continue;
-        };
+        let Some((x, y, w, h)) = base.rect_in(e.rect) else { continue };
         if w < 2.0 || h < 2.0 {
             continue;
         }
@@ -358,27 +339,15 @@ pub fn resolve_draw(input: Value) -> Result<Value, String> {
     resolve(input, base, &s.zooms, &s.elements)
 }
 
-fn resolve(
-    mut input: Value,
-    base: Frame,
-    zooms: &[Frame],
-    els: &[Element],
-) -> Result<Value, String> {
+fn resolve(mut input: Value, base: Frame, zooms: &[Frame], els: &[Element]) -> Result<Value, String> {
     let Some(shapes) = input.get_mut("shapes").and_then(Value::as_array_mut) else {
         return Ok(input);
     };
     for (i, s) in shapes.iter_mut().enumerate() {
-        let Some(obj) = s.as_object_mut() else {
-            continue;
-        };
-        let num = |o: &serde_json::Map<String, Value>, k: &str| {
-            o.get(k).and_then(Value::as_f64).map(|v| v as f32)
-        };
+        let Some(obj) = s.as_object_mut() else { continue };
+        let num = |o: &serde_json::Map<String, Value>, k: &str| o.get(k).and_then(Value::as_f64).map(|v| v as f32);
         if let Some(id) = obj.remove("zoom").filter(|v| !v.is_null()) {
-            let id = id
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| id.to_string());
+            let id = id.as_str().map(str::to_owned).unwrap_or_else(|| id.to_string());
             let z = id
                 .trim_start_matches(['z', 'Z'])
                 .parse::<usize>()
@@ -402,10 +371,7 @@ fn resolve(
             }
         }
         if let Some(id) = obj.remove("element").filter(|v| !v.is_null()) {
-            let id = id
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| id.to_string());
+            let id = id.as_str().map(str::to_owned).unwrap_or_else(|| id.to_string());
             let el = id
                 .trim_start_matches(['e', 'E'])
                 .parse::<usize>()
@@ -427,20 +393,10 @@ fn round(v: f32) -> Value {
 }
 
 /// Places a shape on an element's bounds (all in screenshot px).
-fn snap(
-    obj: &mut serde_json::Map<String, Value>,
-    (x, y, w, h): (f32, f32, f32, f32),
-    img: (f32, f32),
-) {
+fn snap(obj: &mut serde_json::Map<String, Value>, (x, y, w, h): (f32, f32, f32, f32), img: (f32, f32)) {
     let (cx, cy) = (x + w / 2.0, y + h / 2.0);
-    let kind = obj
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("box")
-        .to_string();
-    let get = |o: &serde_json::Map<String, Value>, k: &str| {
-        o.get(k).and_then(Value::as_f64).map(|v| v as f32)
-    };
+    let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("box").to_string();
+    let get = |o: &serde_json::Map<String, Value>, k: &str| o.get(k).and_then(Value::as_f64).map(|v| v as f32);
     let put = |o: &mut serde_json::Map<String, Value>, k: &str, v: f32| {
         o.insert(k.into(), round(v));
     };
@@ -457,14 +413,7 @@ fn snap(
                     // Come in from the side facing the image center so the arrow stays visible.
                     let (dx, dy) = (img.0 / 2.0 - cx, img.1 / 2.0 - cy);
                     let len = (dx * dx + dy * dy).sqrt();
-                    let (ux, uy) = if len < 1.0 {
-                        (
-                            -std::f32::consts::FRAC_1_SQRT_2,
-                            std::f32::consts::FRAC_1_SQRT_2,
-                        )
-                    } else {
-                        (dx / len, dy / len)
-                    };
+                    let (ux, uy) = if len < 1.0 { (-std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2) } else { (dx / len, dy / len) };
                     let reach = w.max(h) / 2.0 + 90.0;
                     (cx + ux * reach, cy + uy * reach)
                 }
@@ -497,16 +446,8 @@ fn edge_point((x, y, w, h): (f32, f32, f32, f32), from: (f32, f32)) -> (f32, f32
     if vx.abs() < 1e-3 && vy.abs() < 1e-3 {
         return (cx, cy);
     }
-    let tx = if vx.abs() > 1e-3 {
-        (w / 2.0) / vx.abs()
-    } else {
-        f32::INFINITY
-    };
-    let ty = if vy.abs() > 1e-3 {
-        (h / 2.0) / vy.abs()
-    } else {
-        f32::INFINITY
-    };
+    let tx = if vx.abs() > 1e-3 { (w / 2.0) / vx.abs() } else { f32::INFINITY };
+    let ty = if vy.abs() > 1e-3 { (h / 2.0) / vy.abs() } else { f32::INFINITY };
     let t = tx.min(ty).min(1.0);
     (cx + vx * t, cy + vy * t)
 }
@@ -549,15 +490,8 @@ fn zoom(input: &Value, out: &Out) -> ToolOut {
         format!("z{}", s.zooms.len())
     };
     let (bx, by, bw, bh) = base.rect_in(rect).unwrap_or((x, y, w, h));
-    let native = if frame.scale() <= 1.0 + 1e-3 {
-        "native resolution"
-    } else {
-        "downscaled to fit image limits"
-    };
-    crate::config::log(&format!(
-        "zoom {id}: screen {rect:?} -> {}x{}",
-        frame.w, frame.h
-    ));
+    let native = if frame.scale() <= 1.0 + 1e-3 { "native resolution" } else { "downscaled to fit image limits" };
+    crate::config::log(&format!("zoom {id}: screen {rect:?} -> {}x{}", frame.w, frame.h));
     out.status("thinking…");
     ToolOut {
         text: format!(
@@ -580,12 +514,7 @@ fn zoom(input: &Value, out: &Out) -> ToolOut {
 fn zoom_rect(base: Frame, monitor: Rect, (x, y, w, h): (f32, f32, f32, f32)) -> Option<Rect> {
     let (x0, y0) = base.to_screen(x.min(x + w), y.min(y + h));
     let (x1, y1) = base.to_screen(x.max(x + w), y.max(y + h));
-    let (mut x0, mut y0, mut x1, mut y1) = (
-        x0.floor() as i32,
-        y0.floor() as i32,
-        x1.ceil() as i32,
-        y1.ceil() as i32,
-    );
+    let (mut x0, mut y0, mut x1, mut y1) = (x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32);
     for (a, b) in [(&mut x0, &mut x1), (&mut y0, &mut y1)] {
         let short = MIN_ZOOM - (*b - *a);
         if short > 0 {
@@ -593,15 +522,7 @@ fn zoom_rect(base: Frame, monitor: Rect, (x, y, w, h): (f32, f32, f32, f32)) -> 
             *b += short - short / 2;
         }
     }
-    let r = uia::intersect(
-        Rect {
-            x: x0,
-            y: y0,
-            w: x1 - x0,
-            h: y1 - y0,
-        },
-        monitor,
-    )?;
+    let r = uia::intersect(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, monitor)?;
     uia::intersect(r, base.src)
 }
 
@@ -615,10 +536,7 @@ pub fn changed_cells(a: &[u8], b: &[u8]) -> usize {
     if a.len() != b.len() {
         return usize::MAX;
     }
-    a.iter()
-        .zip(b)
-        .filter(|(x, y)| x.abs_diff(**y) > CELL_DELTA)
-        .count()
+    a.iter().zip(b).filter(|(x, y)| x.abs_diff(**y) > CELL_DELTA).count()
 }
 
 pub fn is_change(cells: usize) -> bool {
@@ -641,10 +559,7 @@ fn watch(out: &Out) -> ToolOut {
         }
     };
     if stopped {
-        return ToolOut::text(
-            "The user stopped guide mode. Stop guiding; acknowledge in a few words.",
-            false,
-        );
+        return ToolOut::text("The user stopped guide mode. Stop guiding; acknowledge in a few words.", false);
     }
     // Only the work area: the taskbar clock and tray would count as changes.
     let area = uia::intersect(base.src, monitor.work).unwrap_or(base.src);
@@ -655,20 +570,11 @@ fn watch(out: &Out) -> ToolOut {
         Wake::Stopped => {
             state().stopped = true;
             out.status("thinking…");
-            return ToolOut::text(
-                "The user pressed Esc to stop guide mode. Stop guiding; acknowledge in a few words.",
-                false,
-            );
+            return ToolOut::text("The user pressed Esc to stop guide mode. Stop guiding; acknowledge in a few words.", false);
         }
         Wake::Timeout => {
             out.status("thinking…");
-            return ToolOut::text(
-                format!(
-                    "Nothing changed for {} minutes. Ask whether they want to continue instead of calling watch again.",
-                    WATCH_MAX.as_secs() / 60
-                ),
-                false,
-            );
+            return ToolOut::text(format!("Nothing changed for {} minutes. Ask whether they want to continue instead of calling watch again.", WATCH_MAX.as_secs() / 60), false);
         }
         Wake::Changed => {}
     }
@@ -713,11 +619,7 @@ fn watch(out: &Out) -> ToolOut {
 fn wait_for_change(area: Rect, cancel: &AtomicBool) -> Wake {
     let probe = uia::FocusProbe::new();
     let focus = |p: &Option<uia::FocusProbe>| p.as_ref().and_then(|p| p.signature());
-    let shot = || {
-        capture::thumb(area, THUMB_EDGE)
-            .map(|t| t.2)
-            .unwrap_or_default()
-    };
+    let shot = || capture::thumb(area, THUMB_EDGE).map(|t| t.2).unwrap_or_default();
     let focus0 = focus(&probe);
     let mut base = shot();
     let start = Instant::now();
@@ -797,16 +699,9 @@ fn server() -> Option<&'static (u16, String)> {
 fn random_token() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    );
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let a = h.finish();
-    let b = std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish();
+    let b = std::collections::hash_map::RandomState::new().build_hasher().finish();
     format!("{a:016x}{b:016x}")
 }
 
@@ -825,8 +720,7 @@ fn serve(stream: std::net::TcpStream, token: &str) {
             None => ToolOut::text("error: no active question", true),
         }
     };
-    let reply =
-        json!({"text": res.text, "is_error": res.is_error, "image": res.image.as_deref().map(b64)});
+    let reply = json!({"text": res.text, "is_error": res.is_error, "image": res.image.as_deref().map(b64)});
     let mut w = &stream;
     let _ = writeln!(w, "{reply}");
 }
@@ -841,19 +735,12 @@ pub fn cli_env(env: &mut serde_json::Map<String, Value>) {
 
 /// `tools/call` for zoom/watch inside `screenbuddy --mcp`: forwarded to the parent.
 pub fn mcp_call(name: &str, args: &Value) -> Value {
-    let port = std::env::var(PORT_ENV)
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok());
+    let port = std::env::var(PORT_ENV).ok().and_then(|p| p.parse::<u16>().ok());
     let token = std::env::var(TOKEN_ENV).unwrap_or_default();
     let res = port
         .and_then(|p| std::net::TcpStream::connect(("127.0.0.1", p)).ok())
         .and_then(|mut s| {
-            writeln!(
-                s,
-                "{}",
-                json!({"token": token, "tool": name, "input": args})
-            )
-            .ok()?;
+            writeln!(s, "{}", json!({"token": token, "tool": name, "input": args})).ok()?;
             let mut line = String::new();
             BufReader::new(&s).read_line(&mut line).ok()?;
             serde_json::from_str::<Value>(&line).ok()
@@ -877,16 +764,7 @@ mod tests {
 
     fn base() -> Frame {
         // 3840x2160 monitor at x=1920 downscaled to 1430x804.
-        Frame {
-            src: Rect {
-                x: 1920,
-                y: 0,
-                w: 3840,
-                h: 2160,
-            },
-            w: 1430,
-            h: 804,
-        }
+        Frame { src: Rect { x: 1920, y: 0, w: 3840, h: 2160 }, w: 1430, h: 804 }
     }
 
     #[test]
@@ -895,28 +773,10 @@ mod tests {
         let (sx, sy) = b.to_screen(100.0, 50.0);
         let (x, y) = b.image_point(sx, sy);
         assert!((x - 100.0).abs() < 1e-3 && (y - 50.0).abs() < 1e-3);
-        let (rx, ry, rw, rh) = b
-            .rect_in(Rect {
-                x: 1920 + 384,
-                y: 216,
-                w: 384,
-                h: 216,
-            })
-            .unwrap();
-        assert!(
-            (rx - 143.0).abs() < 0.01 && (ry - 80.4).abs() < 0.01,
-            "{rx},{ry}"
-        );
+        let (rx, ry, rw, rh) = b.rect_in(Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }).unwrap();
+        assert!((rx - 143.0).abs() < 0.01 && (ry - 80.4).abs() < 0.01, "{rx},{ry}");
         assert!((rw - 143.0).abs() < 0.01 && (rh - 80.4).abs() < 0.01);
-        assert!(
-            b.rect_in(Rect {
-                x: 0,
-                y: 0,
-                w: 100,
-                h: 100
-            })
-            .is_none()
-        );
+        assert!(b.rect_in(Rect { x: 0, y: 0, w: 100, h: 100 }).is_none());
     }
 
     #[test]
@@ -926,11 +786,7 @@ mod tests {
         let (x0, y0) = b.to_screen(100.0, 100.0);
         assert_eq!((r.x, r.y), (x0.floor() as i32, y0.floor() as i32));
         // Native-resolution zoom of that area.
-        let z = Frame {
-            src: r,
-            w: r.w as u32,
-            h: r.h as u32,
-        };
+        let z = Frame { src: r, w: r.w as u32, h: r.h as u32 };
         let input = json!({"shapes": [{"kind": "box", "zoom": "z1", "x": 0, "y": 0, "w": r.w, "h": r.h},
                                       {"kind": "arrow", "zoom": "z1", "x": 10, "y": 10, "x2": 20, "y2": 20}]});
         let out = resolve(input, b, &[z], &[]).unwrap();
@@ -941,29 +797,12 @@ mod tests {
         assert!(s.get("zoom").is_none());
         let a = &out["shapes"][1];
         assert!(a["x2"].as_f64().unwrap() > a["x"].as_f64().unwrap());
-        assert!(
-            resolve(
-                json!({"shapes": [{"kind": "box", "zoom": "z9", "x": 0, "y": 0}]}),
-                b,
-                &[z],
-                &[]
-            )
-            .is_err()
-        );
+        assert!(resolve(json!({"shapes": [{"kind": "box", "zoom": "z9", "x": 0, "y": 0}]}), b, &[z], &[]).is_err());
     }
 
     #[test]
     fn tiny_zoom_grows_and_clips() {
-        let b = Frame {
-            src: Rect {
-                x: 0,
-                y: 0,
-                w: 1000,
-                h: 800,
-            },
-            w: 1000,
-            h: 800,
-        };
+        let b = Frame { src: Rect { x: 0, y: 0, w: 1000, h: 800 }, w: 1000, h: 800 };
         let r = zoom_rect(b, b.src, (500.0, 400.0, 2.0, 2.0)).unwrap();
         assert_eq!((r.w, r.h), (MIN_ZOOM, MIN_ZOOM));
         let r = zoom_rect(b, b.src, (990.0, 790.0, 50.0, 50.0)).unwrap();
@@ -974,57 +813,19 @@ mod tests {
     #[test]
     fn element_snaps() {
         let b = base();
-        let el = Element {
-            kind: "button",
-            name: "Save".into(),
-            rect: Rect {
-                x: 1920 + 384,
-                y: 216,
-                w: 384,
-                h: 216,
-            },
-            focused: false,
-        };
+        let el = Element { kind: "button", name: "Save".into(), rect: Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }, focused: false };
         let out = resolve(json!({"shapes": [{"kind": "box", "element": "e1"}, {"kind": "circle", "element": "e1"}, {"kind": "arrow", "element": "e1"}]}), b, &[], &[el.clone()]).unwrap();
         let bx = &out["shapes"][0];
-        assert!(
-            (bx["x"].as_f64().unwrap() - 143.0).abs() < 0.1
-                && (bx["w"].as_f64().unwrap() - 143.0).abs() < 0.1,
-            "{bx}"
-        );
+        assert!((bx["x"].as_f64().unwrap() - 143.0).abs() < 0.1 && (bx["w"].as_f64().unwrap() - 143.0).abs() < 0.1, "{bx}");
         let c = &out["shapes"][1];
         assert!((c["x"].as_f64().unwrap() - 214.5).abs() < 0.1);
         let a = &out["shapes"][2];
         // Head lands on the element's edge, tail outside it.
         let (hx, hy) = (a["x2"].as_f64().unwrap(), a["y2"].as_f64().unwrap());
-        assert!(
-            (143.0..=286.1).contains(&hx) && (80.3..=160.9).contains(&hy),
-            "{a}"
-        );
+        assert!((143.0..=286.1).contains(&hx) && (80.3..=160.9).contains(&hy), "{a}");
         assert!(a["x"].as_f64().unwrap() > 286.0);
-        assert!(
-            resolve(
-                json!({"shapes": [{"kind": "box", "element": "e2"}]}),
-                b,
-                &[],
-                &[el]
-            )
-            .is_err()
-        );
-        let txt = format_elements(
-            &[Element {
-                kind: "button",
-                name: "Save".into(),
-                rect: Rect {
-                    x: 1920 + 384,
-                    y: 216,
-                    w: 384,
-                    h: 216,
-                },
-                focused: true,
-            }],
-            b,
-        );
+        assert!(resolve(json!({"shapes": [{"kind": "box", "element": "e2"}]}), b, &[], &[el]).is_err());
+        let txt = format_elements(&[Element { kind: "button", name: "Save".into(), rect: Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }, focused: true }], b);
         assert!(txt.contains("e1 button \"Save\" 143,80,143,80 *"), "{txt}");
     }
 
@@ -1047,16 +848,8 @@ mod tests {
 
     #[test]
     fn select_prefers_named() {
-        let e = |n: &str| Element {
-            kind: "button",
-            name: n.into(),
-            rect: Rect::default(),
-            focused: false,
-        };
+        let e = |n: &str| Element { kind: "button", name: n.into(), rect: Rect::default(), focused: false };
         let got = select(vec![e(""), e("a"), e(""), e("b")], 2);
-        assert_eq!(
-            got.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
-            ["a", "b"]
-        );
+        assert_eq!(got.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     }
 }

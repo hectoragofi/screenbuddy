@@ -3,10 +3,10 @@
 
 use crate::capture::{self, Capture};
 use crate::config::{self, Config};
+use crate::{context, history, voice};
 use crate::llm::{self, Conversation, Ev};
 use crate::overlay::{self, Overlay};
 use crate::win::{self, AppEvent};
-use crate::{context, history, voice};
 use egui::{Color32, FontFamily, FontId, Key, Margin, RichText, TextStyle};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::Arc;
@@ -428,9 +428,7 @@ impl Palette {
         if self.busy() || self.exchanges.last().is_none_or(|x| x.error.is_none()) {
             return;
         }
-        let Some(x) = self.exchanges.pop() else {
-            return;
-        };
+        let Some(x) = self.exchanges.pop() else { return };
         let typed = std::mem::replace(&mut self.input, x.question);
         self.send(ctx);
         self.input = typed;
@@ -630,10 +628,7 @@ impl Palette {
             let _ = std::fs::write(&shot, &*self.jpeg);
         }
         let chat = history::Chat {
-            created: self
-                .created
-                .get_or_insert_with(crate::util::timestamp)
-                .clone(),
+            created: self.created.get_or_insert_with(crate::util::timestamp).clone(),
             provider: self.cfg.provider_label(),
             exchanges: self
                 .exchanges
@@ -708,9 +703,7 @@ impl Palette {
             return;
         }
         if !voice::engine_included() {
-            self.notice = Some(
-                "Voice input isn't available in this build (speech engine not included).".into(),
-            );
+            self.notice = Some("Voice input isn't available in this build (speech engine not included).".into());
             return;
         }
         if !voice::model_ready() {
@@ -768,10 +761,7 @@ impl Palette {
                     }
                 }
             } else {
-                self.notice = Some(format!(
-                    "Downloading the voice model (17 MB, once)… {:.0}%",
-                    d.progress * 100.0
-                ));
+                self.notice = Some(format!("Downloading the voice model (17 MB, once)… {:.0}%", d.progress * 100.0));
             }
         }
         if let Some(rx) = &self.transcribing {
@@ -833,11 +823,7 @@ impl Palette {
                     let max_h = (MAX_H * s) as i32;
                     let (cx, cy) = self.cap.cursor;
                     let x = (cx - w / 2).clamp(work.x, (work.x + work.w - w).max(work.x));
-                    let y = if cy + gap + max_h <= work.y + work.h {
-                        cy + gap
-                    } else {
-                        (cy - gap - max_h).max(work.y)
-                    };
+                    let y = if cy + gap + max_h <= work.y + work.h { cy + gap } else { (cy - gap - max_h).max(work.y) };
                     (x, y)
                 }
                 "center" => (
@@ -1109,37 +1095,19 @@ impl Palette {
                 egui::Frame::new()
                     .fill(Color32::from_white_alpha(14))
                     .corner_radius(6)
-                    .inner_margin(Margin {
-                        left: 8,
-                        right: 4,
-                        top: 2,
-                        bottom: 2,
-                    })
+                    .inner_margin(Margin { left: 8, right: 4, top: 2, bottom: 2 })
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let mark = if c.image.is_some() {
-                            "▣"
-                        } else if c.label == "Selected text" {
-                            "❝"
-                        } else {
-                            "▤"
-                        };
+                        let mark = if c.image.is_some() { "▣" } else if c.label == "Selected text" { "❝" } else { "▤" };
                         let label: String = if c.label.chars().count() > 28 {
                             format!("{}…", c.label.chars().take(27).collect::<String>())
                         } else {
                             c.label.clone()
                         };
-                        ui.label(
-                            RichText::new(format!("{mark} {label}"))
-                                .size(12.5)
-                                .color(TEXT_2),
-                        )
-                        .on_hover_text(&c.hover);
+                        ui.label(RichText::new(format!("{mark} {label}")).size(12.5).color(TEXT_2))
+                            .on_hover_text(&c.hover);
                         if ui
-                            .add(
-                                egui::Button::new(RichText::new("✕").size(11.0).color(TEXT_3))
-                                    .frame(false),
-                            )
+                            .add(egui::Button::new(RichText::new("✕").size(11.0).color(TEXT_3)).frame(false))
                             .on_hover_text("Remove")
                             .clicked()
                         {
@@ -1162,9 +1130,7 @@ impl Palette {
         let accent = self.accent;
         let query = self.input.clone();
         let max_h = MAX_H - self.top_h() - 24.0;
-        let Some(b) = self.browser.as_mut() else {
-            return;
-        };
+        let Some(b) = self.browser.as_mut() else { return };
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .max_height(max_h)
@@ -1217,15 +1183,9 @@ impl Palette {
                         // Soft pulsing status instead of a spinner.
                         let a = 0.45 + 0.35 * ((time * 3.2).sin() as f32 * 0.5 + 0.5);
                         let (color, text) = if watching {
-                            (
-                                accent.gamma_multiply(a + 0.2),
-                                format!("◉ {}", status_text(&self.status)),
-                            )
+                            (accent.gamma_multiply(a + 0.2), format!("◉ {}", status_text(&self.status)))
                         } else {
-                            (
-                                TEXT_2.gamma_multiply(a),
-                                status_text(&self.status).to_string(),
-                            )
+                            (TEXT_2.gamma_multiply(a), status_text(&self.status).to_string())
                         };
                         ui.label(RichText::new(text).color(color));
                     }
@@ -1268,21 +1228,13 @@ impl Palette {
                             ui.horizontal(|ui| {
                                 if ui
                                     .link(RichText::new("Always allow").size(13.0))
-                                    .on_hover_text(
-                                        "Never ask again. Change this in Settings → Agent.",
-                                    )
+                                    .on_hover_text("Never ask again. Change this in Settings → Agent.")
                                     .clicked()
                                 {
                                     decision = Some((true, true));
                                 }
                                 if once {
-                                    ui.label(
-                                        RichText::new(
-                                            "Allowing covers the rest of this conversation",
-                                        )
-                                        .color(TEXT_3)
-                                        .size(12.0),
-                                    );
+                                    ui.label(RichText::new("Allowing covers the rest of this conversation").color(TEXT_3).size(12.0));
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -1484,11 +1436,7 @@ impl eframe::App for Palette {
         self.trim_when_idle(&ctx);
         if self.busy() {
             // Guide mode can wait for minutes: pulse slowly instead of at 30 fps.
-            let ms = if self.status == "watching…" {
-                250
-            } else {
-                33
-            };
+            let ms = if self.status == "watching…" { 250 } else { 33 };
             ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
     }
@@ -1529,13 +1477,7 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> 
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
     let c = rect.center();
     let p = ui.painter();
-    let fg = if active {
-        Color32::WHITE
-    } else if resp.hovered() {
-        TEXT_2
-    } else {
-        TEXT_3
-    };
+    let fg = if active { Color32::WHITE } else if resp.hovered() { TEXT_2 } else { TEXT_3 };
     if active {
         let bg = match icon {
             Icon::Mic(_) => Color32::from_rgb(220, 60, 60),
@@ -1554,14 +1496,9 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> 
         }
         Icon::Mic(level) => {
             if let Some(l) = level {
-                p.circle_stroke(
-                    c,
-                    12.0 + 3.0 * l,
-                    egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60).gamma_multiply(0.6)),
-                );
+                p.circle_stroke(c, 12.0 + 3.0 * l, egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60).gamma_multiply(0.6)));
             }
-            let body =
-                egui::Rect::from_center_size(c + egui::vec2(0.0, -2.5), egui::vec2(6.0, 10.0));
+            let body = egui::Rect::from_center_size(c + egui::vec2(0.0, -2.5), egui::vec2(6.0, 10.0));
             p.rect_stroke(body, 3, st, egui::StrokeKind::Middle);
             let arc: Vec<egui::Pos2> = (0..=12)
                 .map(|i| {

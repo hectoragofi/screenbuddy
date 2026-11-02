@@ -192,10 +192,7 @@ pub struct Cursor {
 }
 
 pub fn new_session_id() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     format!("screenbuddy-{:x}", n & 0xffff_ffff_ffff)
 }
 
@@ -221,21 +218,10 @@ pub fn exec(exe: &std::path::Path, args: &[String], intent: &str, ctx: &Ctx) -> 
         args.push(ctx.session.clone());
     }
     if let Some(c) = ctx.cursor.as_ref().filter(|_| !is_read_only(&args)) {
-        let mut ov: Vec<String> = [
-            "cursor-overlay",
-            "enable",
-            "--session",
-            &ctx.session,
-            "--fill",
-            &c.fill,
-            "--rim",
-            &c.rim,
-            "--accent",
-            &c.accent,
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let mut ov: Vec<String> = ["cursor-overlay", "enable", "--session", &ctx.session, "--fill", &c.fill, "--rim", &c.rim, "--accent", &c.accent]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         if c.label && !intent.trim().is_empty() {
             ov.push("--label".into());
             ov.push(intent.to_string());

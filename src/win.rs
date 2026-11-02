@@ -225,8 +225,7 @@ pub fn register_voice_hotkey(spec: &str) -> Option<String> {
 
 /// True while the non-modifier key of a hotkey spec is physically held.
 pub fn hotkey_held(spec: &str) -> bool {
-    parse_hotkey(spec)
-        .is_ok_and(|(_, vk)| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0)
+    parse_hotkey(spec).is_ok_and(|(_, vk)| unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000 != 0)
 }
 
 /// Our windows are hidden from screen capture (so re-captures stay clean)

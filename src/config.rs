@@ -50,21 +50,13 @@ pub struct VoiceCfg {
 
 impl Default for ContextCfg {
     fn default() -> Self {
-        Self {
-            explorer_menu: false,
-            selection: "uia+copy".into(),
-        }
+        Self { explorer_menu: false, selection: "uia+copy".into() }
     }
 }
 
 impl Default for VoiceCfg {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            hotkey: "Ctrl+Alt+Space".into(),
-            auto_send: false,
-            language: String::new(),
-        }
+        Self { enabled: false, hotkey: "Ctrl+Alt+Space".into(), auto_send: false, language: String::new() }
     }
 }
 
@@ -208,10 +200,7 @@ impl Default for AppearanceCfg {
 
 impl Default for DrawingCfg {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            color: "#0A84FF".into(),
-        }
+        Self { enabled: true, color: "#0A84FF".into() }
     }
 }
 
@@ -257,11 +246,7 @@ impl Default for AgentDesktopCfg {
 
 impl Default for ClaudeCliCfg {
     fn default() -> Self {
-        Self {
-            command: "claude".into(),
-            model: String::new(),
-            keep_warm_minutes: 10,
-        }
+        Self { command: "claude".into(), model: String::new(), keep_warm_minutes: 10 }
     }
 }
 
@@ -305,9 +290,7 @@ pub fn rgb_hex(c: [u8; 3]) -> String {
 }
 
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("screenbuddy");
     let _ = std::fs::create_dir_all(&dir);
     dir
@@ -351,17 +334,10 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
 pub fn log(msg: &str) {
     use std::io::Write;
     let path = data_dir().join("screenbuddy.log");
-    if std::fs::metadata(&path)
-        .map(|m| m.len() > 1_000_000)
-        .unwrap_or(false)
-    {
+    if std::fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false) {
         let _ = std::fs::remove_file(&path);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{}] {msg}", crate::util::timestamp());
     }
 }

@@ -44,11 +44,7 @@ pub fn show(ui: &mut Ui, cache: &RefCell<MathCache>, tex: &str, inline: bool) {
     };
 
     let Some((handle, baseline)) = rendered else {
-        let src = if inline {
-            format!("${tex}$")
-        } else {
-            format!("$${tex}$$")
-        };
+        let src = if inline { format!("${tex}$") } else { format!("$${tex}$$") };
         ui.label(egui::RichText::new(src).monospace());
         return;
     };
@@ -112,31 +108,20 @@ thread_local! {
 fn rasterize(tex: &str, display: bool, px: f32, rgba: [u8; 4]) -> Option<Raster> {
     let layout = KATEX.with(|k| katex_native::layout(k, tex, display)).ok()?;
     let [r, g, b, a] = rgba;
-    let raster = katex_native::raster::rasterize(
-        &layout,
-        f64::from(px),
-        katex_native::Color { r, g, b, a },
-    )?;
+    let raster = katex_native::raster::rasterize(&layout, f64::from(px), katex_native::Color { r, g, b, a })?;
     (raster.width > 0 && raster.height > 0).then_some(raster)
 }
 
 /// Cached formula bitmap (straight RGBA) for painting outside egui.
 pub fn ink(tex: &str, display: bool, px: f32, rgb: [u8; 3]) -> Option<Arc<Raster>> {
-    let key = (
-        tex.to_string(),
-        display,
-        px.to_bits(),
-        [rgb[0], rgb[1], rgb[2], 255],
-    );
+    let key = (tex.to_string(), display, px.to_bits(), [rgb[0], rgb[1], rgb[2], 255]);
     INK.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() > 256 {
             c.clear();
         }
         c.entry(key)
-            .or_insert_with(|| {
-                rasterize(tex, display, px, [rgb[0], rgb[1], rgb[2], 255]).map(Arc::new)
-            })
+            .or_insert_with(|| rasterize(tex, display, px, [rgb[0], rgb[1], rgb[2], 255]).map(Arc::new))
             .clone()
     })
 }
@@ -156,12 +141,7 @@ pub fn split(s: &str) -> Vec<Piece> {
     let mut text = String::new();
     let mut rest = s;
     'outer: while !rest.is_empty() {
-        for (open, close, display) in [
-            ("$$", "$$", true),
-            (r"\[", r"\]", true),
-            (r"\(", r"\)", false),
-            ("$", "$", false),
-        ] {
+        for (open, close, display) in [("$$", "$$", true), (r"\[", r"\]", true), (r"\(", r"\)", false), ("$", "$", false)] {
             if let Some(after) = rest.strip_prefix(open) {
                 if let Some(end) = after.find(close) {
                     let tex = &after[..end];
@@ -171,10 +151,7 @@ pub fn split(s: &str) -> Vec<Piece> {
                         if !text.is_empty() {
                             out.push(Piece::Text(std::mem::take(&mut text)));
                         }
-                        out.push(Piece::Math {
-                            tex: tex.trim().to_string(),
-                            display,
-                        });
+                        out.push(Piece::Math { tex: tex.trim().to_string(), display });
                         rest = &after[end + close.len()..];
                         continue 'outer;
                     }
@@ -257,20 +234,11 @@ mod tests {
             split(r"x = $\frac{1}{2}$!"),
             vec![
                 Piece::Text("x = ".into()),
-                Piece::Math {
-                    tex: r"\frac{1}{2}".into(),
-                    display: false
-                },
+                Piece::Math { tex: r"\frac{1}{2}".into(), display: false },
                 Piece::Text("!".into()),
             ]
         );
-        assert_eq!(
-            split(r"$$e^{i\pi}$$"),
-            vec![Piece::Math {
-                tex: r"e^{i\pi}".into(),
-                display: true
-            }]
-        );
+        assert_eq!(split(r"$$e^{i\pi}$$"), vec![Piece::Math { tex: r"e^{i\pi}".into(), display: true }]);
         assert!(ink(r"\sqrt{x}", false, 20.0, [255, 255, 255]).is_some());
         assert!(ink(r"\frac{", false, 20.0, [255, 255, 255]).is_none());
     }
@@ -278,23 +246,9 @@ mod tests {
     #[test]
     fn katex_lays_out_common_math() {
         let ctx = KatexContext::default();
-        for t in [
-            r"\frac{a}{b}",
-            r"\int_0^1 x^2\,dx",
-            r"\sum_{n=1}^\infty \frac1{n^2}=\frac{\pi^2}6",
-            r"\begin{pmatrix}1&0\\0&1\end{pmatrix}",
-        ] {
+        for t in [r"\frac{a}{b}", r"\int_0^1 x^2\,dx", r"\sum_{n=1}^\infty \frac1{n^2}=\frac{\pi^2}6", r"\begin{pmatrix}1&0\\0&1\end{pmatrix}"] {
             let l = katex_native::layout(&ctx, t, true).unwrap();
-            let r = katex_native::raster::rasterize(
-                &l,
-                24.0,
-                katex_native::Color {
-                    r: 0,
-                    g: 0,
-                    b: 0,
-                    a: 255,
-                },
-            );
+            let r = katex_native::raster::rasterize(&l, 24.0, katex_native::Color { r: 0, g: 0, b: 0, a: 255 });
             assert!(r.is_some_and(|r| r.width > 0), "{t}");
         }
     }
@@ -304,19 +258,12 @@ mod tests {
         let ctx = egui::Context::default();
         let cache = std::rc::Rc::new(RefCell::new(MathCache::default()));
         let mut md = egui_commonmark::CommonMarkCache::default();
-        let text = normalize(concat!(
-            r"Roots: \(x = 2\) or $x=3$.",
-            "\n\n",
-            r"$$x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}$$",
-            "\n\nDone, costs $5."
-        ));
+        let text = normalize(concat!(r"Roots: \(x = 2\) or $x=3$.", "\n\n", r"$$x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}$$", "\n\nDone, costs $5."));
         for _ in 0..2 {
             let mut out = ctx.run_ui(Default::default(), |ui| {
                 let c = cache.clone();
                 let f = move |ui: &mut Ui, tex: &str, inline: bool| show(ui, &c, tex, inline);
-                egui_commonmark::CommonMarkViewer::new()
-                    .render_math_fn(Some(&f))
-                    .show(ui, &mut md, &text);
+                egui_commonmark::CommonMarkViewer::new().render_math_fn(Some(&f)).show(ui, &mut md, &text);
             });
             out.textures_delta.clear();
         }

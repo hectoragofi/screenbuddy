@@ -215,10 +215,7 @@ impl Out {
             }
             self.status("acting…");
         }
-        let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx {
-            session: crate::desktop::new_session_id(),
-            cursor: None,
-        });
+        let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx { session: crate::desktop::new_session_id(), cursor: None });
         let out = crate::desktop::exec(exe, &args, &intent, &dctx);
         let ok = serde_json::from_str::<Value>(&out)
             .ok()
@@ -258,10 +255,7 @@ pub fn spawn(turn: Turn, out: Out) {
             conv.desktop_session = crate::desktop::new_session_id();
         }
         let mut out = out;
-        out.dctx = Some(crate::desktop::Ctx::from_config(
-            &turn.cfg,
-            conv.desktop_session.clone(),
-        ));
+        out.dctx = Some(crate::desktop::Ctx::from_config(&turn.cfg, conv.desktop_session.clone()));
         let out = out;
         crate::vision::turn_started(&out, &turn.cancel);
         let res = match turn.cfg.provider.as_str() {
@@ -766,9 +760,7 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
                 Ok(input) if crate::vision::is_tool(name) => {
                     let r = crate::vision::handle(name, &input, out);
                     if let Some(img) = r.openai_image() {
-                        images.push(
-                            json!({"type": "text", "text": format!("Image returned by {name}:")}),
-                        );
+                        images.push(json!({"type": "text", "text": format!("Image returned by {name}:")}));
                         images.push(img);
                         format!("{} (image in the next message)", r.text)
                     } else {
@@ -825,11 +817,8 @@ impl Job {
                 std::mem::size_of_val(&info) as u32,
             )
             .ok()?;
-            AssignProcessToJobObject(
-                job.0,
-                windows::Win32::Foundation::HANDLE(child.as_raw_handle()),
-            )
-            .ok()?;
+            AssignProcessToJobObject(job.0, windows::Win32::Foundation::HANDLE(child.as_raw_handle()))
+                .ok()?;
             Some(job)
         }
     }
@@ -908,7 +897,8 @@ struct Spare {
 static SPARE: std::sync::Mutex<Option<Spare>> = std::sync::Mutex::new(None);
 
 /// The spawn started by `warm_on_hotkey`, joined before the spare is taken.
-static WARMING: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+static WARMING: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
 
 /// Called the moment the hotkey fires: starts the CLI in parallel with the
 /// screen capture and window creation, so Node has a head start before the
@@ -924,10 +914,7 @@ pub fn warm_on_hotkey(cfg: &Config) {
     let h = std::thread::spawn(move || {
         let sig = spare_sig(&cfg);
         let mut slot = SPARE.lock().unwrap();
-        if slot
-            .as_mut()
-            .is_some_and(|s| s.sig == sig && s.proc.alive())
-        {
+        if slot.as_mut().is_some_and(|s| s.sig == sig && s.proc.alive()) {
             return;
         }
         *slot = None;
@@ -1345,10 +1332,7 @@ mod tests {
             }
             match self.tail {
                 Tail::Eof => Ok(0),
-                Tail::Fail => Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "reset",
-                )),
+                Tail::Fail => Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")),
                 Tail::Hang => loop {
                     std::thread::sleep(Duration::from_secs(3600));
                 },
@@ -1372,10 +1356,7 @@ mod tests {
 
     #[test]
     fn sse_completes_on_final_event() {
-        let (r, seen) = run(
-            body("data: a\n\ndata: stop\ndata: never\n", Tail::Hang),
-            Duration::from_secs(5),
-        );
+        let (r, seen) = run(body("data: a\n\ndata: stop\ndata: never\n", Tail::Hang), Duration::from_secs(5));
         assert!(r.unwrap());
         assert_eq!(seen, ["a", "stop"]);
     }
@@ -1410,13 +1391,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             c2.store(true, Ordering::Relaxed);
         });
-        let r = sse_lines(
-            body("", Tail::Hang),
-            &cancel,
-            &Watch::default(),
-            Duration::from_secs(60),
-            |_| Ok(true),
-        );
+        let r = sse_lines(body("", Tail::Hang), &cancel, &Watch::default(), Duration::from_secs(60), |_| Ok(true));
         assert!(!r.unwrap());
     }
 
@@ -1479,8 +1454,7 @@ mod tests {
         };
         let mut conv = turn.conv.clone();
         conv.anthropic.push(json!({"role": "user", "content": "q"}));
-        conv.anthropic
-            .push(json!({"role": "assistant", "content": "partial"}));
+        conv.anthropic.push(json!({"role": "assistant", "content": "partial"}));
         rollback(&turn, &mut conv);
         assert!(conv.anthropic.is_empty());
         assert!(!conv.image_sent, "the screenshot must be resent on retry");
