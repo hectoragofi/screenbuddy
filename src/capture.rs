@@ -133,7 +133,19 @@ pub fn thumb(r: Rect, max_edge: u32) -> anyhow::Result<(u32, u32, Vec<u8>)> {
         let bmp = CreateCompatibleBitmap(screen, tw, th);
         let old = SelectObject(mem, bmp.into());
         SetStretchBltMode(mem, HALFTONE);
-        let ok = StretchBlt(mem, 0, 0, tw, th, Some(screen), r.x, r.y, r.w, r.h, SRCCOPY | CAPTUREBLT);
+        let ok = StretchBlt(
+            mem,
+            0,
+            0,
+            tw,
+            th,
+            Some(screen),
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            SRCCOPY | CAPTUREBLT,
+        );
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -148,7 +160,15 @@ pub fn thumb(r: Rect, max_edge: u32) -> anyhow::Result<(u32, u32, Vec<u8>)> {
         };
         let mut buf = vec![0u8; (tw * th * 4) as usize];
         SelectObject(mem, old);
-        let lines = GetDIBits(mem, bmp, 0, th as u32, Some(buf.as_mut_ptr().cast()), &mut info, DIB_RGB_COLORS);
+        let lines = GetDIBits(
+            mem,
+            bmp,
+            0,
+            th as u32,
+            Some(buf.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);

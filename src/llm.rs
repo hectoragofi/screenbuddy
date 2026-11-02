@@ -215,7 +215,10 @@ impl Out {
             }
             self.status("acting…");
         }
-        let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx { session: crate::desktop::new_session_id(), cursor: None });
+        let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx {
+            session: crate::desktop::new_session_id(),
+            cursor: None,
+        });
         let out = crate::desktop::exec(exe, &args, &intent, &dctx);
         let ok = serde_json::from_str::<Value>(&out)
             .ok()
@@ -255,7 +258,10 @@ pub fn spawn(turn: Turn, out: Out) {
             conv.desktop_session = crate::desktop::new_session_id();
         }
         let mut out = out;
-        out.dctx = Some(crate::desktop::Ctx::from_config(&turn.cfg, conv.desktop_session.clone()));
+        out.dctx = Some(crate::desktop::Ctx::from_config(
+            &turn.cfg,
+            conv.desktop_session.clone(),
+        ));
         let out = out;
         crate::vision::turn_started(&out, &turn.cancel);
         let res = match turn.cfg.provider.as_str() {
@@ -306,6 +312,8 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+const WEB_PROMPT: &str = "You can search the web. Use it when the answer depends on current, external or exact information that is not on screen (docs, prices, news, error messages); skip it when the screen already answers the question. Keep the answer short and end with the one or two most useful sources as Markdown links.";
+
 fn system_prompt(cfg: &Config) -> String {
     let mut p = SYSTEM_PROMPT.to_string();
     if cfg.drawing.enabled {
@@ -316,6 +324,10 @@ fn system_prompt(cfg: &Config) -> String {
     if cfg.desktop_exe().is_some() {
         p.push_str("\n\n");
         p.push_str(crate::desktop::PROMPT);
+    }
+    if cfg.vision.web_search && cfg.provider != "openai" {
+        p.push_str("\n\n");
+        p.push_str(WEB_PROMPT);
     }
     if !cfg.extra_instructions.trim().is_empty() {
         p.push_str("\n\n");
@@ -443,6 +455,11 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
             "output_config": {"effort": cfg.effort},
             "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some()), &turn.cfg),
         });
+        if turn.cfg.vision.web_search {
+            if let Some(t) = body["tools"].as_array_mut() {
+                t.push(json!({"type": "web_search_20250305", "name": "web_search", "max_uses": 5}));
+            }
+        }
         let mut req = client
             .post(&url)
             .header("x-api-key", &key)
@@ -473,6 +490,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
                     let block = ev["content_block"].clone();
                     match block["type"].as_str() {
                         Some("tool_use") if block["name"] == "draw" => out.status("drawing…"),
+                        Some("server_tool_use") => out.status("searching the web…"),
                         Some("text") => {
                             if wrote_text && !blocks.values().any(|b| b["type"] == "text") {
                                 out.delta("\n\n");
@@ -507,6 +525,15 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
                 }
                 "content_block_stop" => {
                     if let Some(b) = blocks.get_mut(&idx) {
+                        // Server-run (web search): keep the input for history, nothing to execute.
+                        if b["type"] == "server_tool_use" {
+                            let raw = partial.remove(&idx).unwrap_or_default();
+                            if let Ok(input) = serde_json::from_str::<Value>(&raw) {
+                                b["input"] = input;
+                            }
+                            out.status("reading results…");
+                            return Ok(true);
+                        }
                         if b["type"] == "tool_use" {
                             let raw = partial.remove(&idx).unwrap_or_default();
                             let parsed = if raw.trim().is_empty() {
@@ -739,7 +766,9 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
                 Ok(input) if crate::vision::is_tool(name) => {
                     let r = crate::vision::handle(name, &input, out);
                     if let Some(img) = r.openai_image() {
-                        images.push(json!({"type": "text", "text": format!("Image returned by {name}:")}));
+                        images.push(
+                            json!({"type": "text", "text": format!("Image returned by {name}:")}),
+                        );
                         images.push(img);
                         format!("{} (image in the next message)", r.text)
                     } else {
@@ -796,8 +825,11 @@ impl Job {
                 std::mem::size_of_val(&info) as u32,
             )
             .ok()?;
-            AssignProcessToJobObject(job.0, windows::Win32::Foundation::HANDLE(child.as_raw_handle()))
-                .ok()?;
+            AssignProcessToJobObject(
+                job.0,
+                windows::Win32::Foundation::HANDLE(child.as_raw_handle()),
+            )
+            .ok()?;
             Some(job)
         }
     }
@@ -876,8 +908,7 @@ struct Spare {
 static SPARE: std::sync::Mutex<Option<Spare>> = std::sync::Mutex::new(None);
 
 /// The spawn started by `warm_on_hotkey`, joined before the spare is taken.
-static WARMING: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
-    std::sync::Mutex::new(None);
+static WARMING: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
 
 /// Called the moment the hotkey fires: starts the CLI in parallel with the
 /// screen capture and window creation, so Node has a head start before the
@@ -893,7 +924,10 @@ pub fn warm_on_hotkey(cfg: &Config) {
     let h = std::thread::spawn(move || {
         let sig = spare_sig(&cfg);
         let mut slot = SPARE.lock().unwrap();
-        if slot.as_mut().is_some_and(|s| s.sig == sig && s.proc.alive()) {
+        if slot
+            .as_mut()
+            .is_some_and(|s| s.sig == sig && s.proc.alive())
+        {
             return;
         }
         *slot = None;
@@ -1011,7 +1045,16 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
         allowed_list.push("mcp__screenbuddy__desktop");
     }
     allowed_list.extend(crate::vision::cli_allowed(full_cfg));
-    let allowed = if allowed_list.is_empty() { "none".to_string() } else { allowed_list.join(" ") };
+    let web = full_cfg.vision.web_search;
+    if web {
+        allowed_list.extend(["WebSearch", "WebFetch"]);
+    }
+    let builtin = if web { "WebSearch,WebFetch" } else { "" };
+    let allowed = if allowed_list.is_empty() {
+        "none".to_string()
+    } else {
+        allowed_list.join(" ")
+    };
     let allowed = allowed.as_str();
     let system = system_prompt(full_cfg);
     let build = |program: &str| {
@@ -1026,7 +1069,7 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
             "--include-partial-messages",
         ])
         .args(["--system-prompt", &system])
-        .args(["--tools", ""])
+        .args(["--tools", builtin])
         .args(["--strict-mcp-config", "--mcp-config", &mcp])
         .args(["--allowedTools", allowed]);
         if !cfg.model.trim().is_empty() {
@@ -1167,10 +1210,14 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
                 match e["type"].as_str().unwrap_or("") {
                     "message_start" => streamed_this_msg = false,
                     "content_block_start" if e["content_block"]["type"] == "tool_use" => {
-                        let draw = e["content_block"]["name"]
-                            .as_str()
-                            .is_some_and(|n| n.ends_with("draw"));
-                        out.status(if draw { "drawing…" } else { "thinking…" })
+                        let name = e["content_block"]["name"].as_str().unwrap_or("");
+                        out.status(if name.ends_with("draw") {
+                            "drawing…"
+                        } else if name.starts_with("Web") {
+                            "searching the web…"
+                        } else {
+                            "thinking…"
+                        })
                     }
                     "content_block_start" if e["content_block"]["type"] == "thinking" => {
                         out.status("thinking…")
@@ -1298,7 +1345,10 @@ mod tests {
             }
             match self.tail {
                 Tail::Eof => Ok(0),
-                Tail::Fail => Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")),
+                Tail::Fail => Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "reset",
+                )),
                 Tail::Hang => loop {
                     std::thread::sleep(Duration::from_secs(3600));
                 },
@@ -1322,7 +1372,10 @@ mod tests {
 
     #[test]
     fn sse_completes_on_final_event() {
-        let (r, seen) = run(body("data: a\n\ndata: stop\ndata: never\n", Tail::Hang), Duration::from_secs(5));
+        let (r, seen) = run(
+            body("data: a\n\ndata: stop\ndata: never\n", Tail::Hang),
+            Duration::from_secs(5),
+        );
         assert!(r.unwrap());
         assert_eq!(seen, ["a", "stop"]);
     }
@@ -1357,7 +1410,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             c2.store(true, Ordering::Relaxed);
         });
-        let r = sse_lines(body("", Tail::Hang), &cancel, &Watch::default(), Duration::from_secs(60), |_| Ok(true));
+        let r = sse_lines(
+            body("", Tail::Hang),
+            &cancel,
+            &Watch::default(),
+            Duration::from_secs(60),
+            |_| Ok(true),
+        );
         assert!(!r.unwrap());
     }
 
@@ -1420,7 +1479,8 @@ mod tests {
         };
         let mut conv = turn.conv.clone();
         conv.anthropic.push(json!({"role": "user", "content": "q"}));
-        conv.anthropic.push(json!({"role": "assistant", "content": "partial"}));
+        conv.anthropic
+            .push(json!({"role": "assistant", "content": "partial"}));
         rollback(&turn, &mut conv);
         assert!(conv.anthropic.is_empty());
         assert!(!conv.image_sent, "the screenshot must be resent on retry");

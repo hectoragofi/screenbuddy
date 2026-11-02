@@ -76,7 +76,11 @@ pub struct DrawCall {
 }
 
 /// Parses a `draw` tool input (screenshot pixel coords) into screen shapes.
-pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Result<DrawCall, String> {
+pub fn parse_draw(
+    input: &Value,
+    cap: &Capture,
+    default_color: [u8; 3],
+) -> Result<DrawCall, String> {
     let clear = input.get("clear").and_then(Value::as_bool).unwrap_or(false);
     let list = match input.get("shapes") {
         Some(Value::Array(a)) => a.clone(),
@@ -231,7 +235,11 @@ enum Run {
 
 fn ink_for(c: [u8; 3]) -> [u8; 3] {
     let luma = 0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32;
-    if luma > 170.0 { [20, 20, 20] } else { [255, 255, 255] }
+    if luma > 170.0 {
+        [20, 20, 20]
+    } else {
+        [255, 255, 255]
+    }
 }
 
 fn lay_line(text: &str, px: f32, ink: [u8; 3]) -> Line {
@@ -983,8 +991,22 @@ mod tests {
 
     #[test]
     fn rejects_bad_shapes() {
-        assert!(parse_draw(&json!({"shapes":[{"kind":"arrow","x":1,"y":1}]}), &cap(), ACCENT).is_err());
-        assert!(parse_draw(&json!({"shapes":[{"kind":"blob","x":1,"y":1}]}), &cap(), ACCENT).is_err());
+        assert!(
+            parse_draw(
+                &json!({"shapes":[{"kind":"arrow","x":1,"y":1}]}),
+                &cap(),
+                ACCENT
+            )
+            .is_err()
+        );
+        assert!(
+            parse_draw(
+                &json!({"shapes":[{"kind":"blob","x":1,"y":1}]}),
+                &cap(),
+                ACCENT
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1010,7 +1032,12 @@ mod tests {
 
     #[test]
     fn math_labels_render() {
-        let m = Rect { x: 0, y: 0, w: 900, h: 300 };
+        let m = Rect {
+            x: 0,
+            y: 0,
+            w: 900,
+            h: 300,
+        };
         let mk = |kind, x, y, label: &str| Shape {
             kind,
             x,
@@ -1025,7 +1052,12 @@ mod tests {
         };
         let shapes = [
             mk(Kind::Box, 40.0, 120.0, r"$f'(x) = \frac{3e^{3x}}{3x}$"),
-            mk(Kind::Text, 420.0, 40.0, r"so $x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}$ here"),
+            mk(
+                Kind::Text,
+                420.0,
+                40.0,
+                r"so $x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}$ here",
+            ),
             mk(Kind::Text, 420.0, 200.0, "plain label"),
         ];
         let mut pm = Pixmap::new(900, 300).unwrap();

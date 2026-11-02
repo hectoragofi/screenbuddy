@@ -11,8 +11,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Accessibility::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GW_HWNDNEXT, GetAncestor, GetForegroundWindow, GetTopWindow, GetWindow,
-    GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, WindowFromPoint,
+    GA_ROOT, GW_HWNDNEXT, GetAncestor, GetForegroundWindow, GetTopWindow, GetWindow, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, WindowFromPoint,
 };
 
 /// Default wall-clock budget for one snapshot.
@@ -47,7 +47,13 @@ pub fn target_windows(area: Rect, cursor: (i32, i32)) -> Vec<HWND> {
     let mut out: Vec<HWND> = Vec::new();
     unsafe {
         let fg = GetForegroundWindow();
-        let under = GetAncestor(WindowFromPoint(POINT { x: cursor.0, y: cursor.1 }), GA_ROOT);
+        let under = GetAncestor(
+            WindowFromPoint(POINT {
+                x: cursor.0,
+                y: cursor.1,
+            }),
+            GA_ROOT,
+        );
         for h in [fg, under] {
             if usable(h, area) && !out.contains(&h) {
                 out.push(h);
@@ -100,7 +106,12 @@ pub fn intersect(a: Rect, b: Rect) -> Option<Rect> {
     let y0 = a.y.max(b.y);
     let x1 = (a.x + a.w).min(b.x + b.w);
     let y1 = (a.y + a.h).min(b.y + b.h);
-    (x1 > x0 && y1 > y0).then_some(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+    (x1 > x0 && y1 > y0).then_some(Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    })
 }
 
 /// Walks `roots` breadth-first and returns the named or focusable elements
@@ -120,7 +131,12 @@ pub fn snapshot(roots: Vec<HWND>, area: Rect, budget: Duration) -> Vec<Element> 
         let t = Instant::now();
         let r = unsafe { walk(&roots, area, deadline, &mut found) };
         if std::env::var_os("SCREENBUDDY_UIA_MS").is_some() {
-            eprintln!("[uia walk {:?}: {} elements, {:?}]", t.elapsed(), found.len(), r.err());
+            eprintln!(
+                "[uia walk {:?}: {} elements, {:?}]",
+                t.elapsed(),
+                found.len(),
+                r.err()
+            );
         }
         let _ = tx.send(found);
     });
@@ -174,7 +190,10 @@ unsafe fn walk(
                 continue;
             }
             let name = clean(&el.CachedName().map(|b| b.to_string()).unwrap_or_default());
-            let focusable = el.CachedIsKeyboardFocusable().map(|b| b.as_bool()).unwrap_or(false);
+            let focusable = el
+                .CachedIsKeyboardFocusable()
+                .map(|b| b.as_bool())
+                .unwrap_or(false);
             let kind = control_type(el.CachedControlType().map(|c| c.0).unwrap_or(0));
             // Skip wrappers that only repeat their parent.
             let repeat = name == pname && rect == prect;
@@ -183,7 +202,10 @@ unsafe fn walk(
                     kind,
                     name: name.clone(),
                     rect,
-                    focused: el.CachedHasKeyboardFocus().map(|b| b.as_bool()).unwrap_or(false),
+                    focused: el
+                        .CachedHasKeyboardFocus()
+                        .map(|b| b.as_bool())
+                        .unwrap_or(false),
                 });
             }
             if depth >= MAX_DEPTH {
@@ -195,7 +217,12 @@ unsafe fn walk(
             };
             for i in 0..kids.Length().unwrap_or(0) {
                 if let Ok(k) = kids.GetElement(i) {
-                    queue.push_back((k, depth + 1, if visible { name.clone() } else { pname.clone() }, if visible { rect } else { prect }));
+                    queue.push_back((
+                        k,
+                        depth + 1,
+                        if visible { name.clone() } else { pname.clone() },
+                        if visible { rect } else { prect },
+                    ));
                 }
             }
         }
@@ -225,7 +252,10 @@ impl FocusProbe {
             let r = el.CurrentBoundingRectangle().unwrap_or_default();
             let name = el.CurrentName().map(|b| b.to_string()).unwrap_or_default();
             let ct = el.CurrentControlType().map(|c| c.0).unwrap_or(0);
-            Some(format!("{ct}|{name}|{},{},{},{}", r.left, r.top, r.right, r.bottom))
+            Some(format!(
+                "{ct}|{name}|{},{},{},{}",
+                r.left, r.top, r.right, r.bottom
+            ))
         }
     }
 }
@@ -245,12 +275,47 @@ fn clean(s: &str) -> String {
 /// UIA control type ids (UIA_*ControlTypeId, 50000..=50040) to short names.
 pub fn control_type(id: i32) -> &'static str {
     const NAMES: [&str; 41] = [
-        "button", "calendar", "checkbox", "combobox", "edit", "link", "image", "listitem",
-        "list", "menu", "menubar", "menuitem", "progressbar", "radio", "scrollbar", "slider",
-        "spinner", "statusbar", "tab", "tabitem", "text", "toolbar", "tooltip", "tree",
-        "treeitem", "custom", "group", "thumb", "datagrid", "dataitem", "document",
-        "splitbutton", "window", "pane", "header", "headeritem", "table", "titlebar",
-        "separator", "semanticzoom", "appbar",
+        "button",
+        "calendar",
+        "checkbox",
+        "combobox",
+        "edit",
+        "link",
+        "image",
+        "listitem",
+        "list",
+        "menu",
+        "menubar",
+        "menuitem",
+        "progressbar",
+        "radio",
+        "scrollbar",
+        "slider",
+        "spinner",
+        "statusbar",
+        "tab",
+        "tabitem",
+        "text",
+        "toolbar",
+        "tooltip",
+        "tree",
+        "treeitem",
+        "custom",
+        "group",
+        "thumb",
+        "datagrid",
+        "dataitem",
+        "document",
+        "splitbutton",
+        "window",
+        "pane",
+        "header",
+        "headeritem",
+        "table",
+        "titlebar",
+        "separator",
+        "semanticzoom",
+        "appbar",
     ];
     usize::try_from(id - 50000)
         .ok()
@@ -272,8 +337,40 @@ mod tests {
     }
     #[test]
     fn intersects() {
-        let a = Rect { x: 0, y: 0, w: 10, h: 10 };
-        assert_eq!(intersect(a, Rect { x: 5, y: 5, w: 10, h: 10 }), Some(Rect { x: 5, y: 5, w: 5, h: 5 }));
-        assert_eq!(intersect(a, Rect { x: 10, y: 0, w: 5, h: 5 }), None);
+        let a = Rect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        };
+        assert_eq!(
+            intersect(
+                a,
+                Rect {
+                    x: 5,
+                    y: 5,
+                    w: 10,
+                    h: 10
+                }
+            ),
+            Some(Rect {
+                x: 5,
+                y: 5,
+                w: 5,
+                h: 5
+            })
+        );
+        assert_eq!(
+            intersect(
+                a,
+                Rect {
+                    x: 10,
+                    y: 0,
+                    w: 5,
+                    h: 5
+                }
+            ),
+            None
+        );
     }
 }

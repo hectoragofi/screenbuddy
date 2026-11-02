@@ -14,8 +14,8 @@ mod settings;
 mod tray;
 mod uia;
 mod util;
-mod voice;
 mod vision;
+mod voice;
 mod win;
 
 use win::AppEvent;
@@ -84,7 +84,11 @@ impl App {
             errs.extend(win::register_hotkeys(&want.0, &want.1));
             self.hotkeys = want;
         }
-        let voice = if cfg.voice.enabled { cfg.voice.hotkey.clone() } else { String::new() };
+        let voice = if cfg.voice.enabled {
+            cfg.voice.hotkey.clone()
+        } else {
+            String::new()
+        };
         if self.voice_hk.as_deref() != Some(voice.as_str()) {
             errs.extend(win::register_voice_hotkey(&voice));
             self.voice_hk = Some(voice);
@@ -185,13 +189,19 @@ fn run() -> anyhow::Result<()> {
                 AppEvent::Hotkey(win::HK_VOICE) => app.ask(
                     false,
                     true,
-                    palette::Start { voice: true, ..Default::default() },
+                    palette::Start {
+                        voice: true,
+                        ..Default::default()
+                    },
                 ),
                 AppEvent::Hotkey(_) => palette::Outcome::Closed,
                 AppEvent::OpenFile(p) => app.ask(
                     false,
                     false,
-                    palette::Start { chips: vec![context::file_chip(&p)], ..Default::default() },
+                    palette::Start {
+                        chips: vec![context::file_chip(&p)],
+                        ..Default::default()
+                    },
                 ),
                 AppEvent::Menu(id) => match id.as_str() {
                     tray::ASK => app.ask(false, false, Default::default()),
@@ -199,7 +209,10 @@ fn run() -> anyhow::Result<()> {
                     tray::BROWSE => app.ask(
                         false,
                         false,
-                        palette::Start { history: true, ..Default::default() },
+                        palette::Start {
+                            history: true,
+                            ..Default::default()
+                        },
                     ),
                     tray::SETTINGS => {
                         let o = settings::run();

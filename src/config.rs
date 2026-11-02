@@ -50,13 +50,21 @@ pub struct VoiceCfg {
 
 impl Default for ContextCfg {
     fn default() -> Self {
-        Self { explorer_menu: false, selection: "uia+copy".into() }
+        Self {
+            explorer_menu: false,
+            selection: "uia+copy".into(),
+        }
     }
 }
 
 impl Default for VoiceCfg {
     fn default() -> Self {
-        Self { enabled: false, hotkey: "Ctrl+Alt+Space".into(), auto_send: false, language: String::new() }
+        Self {
+            enabled: false,
+            hotkey: "Ctrl+Alt+Space".into(),
+            auto_send: false,
+            language: String::new(),
+        }
     }
 }
 
@@ -69,8 +77,10 @@ pub struct AppearanceCfg {
     pub width: f32,
     /// Answer text size in points.
     pub text_size: f32,
-    /// "top" | "center" | "cursor"
+    /// "top" | "center" | "cursor" | "last" (where you last dragged it)
     pub position: String,
+    /// Top-left of the palette in screen pixels, saved when you drag it.
+    pub saved_pos: Option<[i32; 2]>,
     /// Close the palette when you click elsewhere (kept open while drawings show).
     pub dismiss_on_blur: bool,
 }
@@ -93,11 +103,18 @@ pub struct VisionCfg {
     pub zoom: bool,
     /// Step-by-step guide mode: wait for you to act, then look again.
     pub guide: bool,
+    /// Let the assistant search the web (Anthropic API and Claude CLI).
+    pub web_search: bool,
 }
 
 impl Default for VisionCfg {
     fn default() -> Self {
-        Self { ui_tree: true, zoom: true, guide: true }
+        Self {
+            ui_tree: true,
+            zoom: true,
+            guide: true,
+            web_search: true,
+        }
     }
 }
 
@@ -178,13 +195,23 @@ impl Default for Config {
 
 impl Default for AppearanceCfg {
     fn default() -> Self {
-        Self { accent: "#0A84FF".into(), width: 680.0, text_size: 15.0, position: "top".into(), dismiss_on_blur: true }
+        Self {
+            accent: "#0A84FF".into(),
+            width: 680.0,
+            text_size: 15.0,
+            position: "top".into(),
+            saved_pos: None,
+            dismiss_on_blur: true,
+        }
     }
 }
 
 impl Default for DrawingCfg {
     fn default() -> Self {
-        Self { enabled: true, color: "#0A84FF".into() }
+        Self {
+            enabled: true,
+            color: "#0A84FF".into(),
+        }
     }
 }
 
@@ -230,7 +257,11 @@ impl Default for AgentDesktopCfg {
 
 impl Default for ClaudeCliCfg {
     fn default() -> Self {
-        Self { command: "claude".into(), model: String::new(), keep_warm_minutes: 10 }
+        Self {
+            command: "claude".into(),
+            model: String::new(),
+            keep_warm_minutes: 10,
+        }
     }
 }
 
@@ -274,7 +305,9 @@ pub fn rgb_hex(c: [u8; 3]) -> String {
 }
 
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("screenbuddy");
     let _ = std::fs::create_dir_all(&dir);
     dir
@@ -318,10 +351,17 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
 pub fn log(msg: &str) {
     use std::io::Write;
     let path = data_dir().join("screenbuddy.log");
-    if std::fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false) {
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_file(&path);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "[{}] {msg}", crate::util::timestamp());
     }
 }

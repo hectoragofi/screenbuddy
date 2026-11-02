@@ -38,7 +38,11 @@ impl Chat {
             "This continues an earlier conversation with the user. Earlier turns (the screenshot from back then is not available; a current one is attached):\n\n",
         );
         for x in &self.exchanges {
-            s.push_str(&format!("User: {}\n\nAssistant: {}\n\n", x.question.trim(), x.answer.trim()));
+            s.push_str(&format!(
+                "User: {}\n\nAssistant: {}\n\n",
+                x.question.trim(),
+                x.answer.trim()
+            ));
         }
         s.push_str("Now the user asks:\n\n");
         s
@@ -96,7 +100,10 @@ pub fn parse_md(md: &str) -> Chat {
     for line in md.lines() {
         if let Some(q) = line.strip_prefix("## ") {
             finish(&mut cur, &mut body, &mut chat);
-            cur = Some(SavedExchange { question: q.trim().to_string(), ..Default::default() });
+            cur = Some(SavedExchange {
+                question: q.trim().to_string(),
+                ..Default::default()
+            });
         } else if cur.is_some() {
             body.push(line);
         } else if let Some(t) = line.strip_prefix("# ") {
@@ -121,7 +128,10 @@ pub struct Entry {
 
 impl Entry {
     fn from_chat(dir: PathBuf, chat: &Chat) -> Self {
-        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut hay = String::new();
         for x in &chat.exchanges {
             hay.push_str(&x.question.to_lowercase());
@@ -131,7 +141,11 @@ impl Entry {
         }
         Self {
             when: local_label(&name).unwrap_or(name),
-            title: chat.exchanges.first().map(|x| one_line(&x.question)).unwrap_or_else(|| "(empty)".into()),
+            title: chat
+                .exchanges
+                .first()
+                .map(|x| one_line(&x.question))
+                .unwrap_or_else(|| "(empty)".into()),
             turns: chat.exchanges.len(),
             dir,
             hay,
@@ -140,16 +154,27 @@ impl Entry {
 
     /// True if every whitespace-separated term occurs somewhere.
     pub fn matches(&self, terms: &[String]) -> bool {
-        terms.iter().all(|t| self.hay.contains(t.as_str()) || self.title.to_lowercase().contains(t.as_str()))
+        terms.iter().all(|t| {
+            self.hay.contains(t.as_str()) || self.title.to_lowercase().contains(t.as_str())
+        })
     }
 
     /// A short excerpt around the first term found in the transcript.
     pub fn snippet(&self, terms: &[String]) -> Option<String> {
         let t = terms.first()?;
         let i = self.hay.find(t.as_str())?;
-        let start = self.hay[..i].char_indices().rev().nth(40).map(|(j, _)| j).unwrap_or(0);
+        let start = self.hay[..i]
+            .char_indices()
+            .rev()
+            .nth(40)
+            .map(|(j, _)| j)
+            .unwrap_or(0);
         let tail: String = self.hay[start..].chars().take(120).collect();
-        Some(format!("{}{}", if start > 0 { "…" } else { "" }, one_line(&tail)))
+        Some(format!(
+            "{}{}",
+            if start > 0 { "…" } else { "" },
+            one_line(&tail)
+        ))
     }
 }
 
@@ -159,13 +184,22 @@ pub fn terms(query: &str) -> Vec<String> {
 
 fn one_line(s: &str) -> String {
     let s: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if s.chars().count() > 110 { format!("{}…", s.chars().take(110).collect::<String>()) } else { s }
+    if s.chars().count() > 110 {
+        format!("{}…", s.chars().take(110).collect::<String>())
+    } else {
+        s
+    }
 }
 
 /// Chat folders, newest first.
 pub fn list_dirs(root: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(root)
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
         .unwrap_or_default();
     v.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
     v
@@ -190,11 +224,17 @@ fn local_label(stamp: &str) -> Option<String> {
     };
     let mut local = utc;
     unsafe {
-        let _ = windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime(None, &utc, &mut local);
+        let _ =
+            windows::Win32::System::Time::SystemTimeToTzSpecificLocalTime(None, &utc, &mut local);
     }
-    const M: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const M: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let mon = M.get((local.wMonth as usize).checked_sub(1)?)?;
-    Some(format!("{mon} {}, {} · {:02}:{:02}", local.wDay, local.wYear, local.wHour, local.wMinute))
+    Some(format!(
+        "{mon} {}, {} · {:02}:{:02}",
+        local.wDay, local.wYear, local.wHour, local.wMinute
+    ))
 }
 
 /// What the user picked in the browser.
@@ -225,7 +265,11 @@ impl Browser {
                 }
             }
         });
-        Self { entries: Vec::new(), rx: Some(rx), selected: 0 }
+        Self {
+            entries: Vec::new(),
+            rx: Some(rx),
+            selected: 0,
+        }
     }
 
     pub fn loading(&self) -> bool {
@@ -248,11 +292,21 @@ impl Browser {
     }
 
     fn visible(&self, terms: &[String]) -> Vec<usize> {
-        (0..self.entries.len()).filter(|&i| self.entries[i].matches(terms)).collect()
+        (0..self.entries.len())
+            .filter(|&i| self.entries[i].matches(terms))
+            .collect()
     }
 
     /// Draws the list; `up`/`down`/`enter` come from the palette's key handling.
-    pub fn show(&mut self, ui: &mut egui::Ui, query: &str, keys: (bool, bool, bool), accent: Color32, dim: Color32, dimmer: Color32) -> Option<Action> {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        query: &str,
+        keys: (bool, bool, bool),
+        accent: Color32,
+        dim: Color32,
+        dimmer: Color32,
+    ) -> Option<Action> {
         self.pump();
         let terms = terms(query);
         let vis = self.visible(&terms);
@@ -284,7 +338,11 @@ impl Browser {
             let e = &self.entries[i];
             let sel = row == self.selected;
             let frame = egui::Frame::new()
-                .fill(if sel { accent.gamma_multiply(0.22) } else { Color32::TRANSPARENT })
+                .fill(if sel {
+                    accent.gamma_multiply(0.22)
+                } else {
+                    Color32::TRANSPARENT
+                })
                 .corner_radius(7)
                 .inner_margin(egui::Margin::symmetric(10, 6));
             let r = frame
@@ -293,8 +351,16 @@ impl Browser {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&e.title).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let turns = if e.turns == 1 { "1 turn".to_string() } else { format!("{} turns", e.turns) };
-                            ui.label(RichText::new(format!("{} · {turns}", e.when)).color(dimmer).size(12.0));
+                            let turns = if e.turns == 1 {
+                                "1 turn".to_string()
+                            } else {
+                                format!("{} turns", e.turns)
+                            };
+                            ui.label(
+                                RichText::new(format!("{} · {turns}", e.when))
+                                    .color(dimmer)
+                                    .size(12.0),
+                            );
                         });
                     });
                     if let Some(s) = e.snippet(&terms) {
@@ -314,7 +380,8 @@ impl Browser {
             }
         }
         if self.loading() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
         action
     }
@@ -329,8 +396,17 @@ mod tests {
             created: "2026-11-01 10:00:00".into(),
             provider: "anthropic · m".into(),
             exchanges: vec![
-                SavedExchange { question: "What is this error?".into(), answer: "A null pointer.\n\n## not a heading in json".into(), ..Default::default() },
-                SavedExchange { question: "Fix it".into(), answer: "Check for None.".into(), error: Some("HTTP 500".into()), ..Default::default() },
+                SavedExchange {
+                    question: "What is this error?".into(),
+                    answer: "A null pointer.\n\n## not a heading in json".into(),
+                    ..Default::default()
+                },
+                SavedExchange {
+                    question: "Fix it".into(),
+                    answer: "Check for None.".into(),
+                    error: Some("HTTP 500".into()),
+                    ..Default::default()
+                },
             ],
         }
     }
@@ -350,7 +426,10 @@ mod tests {
         assert_eq!(old.exchanges[0].question, "What is this error?");
         assert_eq!(old.exchanges.last().unwrap().question, "Fix it");
         assert_eq!(old.exchanges.last().unwrap().answer, "Check for None.");
-        assert_eq!(old.exchanges.last().unwrap().error.as_deref(), Some("HTTP 500"));
+        assert_eq!(
+            old.exchanges.last().unwrap().error.as_deref(),
+            Some("HTTP 500")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

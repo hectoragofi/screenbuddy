@@ -35,11 +35,23 @@ pub struct Chip {
 impl Chip {
     pub fn selection(text: &str, app: &str) -> Self {
         let text = cap_chars(text.trim(), SELECTION_CAP);
-        let from = if app.is_empty() { String::new() } else { format!(" in “{app}”") };
+        let from = if app.is_empty() {
+            String::new()
+        } else {
+            format!(" in “{app}”")
+        };
         Self {
             label: "Selected text".into(),
-            hover: format!("{}{}", from.trim_start(), if from.is_empty() { "" } else { "\n" }).to_string() + &cap_chars(&text, 300),
-            prompt: format!("[Text the user has selected{from}]\n<selection>\n{text}\n</selection>"),
+            hover: format!(
+                "{}{}",
+                from.trim_start(),
+                if from.is_empty() { "" } else { "\n" }
+            )
+            .to_string()
+                + &cap_chars(&text, 300),
+            prompt: format!(
+                "[Text the user has selected{from}]\n<selection>\n{text}\n</selection>"
+            ),
             image: None,
         }
     }
@@ -79,13 +91,20 @@ fn human_size(n: u64) -> String {
 /// Builds a chip for a file: images as an image, text as text, anything
 /// else (and anything too big) as its path and metadata.
 pub fn file_chip(path: &Path) -> Chip {
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
     let meta = std::fs::metadata(path);
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let base = |note: &str| Chip {
         label: name.clone(),
         hover: format!("{}\n{}", path.display(), note),
-        prompt: format!("[Attached file: {} ({}). {note}]", path.display(), human_size(size)),
+        prompt: format!(
+            "[Attached file: {} ({}). {note}]",
+            path.display(),
+            human_size(size)
+        ),
         image: None,
     };
     let Ok(meta) = meta else {
@@ -93,7 +112,11 @@ pub fn file_chip(path: &Path) -> Chip {
     };
     if meta.is_dir() {
         let mut names: Vec<String> = std::fs::read_dir(path)
-            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
             .unwrap_or_default();
         names.sort();
         let more = names.len().saturating_sub(200);
@@ -103,7 +126,11 @@ pub fn file_chip(path: &Path) -> Chip {
             "[Attached folder: {}]\n<listing>\n{}{}\n</listing>",
             path.display(),
             names.join("\n"),
-            if more > 0 { format!("\n… and {more} more") } else { String::new() }
+            if more > 0 {
+                format!("\n… and {more} more")
+            } else {
+                String::new()
+            }
         );
         return c;
     }
@@ -117,11 +144,19 @@ pub fn file_chip(path: &Path) -> Chip {
                     return Chip {
                         label: name.clone(),
                         hover: format!("{}\nImage, {}x{} sent", path.display(), img.w, img.h),
-                        prompt: format!("[Attached image file: {} ({}), sent as the image after the screenshot]", path.display(), human_size(size)),
+                        prompt: format!(
+                            "[Attached image file: {} ({}), sent as the image after the screenshot]",
+                            path.display(),
+                            human_size(size)
+                        ),
                         image: Some(img),
                     };
                 }
-                Err(e) => return base(&format!("It looks like an image but could not be decoded ({e}).")),
+                Err(e) => {
+                    return base(&format!(
+                        "It looks like an image but could not be decoded ({e})."
+                    ));
+                }
             }
         }
     }
@@ -133,7 +168,11 @@ pub fn file_chip(path: &Path) -> Chip {
                 "[Attached file: {} ({}){}]\n<file>\n{text}\n</file>",
                 path.display(),
                 human_size(size),
-                if cut { format!(", only the first {} shown", human_size(TEXT_CAP as u64)) } else { String::new() }
+                if cut {
+                    format!(", only the first {} shown", human_size(TEXT_CAP as u64))
+                } else {
+                    String::new()
+                }
             ),
             image: None,
         },
@@ -151,28 +190,41 @@ pub fn file_chip(path: &Path) -> Chip {
 
 /// Decodes an image file and re-encodes it as a JPEG within the API's limits.
 fn load_image(path: &Path, fmt: image::ImageFormat) -> anyhow::Result<Image> {
-    let r = image::ImageReader::with_format(std::io::BufReader::new(std::fs::File::open(path)?), fmt);
+    let r =
+        image::ImageReader::with_format(std::io::BufReader::new(std::fs::File::open(path)?), fmt);
     let img = r.decode()?;
     let (w, h) = (img.width().max(1), img.height().max(1));
     let long = 1568.0 / w.max(h) as f64;
     let area = (1_150_000.0 / (w as f64 * h as f64)).sqrt();
     let s = long.min(area).min(1.0);
     let img = if s < 1.0 {
-        img.resize(((w as f64 * s) as u32).max(1), ((h as f64 * s) as u32).max(1), image::imageops::FilterType::Triangle)
+        img.resize(
+            ((w as f64 * s) as u32).max(1),
+            ((h as f64 * s) as u32).max(1),
+            image::imageops::FilterType::Triangle,
+        )
     } else {
         img
     };
     let rgb = img.to_rgb8();
     let mut jpeg = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 85).encode_image(&rgb)?;
-    Ok(Image { jpeg: Arc::new(jpeg), w: rgb.width(), h: rgb.height() })
+    Ok(Image {
+        jpeg: Arc::new(jpeg),
+        w: rgb.width(),
+        h: rgb.height(),
+    })
 }
 
 /// Reads a file as text if it looks like text. Returns (text, truncated).
 fn read_text(path: &Path) -> Option<(String, bool)> {
     use std::io::Read;
     let mut buf = Vec::new();
-    std::fs::File::open(path).ok()?.take(TEXT_CAP as u64 + 1).read_to_end(&mut buf).ok()?;
+    std::fs::File::open(path)
+        .ok()?
+        .take(TEXT_CAP as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
     let cut = buf.len() > TEXT_CAP;
     buf.truncate(TEXT_CAP);
     decode_text(&buf).map(|t| (t, cut))
@@ -181,7 +233,10 @@ fn read_text(path: &Path) -> Option<(String, bool)> {
 /// UTF-16 (with BOM) or UTF-8; None for binary data.
 pub fn decode_text(buf: &[u8]) -> Option<String> {
     if let Some(rest) = buf.strip_prefix(&[0xFF, 0xFE]) {
-        let u: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         return Some(String::from_utf16_lossy(&u));
     }
     let buf = buf.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(buf);
@@ -191,11 +246,18 @@ pub fn decode_text(buf: &[u8]) -> Option<String> {
     match std::str::from_utf8(buf) {
         Ok(s) => Some(s.to_string()),
         // Cut in the middle of a character at the size cap.
-        Err(e) if e.error_len().is_none() => Some(String::from_utf8_lossy(&buf[..e.valid_up_to()]).into_owned()),
+        Err(e) if e.error_len().is_none() => {
+            Some(String::from_utf8_lossy(&buf[..e.valid_up_to()]).into_owned())
+        }
         Err(_) => {
             // Legacy 8-bit text: accept if it is mostly printable.
-            let printable = buf.iter().take(8192).filter(|&&b| b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t').count();
-            (printable * 100 >= buf.len().min(8192) * 95).then(|| String::from_utf8_lossy(buf).into_owned())
+            let printable = buf
+                .iter()
+                .take(8192)
+                .filter(|&&b| b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t')
+                .count();
+            (printable * 100 >= buf.len().min(8192) * 95)
+                .then(|| String::from_utf8_lossy(buf).into_owned())
         }
     }
 }
@@ -227,7 +289,9 @@ fn set_menu_at(key: &str, on: bool, exe: &Path) -> std::io::Result<()> {
 }
 
 fn menu_registered_at(key: &str) -> bool {
-    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).open_subkey(key).is_ok()
+    winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(key)
+        .is_ok()
 }
 
 /// Makes the registry match the setting (and point at this exe) at startup.
@@ -247,10 +311,24 @@ pub fn send_file_to_running(path: &Path) -> bool {
     let cls = wide("screenbuddy_main");
     for _ in 0..40 {
         unsafe {
-            if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, PCWSTR(cls.as_ptr()), PCWSTR::null()) {
+            if let Ok(h) = FindWindowExW(
+                Some(HWND_MESSAGE),
+                None,
+                PCWSTR(cls.as_ptr()),
+                PCWSTR::null(),
+            ) {
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
-                let cds = COPYDATASTRUCT { dwData: COPYDATA_FILE, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
-                let r = SendMessageW(h, WM_COPYDATA, None, Some(LPARAM(&cds as *const _ as isize)));
+                let cds = COPYDATASTRUCT {
+                    dwData: COPYDATA_FILE,
+                    cbData: (text.len() * 2) as u32,
+                    lpData: text.as_ptr() as *mut _,
+                };
+                let r = SendMessageW(
+                    h,
+                    WM_COPYDATA,
+                    None,
+                    Some(LPARAM(&cds as *const _ as isize)),
+                );
                 return r.0 != 0;
             }
         }
@@ -265,10 +343,15 @@ pub fn send_file_to_running(path: &Path) -> bool {
 /// `lp` must be the LPARAM of a WM_COPYDATA message.
 pub unsafe fn path_from_copydata(lp: LPARAM) -> Option<PathBuf> {
     let cds = unsafe { (lp.0 as *const COPYDATASTRUCT).as_ref()? };
-    if cds.dwData != COPYDATA_FILE || cds.lpData.is_null() || cds.cbData == 0 || cds.cbData > 64 * 1024 {
+    if cds.dwData != COPYDATA_FILE
+        || cds.lpData.is_null()
+        || cds.cbData == 0
+        || cds.cbData > 64 * 1024
+    {
         return None;
     }
-    let s = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
+    let s =
+        unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
     let p = PathBuf::from(String::from_utf16_lossy(s));
     p.exists().then_some(p)
 }
@@ -295,7 +378,10 @@ pub fn selected_text(copy_fallback: bool) -> Option<(String, String)> {
         };
         let _ = tx.send(r);
     });
-    let text = rx.recv_timeout(std::time::Duration::from_millis(900)).ok().flatten()?;
+    let text = rx
+        .recv_timeout(std::time::Duration::from_millis(900))
+        .ok()
+        .flatten()?;
     let text = text.trim().to_string();
     (!text.is_empty()).then_some((text, title))
 }
@@ -326,13 +412,17 @@ fn uia_selection() -> UiaResult {
         let res = (|| -> windows::core::Result<UiaResult> {
             let uia: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;
             let el = uia.GetFocusedElement()?;
-            let Ok(tp) = el.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) else {
+            let Ok(tp) = el.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+            else {
                 return Ok(UiaResult::Unsupported);
             };
             let ranges = tp.GetSelection()?;
             let mut out = String::new();
             for i in 0..ranges.Length()? {
-                let t = ranges.GetElement(i)?.GetText(SELECTION_CAP as i32 + 1)?.to_string();
+                let t = ranges
+                    .GetElement(i)?
+                    .GetText(SELECTION_CAP as i32 + 1)?
+                    .to_string();
                 if !t.trim().is_empty() {
                     if !out.is_empty() {
                         out.push('\n');
@@ -340,7 +430,11 @@ fn uia_selection() -> UiaResult {
                     out.push_str(&t);
                 }
             }
-            Ok(if out.trim().is_empty() { UiaResult::NoSelection } else { UiaResult::Text(out) })
+            Ok(if out.trim().is_empty() {
+                UiaResult::NoSelection
+            } else {
+                UiaResult::Text(out)
+            })
         })();
         CoUninitialize();
         res.unwrap_or(UiaResult::Unsupported)
@@ -422,7 +516,9 @@ mod clipboard {
         unsafe {
             let _ = EmptyClipboard();
             for (f, bytes) in saved {
-                let Ok(g) = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) else { continue };
+                let Ok(g) = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) else {
+                    continue;
+                };
                 let p = GlobalLock(g);
                 if p.is_null() {
                     continue;
@@ -466,7 +562,15 @@ mod clipboard {
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
-                ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, ..Default::default() },
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    ..Default::default()
+                },
             },
         }
     }
@@ -509,12 +613,21 @@ mod tests {
 
     #[test]
     fn text_detection() {
-        assert_eq!(decode_text(b"hello\nworld").as_deref(), Some("hello\nworld"));
+        assert_eq!(
+            decode_text(b"hello\nworld").as_deref(),
+            Some("hello\nworld")
+        );
         assert_eq!(decode_text(b"\xEF\xBB\xBFbom").as_deref(), Some("bom"));
         assert!(decode_text(b"\x89PNG\r\n\x1a\n\0\0\0").is_none());
-        assert_eq!(decode_text(&[0xFF, 0xFE, b'h', 0, b'i', 0]).as_deref(), Some("hi"));
+        assert_eq!(
+            decode_text(&[0xFF, 0xFE, b'h', 0, b'i', 0]).as_deref(),
+            Some("hi")
+        );
         // Truncated in the middle of a multi-byte character.
-        assert_eq!(decode_text("héllo".as_bytes()[..2].as_ref()).as_deref(), Some("h"));
+        assert_eq!(
+            decode_text("héllo".as_bytes()[..2].as_ref()).as_deref(),
+            Some("h")
+        );
     }
 
     #[test]
@@ -528,7 +641,9 @@ mod tests {
         assert!(c.prompt.contains("the quick brown fox") && c.image.is_none());
 
         let png = dir.join("pic.png");
-        image::RgbImage::from_pixel(3000, 1000, image::Rgb([200, 10, 10])).save(&png).unwrap();
+        image::RgbImage::from_pixel(3000, 1000, image::Rgb([200, 10, 10]))
+            .save(&png)
+            .unwrap();
         let c = file_chip(&png);
         let img = c.image.expect("image chip");
         assert!(img.w <= 1568 && img.w * img.h <= 1_150_000 && img.jpeg.starts_with(&[0xFF, 0xD8]));
@@ -568,6 +683,7 @@ mod tests {
         set_menu_at(key, false, exe).unwrap();
         assert!(!menu_registered_at(key));
         set_menu_at(key, false, exe).unwrap(); // removing twice is fine
-        let _ = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER).delete_subkey_all(r"Software\screenbuddy-test");
+        let _ = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+            .delete_subkey_all(r"Software\screenbuddy-test");
     }
 }

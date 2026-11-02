@@ -3,10 +3,10 @@
 
 use crate::capture::{self, Capture};
 use crate::config::{self, Config};
-use crate::{context, history, voice};
 use crate::llm::{self, Conversation, Ev};
 use crate::overlay::{self, Overlay};
 use crate::win::{self, AppEvent};
+use crate::{context, history, voice};
 use egui::{Color32, FontFamily, FontId, Key, Margin, RichText, TextStyle};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::Arc;
@@ -144,6 +144,8 @@ pub struct Palette {
     voice_pending: bool,
     /// egui time (s) at which to hand cold pages back to the OS; see `trim_when_idle`.
     trim_at: f64,
+    /// The user dragged the palette; its spot is saved on close.
+    moved: bool,
 }
 
 /// Opens the palette and blocks until it closes.
@@ -290,6 +292,8 @@ fn status_text(s: &str) -> &'static str {
         "zooming…" => "Looking closer",
         "looking…" => "Looking",
         "watching…" => "Watching for your next step · Esc stops",
+        "searching the web…" => "Searching the web",
+        "reading results…" => "Reading results",
         _ => "Thinking",
     }
 }
@@ -346,6 +350,7 @@ impl Palette {
             voice_dl: None,
             voice_pending: start.voice,
             trim_at: TRIM_AFTER_OPEN,
+            moved: false,
         }
     }
 
@@ -423,7 +428,9 @@ impl Palette {
         if self.busy() || self.exchanges.last().is_none_or(|x| x.error.is_none()) {
             return;
         }
-        let Some(x) = self.exchanges.pop() else { return };
+        let Some(x) = self.exchanges.pop() else {
+            return;
+        };
         let typed = std::mem::replace(&mut self.input, x.question);
         self.send(ctx);
         self.input = typed;
@@ -623,7 +630,10 @@ impl Palette {
             let _ = std::fs::write(&shot, &*self.jpeg);
         }
         let chat = history::Chat {
-            created: self.created.get_or_insert_with(crate::util::timestamp).clone(),
+            created: self
+                .created
+                .get_or_insert_with(crate::util::timestamp)
+                .clone(),
             provider: self.cfg.provider_label(),
             exchanges: self
                 .exchanges
@@ -698,7 +708,9 @@ impl Palette {
             return;
         }
         if !voice::engine_included() {
-            self.notice = Some("Voice input isn't available in this build (speech engine not included).".into());
+            self.notice = Some(
+                "Voice input isn't available in this build (speech engine not included).".into(),
+            );
             return;
         }
         if !voice::model_ready() {
@@ -756,7 +768,10 @@ impl Palette {
                     }
                 }
             } else {
-                self.notice = Some(format!("Downloading the voice model (17 MB, once)… {:.0}%", d.progress * 100.0));
+                self.notice = Some(format!(
+                    "Downloading the voice model (17 MB, once)… {:.0}%",
+                    d.progress * 100.0
+                ));
             }
         }
         if let Some(rx) = &self.transcribing {
@@ -818,11 +833,30 @@ impl Palette {
                     let max_h = (MAX_H * s) as i32;
                     let (cx, cy) = self.cap.cursor;
                     let x = (cx - w / 2).clamp(work.x, (work.x + work.w - w).max(work.x));
-                    let y = if cy + gap + max_h <= work.y + work.h { cy + gap } else { (cy - gap - max_h).max(work.y) };
+                    let y = if cy + gap + max_h <= work.y + work.h {
+                        cy + gap
+                    } else {
+                        (cy - gap - max_h).max(work.y)
+                    };
                     (x, y)
                 }
-                "center" => (work.x + (work.w - w) / 2, work.y + (work.h - (MAX_H * s) as i32).max(0) / 2),
-                _ => (work.x + (work.w - w) / 2, work.y + (work.h as f32 * 0.2) as i32),
+                "center" => (
+                    work.x + (work.w - w) / 2,
+                    work.y + (work.h - (MAX_H * s) as i32).max(0) / 2,
+                ),
+                "last" if self.cfg.appearance.saved_pos.is_some_and(on_screen) => {
+                    let [x, y] = self.cfg.appearance.saved_pos.unwrap();
+                    let wa = capture::monitor_at(x, y).work;
+                    let h = (BAR_H * s) as i32;
+                    (
+                        x.clamp(wa.x, (wa.x + wa.w - w).max(wa.x)),
+                        y.clamp(wa.y, (wa.y + wa.h - h).max(wa.y)),
+                    )
+                }
+                _ => (
+                    work.x + (work.w - w) / 2,
+                    work.y + (work.h as f32 * 0.2) as i32,
+                ),
             };
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE);
             let _ = SetForegroundWindow(hwnd);
@@ -834,10 +868,63 @@ impl Palette {
         self.cancel.store(true, Ordering::Relaxed);
         self.rec = None; // discards the recording
         self.save_history();
+        self.save_position();
         if self.quit {
             *self.outcome.lock().unwrap() = Outcome::Quit;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// After a drag, remembers the spot and opens there from now on.
+    fn save_position(&mut self) {
+        let (true, Some(h)) = (self.moved, self.hwnd) else {
+            return;
+        };
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(h, &mut r) }.is_err() {
+            return;
+        }
+        // Re-read so a Settings window saved meanwhile is not clobbered.
+        let (mut cfg, err) = config::load();
+        if err.is_some() {
+            return;
+        }
+        cfg.appearance.position = "last".into();
+        cfg.appearance.saved_pos = Some([r.left, r.top]);
+        if let Err(e) = config::save(&cfg) {
+            config::log(&format!("saving palette position failed: {e}"));
+        }
+    }
+
+    /// Keeps the bottom edge on screen as the card grows (e.g. after it was
+    /// dragged near the bottom of the monitor).
+    fn keep_on_screen(&self, ctx: &egui::Context, height: f32) {
+        let Some(h) = self.hwnd else {
+            return;
+        };
+        unsafe {
+            let mut r = RECT::default();
+            if GetWindowRect(h, &mut r).is_err() {
+                return;
+            }
+            let wa = capture::monitor_at((r.left + r.right) / 2, r.top).work;
+            let px = (height * ctx.pixels_per_point()).round() as i32;
+            let bottom = wa.y + wa.h;
+            if r.top + px > bottom {
+                let y = (bottom - px).max(wa.y);
+                if y != r.top {
+                    let _ = SetWindowPos(
+                        h,
+                        Some(HWND_TOPMOST),
+                        r.left,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
     }
 
     fn handle_app_events(&mut self, ctx: &egui::Context) {
@@ -903,9 +990,37 @@ impl Palette {
         }
     }
 
+    fn start_drag(&mut self, ctx: &egui::Context) {
+        self.moved = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    /// Six-dot handle at the left of the bar: grab it to move the palette.
+    fn grip(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 28.0), egui::Sense::drag());
+        let resp = resp
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text("Drag to move");
+        let col = if resp.hovered() || resp.dragged() {
+            TEXT_2
+        } else {
+            TEXT_3
+        };
+        let c = rect.center();
+        for dx in [-2.5, 2.5] {
+            for dy in [-5.0, 0.0, 5.0] {
+                ui.painter().circle_filled(c + egui::vec2(dx, dy), 1.3, col);
+            }
+        }
+        if resp.drag_started() {
+            self.start_drag(ui.ctx());
+        }
+    }
+
     fn bar(&mut self, ui: &mut egui::Ui, enter: bool) {
         ui.horizontal(|ui| {
             ui.set_height(BAR_H - 2.0 * 10.0);
+            self.grip(ui);
             // Screenshot chip: what the question is about. Click to retake.
             if let Some(t) = &self.thumb {
                 let size = t.size_vec2();
@@ -994,19 +1109,37 @@ impl Palette {
                 egui::Frame::new()
                     .fill(Color32::from_white_alpha(14))
                     .corner_radius(6)
-                    .inner_margin(Margin { left: 8, right: 4, top: 2, bottom: 2 })
+                    .inner_margin(Margin {
+                        left: 8,
+                        right: 4,
+                        top: 2,
+                        bottom: 2,
+                    })
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
-                        let mark = if c.image.is_some() { "▣" } else if c.label == "Selected text" { "❝" } else { "▤" };
+                        let mark = if c.image.is_some() {
+                            "▣"
+                        } else if c.label == "Selected text" {
+                            "❝"
+                        } else {
+                            "▤"
+                        };
                         let label: String = if c.label.chars().count() > 28 {
                             format!("{}…", c.label.chars().take(27).collect::<String>())
                         } else {
                             c.label.clone()
                         };
-                        ui.label(RichText::new(format!("{mark} {label}")).size(12.5).color(TEXT_2))
-                            .on_hover_text(&c.hover);
+                        ui.label(
+                            RichText::new(format!("{mark} {label}"))
+                                .size(12.5)
+                                .color(TEXT_2),
+                        )
+                        .on_hover_text(&c.hover);
                         if ui
-                            .add(egui::Button::new(RichText::new("✕").size(11.0).color(TEXT_3)).frame(false))
+                            .add(
+                                egui::Button::new(RichText::new("✕").size(11.0).color(TEXT_3))
+                                    .frame(false),
+                            )
                             .on_hover_text("Remove")
                             .clicked()
                         {
@@ -1029,7 +1162,9 @@ impl Palette {
         let accent = self.accent;
         let query = self.input.clone();
         let max_h = MAX_H - self.top_h() - 24.0;
-        let Some(b) = self.browser.as_mut() else { return };
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .max_height(max_h)
@@ -1082,9 +1217,15 @@ impl Palette {
                         // Soft pulsing status instead of a spinner.
                         let a = 0.45 + 0.35 * ((time * 3.2).sin() as f32 * 0.5 + 0.5);
                         let (color, text) = if watching {
-                            (accent.gamma_multiply(a + 0.2), format!("◉ {}", status_text(&self.status)))
+                            (
+                                accent.gamma_multiply(a + 0.2),
+                                format!("◉ {}", status_text(&self.status)),
+                            )
                         } else {
-                            (TEXT_2.gamma_multiply(a), status_text(&self.status).to_string())
+                            (
+                                TEXT_2.gamma_multiply(a),
+                                status_text(&self.status).to_string(),
+                            )
                         };
                         ui.label(RichText::new(text).color(color));
                     }
@@ -1127,13 +1268,21 @@ impl Palette {
                             ui.horizontal(|ui| {
                                 if ui
                                     .link(RichText::new("Always allow").size(13.0))
-                                    .on_hover_text("Never ask again. Change this in Settings → Agent.")
+                                    .on_hover_text(
+                                        "Never ask again. Change this in Settings → Agent.",
+                                    )
                                     .clicked()
                                 {
                                     decision = Some((true, true));
                                 }
                                 if once {
-                                    ui.label(RichText::new("Allowing covers the rest of this conversation").color(TEXT_3).size(12.0));
+                                    ui.label(
+                                        RichText::new(
+                                            "Allowing covers the rest of this conversation",
+                                        )
+                                        .color(TEXT_3)
+                                        .size(12.0),
+                                    );
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -1219,6 +1368,9 @@ impl Palette {
             if diff.abs() < 2.0 {
                 self.height = target;
             }
+            if diff > 0.0 {
+                self.keep_on_screen(ctx, self.height.round());
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                 self.width,
                 self.height.round(),
@@ -1296,6 +1448,11 @@ impl eframe::App for Palette {
         let full = ui.max_rect();
         let fill = TINT_SOLID;
         ui.painter().rect_filled(full, 8, fill);
+        // Drag any empty part of the card to move it; widgets on top win.
+        let bg = ui.interact(full, ui.scope_id().with("drag-bg"), egui::Sense::drag());
+        if bg.drag_started() {
+            self.start_drag(&ctx);
+        }
 
         egui::Frame::new()
             .inner_margin(Margin {
@@ -1327,7 +1484,11 @@ impl eframe::App for Palette {
         self.trim_when_idle(&ctx);
         if self.busy() {
             // Guide mode can wait for minutes: pulse slowly instead of at 30 fps.
-            let ms = if self.status == "watching…" { 250 } else { 33 };
+            let ms = if self.status == "watching…" {
+                250
+            } else {
+                33
+            };
             ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
     }
@@ -1337,6 +1498,13 @@ impl Drop for Palette {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// True when the point lies on some monitor (a saved spot can outlive a
+/// disconnected display).
+fn on_screen([x, y]: [i32; 2]) -> bool {
+    let r = capture::monitor_at(x, y).rect;
+    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
 fn lowercase_first(s: &str) -> String {
@@ -1361,7 +1529,13 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> 
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
     let c = rect.center();
     let p = ui.painter();
-    let fg = if active { Color32::WHITE } else if resp.hovered() { TEXT_2 } else { TEXT_3 };
+    let fg = if active {
+        Color32::WHITE
+    } else if resp.hovered() {
+        TEXT_2
+    } else {
+        TEXT_3
+    };
     if active {
         let bg = match icon {
             Icon::Mic(_) => Color32::from_rgb(220, 60, 60),
@@ -1380,9 +1554,14 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> 
         }
         Icon::Mic(level) => {
             if let Some(l) = level {
-                p.circle_stroke(c, 12.0 + 3.0 * l, egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60).gamma_multiply(0.6)));
+                p.circle_stroke(
+                    c,
+                    12.0 + 3.0 * l,
+                    egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60).gamma_multiply(0.6)),
+                );
             }
-            let body = egui::Rect::from_center_size(c + egui::vec2(0.0, -2.5), egui::vec2(6.0, 10.0));
+            let body =
+                egui::Rect::from_center_size(c + egui::vec2(0.0, -2.5), egui::vec2(6.0, 10.0));
             p.rect_stroke(body, 3, st, egui::StrokeKind::Middle);
             let arc: Vec<egui::Pos2> = (0..=12)
                 .map(|i| {

@@ -63,7 +63,9 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
             let (text, is_error) = match p["name"].as_str() {
                 Some("draw") => validate(&p["arguments"]),
                 Some("desktop") => desktop(&p["arguments"]),
-                Some(n) if crate::vision::is_tool(n) => return Ok(crate::vision::mcp_call(n, &p["arguments"])),
+                Some(n) if crate::vision::is_tool(n) => {
+                    return Ok(crate::vision::mcp_call(n, &p["arguments"]));
+                }
                 _ => return Err((-32602, format!("unknown tool {}", p["name"]))),
             };
             Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
@@ -93,8 +95,14 @@ fn desktop(input: &Value) -> (String, bool) {
         );
     }
     let cfg = crate::config::load().0;
-    let session = std::env::var("SCREENBUDDY_DESKTOP_SESSION").unwrap_or_else(|_| crate::desktop::new_session_id());
-    let out = crate::desktop::exec(&exe, &args, &intent, &crate::desktop::Ctx::from_config(&cfg, session));
+    let session = std::env::var("SCREENBUDDY_DESKTOP_SESSION")
+        .unwrap_or_else(|_| crate::desktop::new_session_id());
+    let out = crate::desktop::exec(
+        &exe,
+        &args,
+        &intent,
+        &crate::desktop::Ctx::from_config(&cfg, session),
+    );
     let ok = serde_json::from_str::<Value>(&out)
         .ok()
         .and_then(|v| v["ok"].as_bool())
@@ -127,9 +135,13 @@ fn validate(args: &Value) -> (String, bool) {
         return ("error: `shapes` must be an array".into(), true);
     };
     for (i, s) in shapes.iter().enumerate() {
-        let placed = s["element"].is_string() || (s["x"].as_f64().is_some() && s["y"].as_f64().is_some());
+        let placed =
+            s["element"].is_string() || (s["x"].as_f64().is_some() && s["y"].as_f64().is_some());
         if s["kind"].as_str().is_none() || !placed {
-            return (format!("error: shape {i} needs kind and x, y (or element)"), true);
+            return (
+                format!("error: shape {i} needs kind and x, y (or element)"),
+                true,
+            );
         }
     }
     (
