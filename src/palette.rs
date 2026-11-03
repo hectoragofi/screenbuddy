@@ -116,6 +116,7 @@ pub struct Palette {
     was_focused: bool,
     md: egui_commonmark::CommonMarkCache,
     math: std::rc::Rc<std::cell::RefCell<crate::math::MathCache>>,
+    diagrams: crate::diagram::DiagramCache,
     notice: Option<String>,
     quit: bool,
     outcome: Arc<std::sync::Mutex<Outcome>>,
@@ -339,6 +340,7 @@ impl Palette {
             was_focused: false,
             md: Default::default(),
             math: Default::default(),
+            diagrams: Default::default(),
             notice,
             quit: false,
             outcome,
@@ -476,6 +478,7 @@ impl Palette {
                 self.overlay = None;
                 self.exchanges.clear();
                 self.math.borrow_mut().clear();
+                self.diagrams.clear();
                 self.history_dir = None;
                 self.resume = None;
                 self.created = None;
@@ -696,6 +699,7 @@ impl Palette {
         });
         self.overlay = None;
         self.math.borrow_mut().clear();
+        self.diagrams.clear();
         self.browser = None;
         self.input = std::mem::take(&mut self.draft);
         self.notice = None;
@@ -1319,6 +1323,7 @@ impl Palette {
         let mut open_settings = false;
         let mut retry = false;
         let mut decision: Option<(bool, bool)> = None;
+        let mut pin: Option<String> = None;
         let accent = self.accent;
         let once = self.cfg.agent_desktop.approval == "once";
         let out = egui::ScrollArea::vertical()
@@ -1339,9 +1344,21 @@ impl Palette {
                         let render = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
                             crate::math::show(ui, &math, tex, inline)
                         };
-                        egui_commonmark::CommonMarkViewer::new()
-                            .render_math_fn(Some(&render))
-                            .show(ui, &mut self.md, &crate::math::normalize(&x.answer));
+                        let theme = crate::diagram::Theme { bg: TINT_SOLID, fg: TEXT, muted: TEXT_2, accent };
+                        for seg in crate::diagram::split(&x.answer) {
+                            match seg {
+                                crate::diagram::Seg::Md(md) => {
+                                    egui_commonmark::CommonMarkViewer::new()
+                                        .render_math_fn(Some(&render))
+                                        .show(ui, &mut self.md, &crate::math::normalize(md));
+                                }
+                                crate::diagram::Seg::Mermaid(src) => {
+                                    if crate::diagram::show(ui, &mut self.diagrams, &mut self.md, src, theme) {
+                                        pin = Some(src.to_string());
+                                    }
+                                }
+                            }
+                        }
                     }
                     let watching = self.status == "watching…";
                     if last && busy && (x.answer.is_empty() || watching) && self.pending.is_none() {
@@ -1439,6 +1456,14 @@ impl Palette {
         }
         if retry {
             self.retry(ui.ctx());
+        }
+        if let Some(src) = pin {
+            // Top-right of the captured area; the overlay clamps the card on screen.
+            let (w, h) = (self.cap.img_w as f32, self.cap.img_h as f32);
+            let shape = serde_json::json!({"kind": "diagram", "mermaid": src, "x": w, "y": h * 0.06});
+            if let Err(e) = self.draw(serde_json::json!({"shapes": [shape]})) {
+                self.notice = Some(format!("Couldn't show the diagram on screen ({e})."));
+            }
         }
     }
 
