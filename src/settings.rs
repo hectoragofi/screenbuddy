@@ -51,6 +51,8 @@ const PAGES: &[(Page, &str, &str)] = &[
 struct Job {
     running: bool,
     text: String,
+    /// Installed agent-desktop is older than desktop::MIN_VERSION.
+    outdated: bool,
 }
 
 struct Settings {
@@ -550,6 +552,11 @@ impl Settings {
                 if job.running {
                     ui.spinner();
                     ui.label(RichText::new(&job.text).color(TEXT_2));
+                } else if installed && job.outdated {
+                    ui.label(RichText::new(&job.text).color(TEXT_2));
+                    if ui.add(primary("Update", accent)).clicked() {
+                        install_agent(self.agent.clone());
+                    }
                 } else if installed {
                     ui.label(RichText::new(format!("✓ {}", if job.text.is_empty() { "Installed" } else { &job.text })).color(Color32::from_rgb(48, 209, 88)));
                 } else if ui.add(primary("Install", accent)).clicked() {
@@ -890,19 +897,21 @@ fn probe_agent(cfg: &Config, job: Arc<Mutex<Job>>) {
     let Some(exe) = crate::desktop::resolve(&cfg.agent_desktop.command) else { return };
     std::thread::spawn(move || {
         let out = crate::desktop::run(&exe, &["version".to_string()]);
-        let v = serde_json::from_str::<serde_json::Value>(&out).ok().and_then(|v| v["data"]["version"].as_str().map(|s| format!("Installed · v{s}")));
+        let v = serde_json::from_str::<serde_json::Value>(&out).ok().and_then(|v| v["data"]["version"].as_str().map(str::to_owned));
         if let Some(v) = v {
-            job.lock().unwrap().text = v;
+            let mut j = job.lock().unwrap();
+            j.outdated = crate::desktop::outdated(&v);
+            j.text = if j.outdated { format!("v{v} · update to v{}+", crate::desktop::MIN_VERSION) } else { format!("Installed · v{v}") };
         }
     });
 }
 
 fn install_agent(job: Arc<Mutex<Job>>) {
     use std::os::windows::process::CommandExt;
-    *job.lock().unwrap() = Job { running: true, text: "Installing…".into() };
+    *job.lock().unwrap() = Job { running: true, text: "Installing…".into(), outdated: false };
     std::thread::spawn(move || {
         let res = std::process::Command::new("cmd")
-            .args(["/C", "npm", "install", "-g", "agent-desktop"])
+            .args(["/C", "npm", "install", "-g", "agent-desktop@latest"])
             .creation_flags(0x0800_0000)
             .output();
         let text = match res {
@@ -910,6 +919,6 @@ fn install_agent(job: Arc<Mutex<Job>>) {
             Ok(o) => format!("Install failed: {}", String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("npm error")),
             Err(_) => "Install needs Node.js (npm). Get it from nodejs.org, then try again.".to_string(),
         };
-        *job.lock().unwrap() = Job { running: false, text };
+        *job.lock().unwrap() = Job { running: false, text, outdated: false };
     });
 }

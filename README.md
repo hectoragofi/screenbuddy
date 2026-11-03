@@ -51,7 +51,7 @@ All three are in Settings → Drawing → Seeing your screen (`[vision]` `ui_tre
 
 ## Doing things for you (agent-desktop)
 
-If [agent-desktop](https://github.com/vercel-labs/agent-desktop) is installed, just ask screenbuddy to do something: "open Notepad and type hi", "turn on dark mode", "reply 'on my way' in Slack". There's an **Install** button in Settings → Agent (it runs `npm install -g agent-desktop`). It works through the accessibility tree, not pixels. Reading apps (`snapshot`, `list-apps`, …) never asks.
+If [agent-desktop](https://github.com/vercel-labs/agent-desktop) is installed, just ask screenbuddy to do something: "open Notepad and type hi", "turn on dark mode", "reply 'on my way' in Slack". There's an **Install** button in Settings → Agent (it runs `npm install -g agent-desktop@latest`; needs v1.1.0+, older installs get an **Update** button). It works through the accessibility tree, not pixels. Reading apps (`snapshot`, `list-apps`, …) never asks.
 
 Permission for actions (Settings → Agent):
 
