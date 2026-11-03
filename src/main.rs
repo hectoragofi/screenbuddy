@@ -8,6 +8,7 @@ mod history;
 mod llm;
 mod math;
 mod mcp;
+mod mention;
 mod overlay;
 mod palette;
 mod settings;

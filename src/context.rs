@@ -59,7 +59,7 @@ pub fn compose(chips: &[Chip], question: &str) -> String {
     s
 }
 
-fn cap_chars(s: &str, n: usize) -> String {
+pub(crate) fn cap_chars(s: &str, n: usize) -> String {
     match s.char_indices().nth(n) {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s.to_string(),
@@ -152,7 +152,11 @@ pub fn file_chip(path: &Path) -> Chip {
 /// Decodes an image file and re-encodes it as a JPEG within the API's limits.
 fn load_image(path: &Path, fmt: image::ImageFormat) -> anyhow::Result<Image> {
     let r = image::ImageReader::with_format(std::io::BufReader::new(std::fs::File::open(path)?), fmt);
-    let img = r.decode()?;
+    encode_image(r.decode()?)
+}
+
+/// Re-encodes an image as a JPEG within the API's size limits.
+pub fn encode_image(img: image::DynamicImage) -> anyhow::Result<Image> {
     let (w, h) = (img.width().max(1), img.height().max(1));
     let long = 1568.0 / w.max(h) as f64;
     let area = (1_150_000.0 / (w as f64 * h as f64)).sqrt();
@@ -347,7 +351,7 @@ fn uia_selection() -> UiaResult {
     }
 }
 
-mod clipboard {
+pub(crate) mod clipboard {
     //! Ctrl+C fallback that puts the user's clipboard back afterwards.
     use windows::Win32::Foundation::*;
     use windows::Win32::System::DataExchange::*;
@@ -444,7 +448,42 @@ mod clipboard {
         }
     }
 
-    fn read_text() -> Option<String> {
+    /// Clipboard image as a BMP file (CF_DIB plus a file header).
+    pub fn read_bmp() -> Option<Vec<u8>> {
+        const CF_DIB: u32 = 8;
+        let _o = Open::new()?;
+        unsafe {
+            let h = GetClipboardData(CF_DIB).ok()?;
+            let g = HGLOBAL(h.0);
+            let p = GlobalLock(g) as *const u8;
+            if p.is_null() {
+                return None;
+            }
+            let dib = std::slice::from_raw_parts(p, GlobalSize(g)).to_vec();
+            let _ = GlobalUnlock(g);
+            if dib.len() < 40 {
+                return None;
+            }
+            // Pixel data starts after the header and the color table.
+            let rd = |o: usize| u32::from_le_bytes([dib[o], dib[o + 1], dib[o + 2], dib[o + 3]]);
+            let hdr = rd(0);
+            let bits = u16::from_le_bytes([dib[14], dib[15]]) as u32;
+            let compression = rd(16);
+            let used = rd(32);
+            let colors = if used != 0 { used } else if bits <= 8 { 1 << bits } else { 0 };
+            let masks = if hdr == 40 && compression == 3 { 12 } else { 0 };
+            let off = 14 + hdr + masks + colors * 4;
+            let mut bmp = Vec::with_capacity(dib.len() + 14);
+            bmp.extend_from_slice(b"BM");
+            bmp.extend_from_slice(&((dib.len() + 14) as u32).to_le_bytes());
+            bmp.extend_from_slice(&[0; 4]);
+            bmp.extend_from_slice(&off.to_le_bytes());
+            bmp.extend_from_slice(&dib);
+            Some(bmp)
+        }
+    }
+
+    pub fn read_text() -> Option<String> {
         let _o = Open::new()?;
         unsafe {
             let h = GetClipboardData(CF_UNICODETEXT).ok()?;
