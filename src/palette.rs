@@ -144,6 +144,8 @@ pub struct Palette {
     voice_pending: bool,
     /// egui time (s) at which to hand cold pages back to the OS; see `trim_when_idle`.
     trim_at: f64,
+    /// The user dragged the palette; its spot is saved on close.
+    moved: bool,
 }
 
 /// Opens the palette and blocks until it closes.
@@ -290,6 +292,8 @@ fn status_text(s: &str) -> &'static str {
         "zooming…" => "Looking closer",
         "looking…" => "Looking",
         "watching…" => "Watching for your next step · Esc stops",
+        "searching the web…" => "Searching the web",
+        "reading results…" => "Reading results",
         _ => "Thinking",
     }
 }
@@ -346,6 +350,7 @@ impl Palette {
             voice_dl: None,
             voice_pending: start.voice,
             trim_at: TRIM_AFTER_OPEN,
+            moved: false,
         }
     }
 
@@ -821,8 +826,23 @@ impl Palette {
                     let y = if cy + gap + max_h <= work.y + work.h { cy + gap } else { (cy - gap - max_h).max(work.y) };
                     (x, y)
                 }
-                "center" => (work.x + (work.w - w) / 2, work.y + (work.h - (MAX_H * s) as i32).max(0) / 2),
-                _ => (work.x + (work.w - w) / 2, work.y + (work.h as f32 * 0.2) as i32),
+                "center" => (
+                    work.x + (work.w - w) / 2,
+                    work.y + (work.h - (MAX_H * s) as i32).max(0) / 2,
+                ),
+                "last" if self.cfg.appearance.saved_pos.is_some_and(on_screen) => {
+                    let [x, y] = self.cfg.appearance.saved_pos.unwrap();
+                    let wa = capture::monitor_at(x, y).work;
+                    let h = (BAR_H * s) as i32;
+                    (
+                        x.clamp(wa.x, (wa.x + wa.w - w).max(wa.x)),
+                        y.clamp(wa.y, (wa.y + wa.h - h).max(wa.y)),
+                    )
+                }
+                _ => (
+                    work.x + (work.w - w) / 2,
+                    work.y + (work.h as f32 * 0.2) as i32,
+                ),
             };
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE);
             let _ = SetForegroundWindow(hwnd);
@@ -834,10 +854,63 @@ impl Palette {
         self.cancel.store(true, Ordering::Relaxed);
         self.rec = None; // discards the recording
         self.save_history();
+        self.save_position();
         if self.quit {
             *self.outcome.lock().unwrap() = Outcome::Quit;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// After a drag, remembers the spot and opens there from now on.
+    fn save_position(&mut self) {
+        let (true, Some(h)) = (self.moved, self.hwnd) else {
+            return;
+        };
+        let mut r = RECT::default();
+        if unsafe { GetWindowRect(h, &mut r) }.is_err() {
+            return;
+        }
+        // Re-read so a Settings window saved meanwhile is not clobbered.
+        let (mut cfg, err) = config::load();
+        if err.is_some() {
+            return;
+        }
+        cfg.appearance.position = "last".into();
+        cfg.appearance.saved_pos = Some([r.left, r.top]);
+        if let Err(e) = config::save(&cfg) {
+            config::log(&format!("saving palette position failed: {e}"));
+        }
+    }
+
+    /// Keeps the bottom edge on screen as the card grows (e.g. after it was
+    /// dragged near the bottom of the monitor).
+    fn keep_on_screen(&self, ctx: &egui::Context, height: f32) {
+        let Some(h) = self.hwnd else {
+            return;
+        };
+        unsafe {
+            let mut r = RECT::default();
+            if GetWindowRect(h, &mut r).is_err() {
+                return;
+            }
+            let wa = capture::monitor_at((r.left + r.right) / 2, r.top).work;
+            let px = (height * ctx.pixels_per_point()).round() as i32;
+            let bottom = wa.y + wa.h;
+            if r.top + px > bottom {
+                let y = (bottom - px).max(wa.y);
+                if y != r.top {
+                    let _ = SetWindowPos(
+                        h,
+                        Some(HWND_TOPMOST),
+                        r.left,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
     }
 
     fn handle_app_events(&mut self, ctx: &egui::Context) {
@@ -903,9 +976,37 @@ impl Palette {
         }
     }
 
+    fn start_drag(&mut self, ctx: &egui::Context) {
+        self.moved = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    /// Six-dot handle at the left of the bar: grab it to move the palette.
+    fn grip(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 28.0), egui::Sense::drag());
+        let resp = resp
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text("Drag to move");
+        let col = if resp.hovered() || resp.dragged() {
+            TEXT_2
+        } else {
+            TEXT_3
+        };
+        let c = rect.center();
+        for dx in [-2.5, 2.5] {
+            for dy in [-5.0, 0.0, 5.0] {
+                ui.painter().circle_filled(c + egui::vec2(dx, dy), 1.3, col);
+            }
+        }
+        if resp.drag_started() {
+            self.start_drag(ui.ctx());
+        }
+    }
+
     fn bar(&mut self, ui: &mut egui::Ui, enter: bool) {
         ui.horizontal(|ui| {
             ui.set_height(BAR_H - 2.0 * 10.0);
+            self.grip(ui);
             // Screenshot chip: what the question is about. Click to retake.
             if let Some(t) = &self.thumb {
                 let size = t.size_vec2();
@@ -1219,6 +1320,9 @@ impl Palette {
             if diff.abs() < 2.0 {
                 self.height = target;
             }
+            if diff > 0.0 {
+                self.keep_on_screen(ctx, self.height.round());
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
                 self.width,
                 self.height.round(),
@@ -1296,6 +1400,11 @@ impl eframe::App for Palette {
         let full = ui.max_rect();
         let fill = TINT_SOLID;
         ui.painter().rect_filled(full, 8, fill);
+        // Drag any empty part of the card to move it; widgets on top win.
+        let bg = ui.interact(full, ui.scope_id().with("drag-bg"), egui::Sense::drag());
+        if bg.drag_started() {
+            self.start_drag(&ctx);
+        }
 
         egui::Frame::new()
             .inner_margin(Margin {
@@ -1337,6 +1446,13 @@ impl Drop for Palette {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// True when the point lies on some monitor (a saved spot can outlive a
+/// disconnected display).
+fn on_screen([x, y]: [i32; 2]) -> bool {
+    let r = capture::monitor_at(x, y).rect;
+    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
 fn lowercase_first(s: &str) -> String {

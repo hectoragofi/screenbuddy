@@ -69,8 +69,10 @@ pub struct AppearanceCfg {
     pub width: f32,
     /// Answer text size in points.
     pub text_size: f32,
-    /// "top" | "center" | "cursor"
+    /// "top" | "center" | "cursor" | "last" (where you last dragged it)
     pub position: String,
+    /// Top-left of the palette in screen pixels, saved when you drag it.
+    pub saved_pos: Option<[i32; 2]>,
     /// Close the palette when you click elsewhere (kept open while drawings show).
     pub dismiss_on_blur: bool,
 }
@@ -93,11 +95,18 @@ pub struct VisionCfg {
     pub zoom: bool,
     /// Step-by-step guide mode: wait for you to act, then look again.
     pub guide: bool,
+    /// Let the assistant search the web (Anthropic API and Claude CLI).
+    pub web_search: bool,
 }
 
 impl Default for VisionCfg {
     fn default() -> Self {
-        Self { ui_tree: true, zoom: true, guide: true }
+        Self {
+            ui_tree: true,
+            zoom: true,
+            guide: true,
+            web_search: true,
+        }
     }
 }
 
@@ -178,7 +187,14 @@ impl Default for Config {
 
 impl Default for AppearanceCfg {
     fn default() -> Self {
-        Self { accent: "#0A84FF".into(), width: 680.0, text_size: 15.0, position: "top".into(), dismiss_on_blur: true }
+        Self {
+            accent: "#0A84FF".into(),
+            width: 680.0,
+            text_size: 15.0,
+            position: "top".into(),
+            saved_pos: None,
+            dismiss_on_blur: true,
+        }
     }
 }
 

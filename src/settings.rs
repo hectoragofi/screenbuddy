@@ -468,7 +468,17 @@ impl Settings {
         });
         group(ui, "Palette", |ui| {
             row(ui, "Position", None, |ui| {
-                segmented(ui, &mut self.cfg.appearance.position, &[("top", "Top"), ("center", "Center"), ("cursor", "Near cursor")], accent);
+                segmented(
+                    ui,
+                    &mut self.cfg.appearance.position,
+                    &[
+                        ("top", "Top"),
+                        ("center", "Center"),
+                        ("cursor", "Near cursor"),
+                        ("last", "Where I left it"),
+                    ],
+                    accent,
+                );
             });
             sep(ui);
             row(ui, "Width", None, |ui| {
@@ -508,9 +518,23 @@ impl Settings {
                 toggle(ui, &mut self.cfg.vision.zoom, accent);
             });
             sep(ui);
-            row(ui, "Guide mode", Some("\"Walk me through…\": points at each step and waits for you"), |ui| {
-                toggle(ui, &mut self.cfg.vision.guide, accent);
-            });
+            row(
+                ui,
+                "Guide mode",
+                Some("\"Walk me through…\": points at each step and waits for you"),
+                |ui| {
+                    toggle(ui, &mut self.cfg.vision.guide, accent);
+                },
+            );
+            sep(ui);
+            row(
+                ui,
+                "Search the web",
+                Some("Looks things up when the answer isn't on screen (Anthropic or Claude CLI)"),
+                |ui| {
+                    toggle(ui, &mut self.cfg.vision.web_search, accent);
+                },
+            );
         });
     }
 
