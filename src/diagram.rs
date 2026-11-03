@@ -273,13 +273,118 @@ fn run(rx: Receiver<Job>) {
 
 fn handle(engine: &mut Result<Engine, String>, job: Job) {
     let result = match engine {
-        Ok(e) => e
-            .svg(&job.src, job.max_w)
-            .and_then(|svg| rasterize(&svg, &job.theme, job.ppp, &e.opts)),
+        Ok(e) => {
+            // Models often leave punctuation in labels unquoted, which Mermaid
+            // rejects; retry once with labels quoted before giving up.
+            let svg = e.svg(&job.src, job.max_w).or_else(|err| match repair(&job.src) {
+                Some(fixed) => e.svg(&fixed, job.max_w).map_err(|_| err),
+                None => Err(err),
+            });
+            svg.and_then(|svg| rasterize(&svg, &job.theme, job.ppp, &e.opts))
+        }
         Err(e) => Err(e.clone()),
     };
     job.slots.lock().unwrap().insert(job.key, Slot::Done(result));
     job.ctx.request_repaint();
+}
+
+/// Rewrites a flowchart so free-text labels are quoted: `A -- text --> B`
+/// becomes `A -->|"text"| B`, and node text with punctuation, as in
+/// `A[x: y (z)]`, becomes `A["x: y (z)"]`. `None` when nothing changed.
+fn repair(src: &str) -> Option<String> {
+    let head = src.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("%%"))?;
+    let kind = head.split_whitespace().next()?;
+    if kind != "flowchart" && kind != "graph" {
+        return None;
+    }
+    let mut out = String::with_capacity(src.len() + 32);
+    let mut seen_head = false;
+    for line in src.split_inclusive('\n') {
+        let t = line.trim();
+        if !seen_head && t == head {
+            seen_head = true;
+            out.push_str(line);
+            continue;
+        }
+        if t.is_empty() || t.starts_with("%%") || t.starts_with("classDef") || t.starts_with("style")
+            || t.starts_with("linkStyle") || t.starts_with("class ") || t.starts_with("click ")
+        {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&quote_nodes(&quote_dash_labels(line)));
+    }
+    (out != src).then_some(out)
+}
+
+/// `A -- text --> B` → `A -->|"text"| B` (also `---`/`-.->`-free forms only).
+fn quote_dash_labels(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(i) = rest.find(" -- ") {
+        let after = &rest[i + 4..];
+        let Some(j) = after.find(" -->") else { break };
+        let label = after[..j].trim();
+        out.push_str(&rest[..i]);
+        out.push_str(" -->|\"");
+        out.push_str(&label.replace('"', "#quot;"));
+        out.push_str("\"|");
+        rest = &after[j + 4..];
+    }
+    out.push_str(rest);
+    out
+}
+
+const SHAPES: [(&str, &str); 10] = [
+    ("([", "])"), ("[[", "]]"), ("[(", ")]"), ("((", "))"), ("{{", "}}"),
+    ("[/", "/]"), ("[\\", "\\]"), ("[", "]"), ("(", ")"), ("{", "}"),
+];
+
+/// Quotes node text after an id when it holds characters Mermaid treats as
+/// syntax. The closer is the last one before the next edge or line end, so
+/// brackets inside the text stay part of it.
+fn quote_nodes(line: &str) -> String {
+    let b = line.as_bytes();
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut i = 0;
+    while i < line.len() {
+        let id_start = i;
+        while i < line.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if i == id_start {
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        out.push_str(&line[id_start..i]);
+        let Some((open, close)) = SHAPES.iter().find(|(o, _)| line[i..].starts_with(o)) else { continue };
+        let body_start = i + open.len();
+        // The node ends before the next edge operator (or `&`, `:::`) or at line end.
+        let tail = &line[body_start..];
+        let stop = ["-->", "---", "-.-", "==>", "-- ", "&", ":::", "|"]
+            .iter()
+            .filter_map(|op| tail.find(op))
+            .filter(|&k| tail[..k].contains(close))
+            .min()
+            .unwrap_or(tail.len());
+        let Some(end) = tail[..stop].rfind(close) else { continue };
+        let text = &tail[..end];
+        let needs = !text.trim_start().starts_with('"')
+            && text.chars().any(|c| !(c.is_alphanumeric() || " _-.,'?!".contains(c)));
+        out.push_str(open);
+        if needs {
+            out.push('"');
+            out.push_str(&text.replace('"', "#quot;"));
+            out.push('"');
+        } else {
+            out.push_str(text);
+        }
+        out.push_str(close);
+        i = body_start + end + close.len();
+    }
+    out
 }
 
 struct Engine {
