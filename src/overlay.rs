@@ -142,14 +142,17 @@ pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Resul
             let m = cap.monitor.rect;
             let scale = cap.monitor.scale.max(0.5);
             let pad = CARD_PAD * scale;
-            // Card width cap: `w` if given, else 520pt; never wider than the monitor.
-            let max_px = if w > 0.0 { w } else { 520.0 * scale }.min(m.w as f32 - pad * 2.0);
-            let img = crate::diagram::render_blocking(src, card_theme(color), (max_px - pad * 2.0) / scale, scale)
+            let margin = 16.0 * scale;
+            // Card box: `w` if given, else 60% of the monitor; never taller
+            // than the monitor, so tall diagrams shrink (or turn sideways).
+            let max_w = if w > 0.0 { w } else { m.w as f32 * 0.6 }.min(m.w as f32 - margin * 2.0);
+            let max_h = m.h as f32 - margin * 2.0;
+            let (bw, bh) = ((max_w - pad * 2.0) / scale, (max_h - pad * 2.0) / scale);
+            let img = crate::diagram::render_blocking(src, card_theme(color), bw, bh, scale)
                 .map_err(|e| format!("shape {i}: the Mermaid diagram didn't parse ({e}); fix the syntax and draw again"))?;
             w = img.size[0] as f32 + pad * 2.0;
             h = img.size[1] as f32 + pad * 2.0;
             // Keep the card on the monitor.
-            let margin = 16.0 * scale;
             sx = sx.min((m.x + m.w) as f32 - w - margin).max(m.x as f32);
             sy = sy.min((m.y + m.h) as f32 - h - margin).max(m.y as f32);
             diagram = Some(img);
@@ -1140,6 +1143,20 @@ mod tests {
         assert_eq!(s.kind, Kind::Diagram);
         assert!(s.diagram.is_some() && s.w > 100.0 && s.h > 40.0);
         assert!(s.x + s.w <= (c.monitor.rect.x + c.monitor.rect.w) as f32 + 0.5, "{} {}", s.x, s.w);
+
+        // A tall top-down chart (what a model drew for "git rebase") stays on screen.
+        let tall = "flowchart TD\n A[git rebase main] --> B[Find merge base]\n B --> C[Save commits as patches]\n C --> D[Move HEAD to main]\n D --> E[Apply next commit]\n E --> F{Conflict?}\n F -->|No| G[New commit]\n F -->|Yes| H[Fix files, git add]\n H --> I{What next?}\n I -->|continue| G\n I -->|skip| J[Drop commit]\n I -->|abort| K[Back to start]\n G --> L{More commits?}\n J --> L\n L -->|Yes| E\n L -->|No| M[Point branch at last commit]\n M --> N[Done]";
+        let call2 = parse_draw(&json!({"shapes":[{"kind":"diagram","mermaid":tall,"x":900,"y":40}]}), &c, ACCENT).unwrap();
+        let t = &call2.shapes[0];
+        let mr = c.monitor.rect;
+        assert!(t.y >= mr.y as f32 && t.y + t.h <= (mr.y + mr.h) as f32, "{} {}", t.y, t.h);
+        assert!(t.x >= mr.x as f32 && t.x + t.w <= (mr.x + mr.w) as f32, "{} {}", t.x, t.w);
+        if let Ok(out) = std::env::var("SCREENBUDDY_DIAGRAM_PNG") {
+            let mut pm = Pixmap::new(mr.w as u32, mr.h as u32).unwrap();
+            pm.fill(Color::from_rgba8(235, 235, 240, 255));
+            draw_shape(&mut pm, t, 1.0, mr, Transform::from_translate(-mr.x as f32, -mr.y as f32));
+            pm.save_png(out.replace(".png", "-tall.png")).unwrap();
+        }
 
         let err = parse_draw(&json!({"shapes":[{"kind":"diagram","mermaid":"flowchart LR\n A -->","x":0,"y":0}]}), &c, ACCENT)
             .err()

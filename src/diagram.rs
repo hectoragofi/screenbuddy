@@ -177,7 +177,7 @@ pub fn show(ui: &mut Ui, cache: &mut DiagramCache, md: &mut egui_commonmark::Com
                         theme,
                         max_w,
                         ppp,
-                        fit_w: f32::INFINITY,
+                        fit: (f32::INFINITY, f32::INFINITY),
                         reply: Box::new(move |r| {
                             slots.lock().unwrap().insert(key, Slot::Done(r));
                             ctx.request_repaint();
@@ -241,19 +241,49 @@ struct Job {
     max_w: f32,
     /// Pixels per point.
     ppp: f32,
-    /// Shrink the raster so it is at most this many points wide.
-    fit_w: f32,
+    /// Shrink the raster to fit this many points (width, height).
+    fit: (f32, f32),
     reply: Box<dyn FnOnce(Result<Img, String>) + Send>,
 }
 
-/// Renders on the worker and waits; for the screen overlay and the MCP
-/// draw check. Results are cached by source, width, scale and theme.
-pub fn render_blocking(src: &str, theme: Theme, max_w: f32, ppp: f32) -> Result<Arc<Img>, String> {
+/// Renders on the worker and waits, shrinking to fit `max_w` x `max_h`
+/// points; for the screen overlay and the MCP draw check. A top-down
+/// flowchart that would have to shrink a lot is also tried left-to-right,
+/// and the larger result wins. Cached by source, box, scale and theme.
+pub fn render_blocking(src: &str, theme: Theme, max_w: f32, max_h: f32, ppp: f32) -> Result<Arc<Img>, String> {
+    let first = render_once(src, theme, max_w, max_h, ppp)?;
+    let shrink = |img: &Img| img.size[0] as f32 / (img.native.x * ppp).max(1.0);
+    if shrink(&first) < 0.85 {
+        if let Some(lr) = sideways(src) {
+            if let Ok(alt) = render_once(&lr, theme, max_w, max_h, ppp) {
+                if shrink(&alt) > shrink(&first) {
+                    return Ok(alt);
+                }
+            }
+        }
+    }
+    Ok(first)
+}
+
+/// `flowchart TD` / `graph TB` source turned left-to-right.
+fn sideways(src: &str) -> Option<String> {
+    let start = src.len() - src.trim_start().len();
+    let line_end = src[start..].find('\n').map_or(src.len(), |i| start + i);
+    let mut words = src[start..line_end].split_whitespace();
+    let kind = words.next()?;
+    let dir = words.next()?;
+    if !matches!(kind, "flowchart" | "graph") || !matches!(dir, "TD" | "TB") || words.next().is_some() {
+        return None;
+    }
+    Some(format!("{}{kind} LR{}", &src[..start], &src[line_end..]))
+}
+
+fn render_once(src: &str, theme: Theme, max_w: f32, max_h: f32, ppp: f32) -> Result<Arc<Img>, String> {
     type Done = HashMap<u64, Result<Arc<Img>, String>>;
     static DONE: OnceLock<Mutex<Done>> = OnceLock::new();
     let key = {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (src, max_w.to_bits(), ppp.to_bits(), theme).hash(&mut h);
+        (src, max_w.to_bits(), max_h.to_bits(), ppp.to_bits(), theme).hash(&mut h);
         h.finish()
     };
     let done = DONE.get_or_init(Default::default);
@@ -266,7 +296,7 @@ pub fn render_blocking(src: &str, theme: Theme, max_w: f32, ppp: f32) -> Result<
         theme,
         max_w,
         ppp,
-        fit_w: max_w,
+        fit: (max_w, max_h),
         reply: Box::new(move |r| {
             let _ = tx.send(r);
         }),
@@ -337,7 +367,7 @@ fn handle(engine: &mut Result<Engine, String>, job: Job) {
                 Some(fixed) => e.svg(&fixed, job.max_w).map_err(|_| err),
                 None => Err(err),
             });
-            svg.and_then(|svg| rasterize(&svg, &job.theme, job.ppp, job.fit_w, &e.opts))
+            svg.and_then(|svg| rasterize(&svg, &job.theme, job.ppp, job.fit, &e.opts))
         }
         Err(e) => Err(e.clone()),
     };
@@ -582,12 +612,12 @@ fn options() -> usvg::Options<'static> {
     usvg::Options { font_family: "Segoe UI".into(), fontdb: Arc::new(db), ..Default::default() }
 }
 
-fn rasterize(svg: &str, theme: &Theme, ppp: f32, fit_w: f32, opts: &usvg::Options) -> Result<Img, String> {
+fn rasterize(svg: &str, theme: &Theme, ppp: f32, fit: (f32, f32), opts: &usvg::Options) -> Result<Img, String> {
     // usvg ignores CSS `rx`, which Pele uses for themeable corner radii.
     let svg = resolve_vars(svg, theme).replace("style=\"rx:6px\"", "rx=\"6\"");
     let tree = usvg::Tree::from_str(&svg, opts).map_err(|e| format!("svg: {e}"))?;
     let native = tree.size();
-    let fit = (fit_w / native.width().max(1.0)).min(1.0);
+    let fit = (fit.0 / native.width().max(1.0)).min(fit.1 / native.height().max(1.0)).min(1.0);
     let scale = (ppp * fit).min(MAX_PX / native.width().max(native.height()).max(1.0));
     let w = (native.width() * scale).ceil().max(1.0) as u32;
     let h = (native.height() * scale).ceil().max(1.0) as u32;
@@ -605,7 +635,7 @@ fn rasterize(svg: &str, theme: &Theme, ppp: f32, fit_w: f32, opts: &usvg::Option
 fn png(src: &str, theme: &Theme) -> Result<Vec<u8>, String> {
     let mut e = Engine::new()?;
     let svg = e.svg(src, 560.0)?;
-    let img = rasterize(&svg, theme, 2.0, f32::INFINITY, &e.opts)?;
+    let img = rasterize(&svg, theme, 2.0, (f32::INFINITY, f32::INFINITY), &e.opts)?;
     let pm = tiny_skia::Pixmap::from_vec(
         img.rgba,
         tiny_skia::IntSize::from_wh(img.size[0] as u32, img.size[1] as u32).unwrap(),

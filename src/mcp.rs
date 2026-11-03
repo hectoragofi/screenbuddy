@@ -137,7 +137,7 @@ fn validate(args: &Value) -> (String, bool) {
                 return (format!("error: shape {i}: diagram needs `mermaid` source"), true);
             };
             let theme = crate::overlay::card_theme([10, 132, 255]);
-            if let Err(e) = crate::diagram::render_blocking(src, theme, 520.0, 1.0) {
+            if let Err(e) = crate::diagram::render_blocking(src, theme, 1200.0, 800.0, 1.0) {
                 return (format!("error: shape {i}: the Mermaid diagram didn't parse ({e}); fix the syntax and draw again"), true);
             }
         }
