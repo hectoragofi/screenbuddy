@@ -4,7 +4,7 @@
 use crate::capture::{Capture, Rect};
 use crate::util::wide;
 use serde_json::Value;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform,
 };
@@ -24,6 +24,8 @@ pub enum Kind {
     Circle,
     Highlight,
     Text,
+    /// A rendered Mermaid diagram on a card; x,y is its top-left, w,h the card.
+    Diagram,
 }
 
 /// A shape in overlay-independent virtual-screen pixels.
@@ -39,6 +41,21 @@ pub struct Shape {
     pub r: f32,
     pub label: Option<String>,
     pub color: [u8; 3],
+    pub diagram: Option<Arc<crate::diagram::Img>>,
+}
+
+/// Inner padding of a diagram card, in points.
+const CARD_PAD: f32 = 14.0;
+const CARD_BG: [u8; 3] = [30, 30, 32];
+
+/// Card colors for diagrams drawn on screen; `accent` is the shape color.
+pub fn card_theme(accent: [u8; 3]) -> crate::diagram::Theme {
+    crate::diagram::Theme {
+        bg: egui::Color32::from_rgb(CARD_BG[0], CARD_BG[1], CARD_BG[2]),
+        fg: egui::Color32::from_rgb(236, 236, 240),
+        muted: egui::Color32::from_rgb(152, 152, 160),
+        accent: egui::Color32::from_rgb(accent[0], accent[1], accent[2]),
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +110,7 @@ pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Resul
             "circle" => Kind::Circle,
             "highlight" => Kind::Highlight,
             "text" | "label" => Kind::Text,
+            "diagram" | "mermaid" => Kind::Diagram,
             other => return Err(format!("shape {i}: unknown kind '{other}'")),
         };
         let (Some(x), Some(y)) = (num("x"), num("y")) else {
@@ -108,25 +126,50 @@ pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Resul
         {
             return Err(format!("shape {i}: {:?} needs w,h", kind));
         }
+        let color = s
+            .get("color")
+            .and_then(Value::as_str)
+            .and_then(parse_color)
+            .unwrap_or(default_color);
+        let (mut sx, mut sy) = (sx, sy);
+        let mut w = num("w").unwrap_or(0.0).abs() * ls;
+        let mut h = num("h").unwrap_or(0.0).abs() * ls;
+        let mut diagram = None;
+        if kind == Kind::Diagram {
+            let Some(src) = s.get("mermaid").and_then(Value::as_str).filter(|m| !m.trim().is_empty()) else {
+                return Err(format!("shape {i}: diagram needs `mermaid` source"));
+            };
+            let m = cap.monitor.rect;
+            let scale = cap.monitor.scale.max(0.5);
+            let pad = CARD_PAD * scale;
+            // Card width cap: `w` if given, else 520pt; never wider than the monitor.
+            let max_px = if w > 0.0 { w } else { 520.0 * scale }.min(m.w as f32 - pad * 2.0);
+            let img = crate::diagram::render_blocking(src, card_theme(color), (max_px - pad * 2.0) / scale, scale)
+                .map_err(|e| format!("shape {i}: the Mermaid diagram didn't parse ({e}); fix the syntax and draw again"))?;
+            w = img.size[0] as f32 + pad * 2.0;
+            h = img.size[1] as f32 + pad * 2.0;
+            // Keep the card on the monitor.
+            let margin = 16.0 * scale;
+            sx = sx.min((m.x + m.w) as f32 - w - margin).max(m.x as f32);
+            sy = sy.min((m.y + m.h) as f32 - h - margin).max(m.y as f32);
+            diagram = Some(img);
+        }
         shapes.push(Shape {
             kind,
             x: sx,
             y: sy,
             x2: ex,
             y2: ey,
-            w: num("w").unwrap_or(0.0).abs() * ls,
-            h: num("h").unwrap_or(0.0).abs() * ls,
+            w,
+            h,
             r: num("r").unwrap_or(24.0).abs().max(4.0) * ls,
             label: s
                 .get("label")
                 .and_then(Value::as_str)
                 .filter(|l| !l.trim().is_empty())
                 .map(str::to_owned),
-            color: s
-                .get("color")
-                .and_then(Value::as_str)
-                .and_then(parse_color)
-                .unwrap_or(default_color),
+            color,
+            diagram,
         });
     }
     Ok(DrawCall { clear, shapes })
@@ -272,6 +315,40 @@ fn lay_line(text: &str, px: f32, ink: [u8; 3]) -> Line {
     line
 }
 
+/// Composites a premultiplied-RGBA diagram onto the pixmap at (x, y).
+fn blit_premul(pm: &mut Pixmap, img: &crate::diagram::Img, x: i32, y: i32) {
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let (w, h) = (img.size[0] as i32, img.size[1] as i32);
+    let pixels = pm.pixels_mut();
+    for row in 0..h {
+        let ty = y + row;
+        if ty < 0 || ty >= ph {
+            continue;
+        }
+        for col in 0..w {
+            let tx = x + col;
+            if tx < 0 || tx >= pw {
+                continue;
+            }
+            let i = ((row * w + col) * 4) as usize;
+            let a = img.rgba[i + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            let p = &mut pixels[(ty * pw + tx) as usize];
+            let inv = 255 - a;
+            let over = |src: u8, d: u8| (src as u32 + d as u32 * inv / 255).min(255) as u8;
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(
+                over(img.rgba[i], p.red()),
+                over(img.rgba[i + 1], p.green()),
+                over(img.rgba[i + 2], p.blue()),
+                over(img.rgba[i + 3], p.alpha()),
+            )
+            .unwrap_or(*p);
+        }
+    }
+}
+
 /// Blends a straight-RGBA bitmap into a premultiplied pixmap at (x, y).
 fn blit(pm: &mut Pixmap, r: &katex_native::raster::Raster, x: i32, y: i32) {
     let (pw, ph) = (pm.width() as i32, pm.height() as i32);
@@ -318,7 +395,7 @@ fn label_box(s: &Shape, scale: f32, m: Rect) -> Option<Label> {
             let ly = if dy >= 0.0 { s.y + gap } else { s.y - h - gap };
             (lx, ly)
         }
-        Kind::Box | Kind::Highlight => (s.x, s.y - h - gap),
+        Kind::Box | Kind::Highlight | Kind::Diagram => (s.x, s.y - h - gap),
         Kind::Circle => (s.x + s.r + gap, s.y - h / 2.0),
         Kind::Text => (s.x, s.y),
     };
@@ -329,7 +406,7 @@ fn label_box(s: &Shape, scale: f32, m: Rect) -> Option<Label> {
         (m.x + m.w) as f32,
         (m.y + m.h) as f32,
     );
-    let y = if y < my0 && matches!(s.kind, Kind::Box | Kind::Highlight) {
+    let y = if y < my0 && matches!(s.kind, Kind::Box | Kind::Highlight | Kind::Diagram) {
         s.y + s.h + gap
     } else {
         y
@@ -350,7 +427,7 @@ fn bounds(s: &Shape, scale: f32, m: Rect) -> (f32, f32, f32, f32) {
     let pad = 12.0 * scale;
     let (mut x0, mut y0, mut x1, mut y1) = match s.kind {
         Kind::Arrow => (s.x.min(s.x2), s.y.min(s.y2), s.x.max(s.x2), s.y.max(s.y2)),
-        Kind::Box | Kind::Highlight => (s.x, s.y, s.x + s.w, s.y + s.h),
+        Kind::Box | Kind::Highlight | Kind::Diagram => (s.x, s.y, s.x + s.w, s.y + s.h),
         Kind::Circle => (s.x - s.r, s.y - s.r, s.x + s.r, s.y + s.r),
         Kind::Text => (s.x, s.y, s.x, s.y),
     };
@@ -451,6 +528,18 @@ fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
             }
         }
         Kind::Text => {}
+        Kind::Diagram => {
+            let Some(r) = tiny_skia::Rect::from_xywh(s.x, s.y, s.w.max(1.0), s.h.max(1.0)) else {
+                return;
+            };
+            let p = rounded_rect(r, 12.0 * scale);
+            pm.fill_path(&p, &paint(rgba(CARD_BG, 0.97)), FillRule::Winding, t, None);
+            pm.stroke_path(&p, &paint(Color::from_rgba8(255, 255, 255, 30)), &stroke(scale), t, None);
+            if let Some(img) = &s.diagram {
+                let pad = CARD_PAD * scale;
+                blit_premul(pm, img, (s.x + pad + t.tx).round() as i32, (s.y + pad + t.ty).round() as i32);
+            }
+        }
     }
     if let Some(l) = label_box(s, scale, m) {
         let Some(r) = tiny_skia::Rect::from_xywh(l.x, l.y, l.w, l.h) else {
@@ -1022,6 +1111,7 @@ mod tests {
             r: 0.0,
             label: Some(label.into()),
             color: ACCENT,
+            diagram: None,
         };
         let shapes = [
             mk(Kind::Box, 40.0, 120.0, r"$f'(x) = \frac{3e^{3x}}{3x}$"),
@@ -1036,6 +1126,34 @@ mod tests {
             draw_shape(&mut pm, sh, 1.5, m, Transform::identity());
         }
         if let Ok(out) = std::env::var("SCREENBUDDY_MATH_PNG") {
+            pm.save_png(out).unwrap();
+        }
+    }
+
+    #[test]
+    fn diagram_cards_render_and_report_errors() {
+        let c = cap();
+        let src = "flowchart LR\n A[Hotkey] --> B{Open?}\n B -->|No| C[Capture]";
+        // Placed off the right edge: the card is pulled back onto the monitor.
+        let call = parse_draw(&json!({"shapes":[{"kind":"diagram","mermaid":src,"x":1270,"y":10}]}), &c, ACCENT).unwrap();
+        let s = &call.shapes[0];
+        assert_eq!(s.kind, Kind::Diagram);
+        assert!(s.diagram.is_some() && s.w > 100.0 && s.h > 40.0);
+        assert!(s.x + s.w <= (c.monitor.rect.x + c.monitor.rect.w) as f32 + 0.5, "{} {}", s.x, s.w);
+
+        let err = parse_draw(&json!({"shapes":[{"kind":"diagram","mermaid":"flowchart LR\n A -->","x":0,"y":0}]}), &c, ACCENT)
+            .err()
+            .unwrap();
+        assert!(err.contains("didn't parse"), "{err}");
+        assert!(parse_draw(&json!({"shapes":[{"kind":"diagram","x":0,"y":0}]}), &c, ACCENT).is_err());
+
+        let m = c.monitor.rect;
+        let mut pm = Pixmap::new(m.w as u32, 400).unwrap();
+        pm.fill(Color::from_rgba8(235, 235, 240, 255));
+        let t = Transform::from_translate(-m.x as f32, 0.0);
+        draw_shape(&mut pm, s, 1.0, m, t);
+        assert!(pm.pixels().iter().any(|p| p.red() < 60));
+        if let Ok(out) = std::env::var("SCREENBUDDY_DIAGRAM_PNG") {
             pm.save_png(out).unwrap();
         }
     }

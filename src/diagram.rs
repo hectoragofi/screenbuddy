@@ -106,11 +106,18 @@ impl Theme {
     }
 }
 
-struct Img {
-    size: [usize; 2],
-    rgba: Vec<u8>,
+/// A rendered diagram: premultiplied RGBA.
+pub struct Img {
+    pub size: [usize; 2],
+    pub rgba: Vec<u8>,
     /// Size in points at which the diagram reads naturally.
-    native: Vec2,
+    pub native: Vec2,
+}
+
+impl std::fmt::Debug for Img {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Img({}x{})", self.size[0], self.size[1])
+    }
 }
 
 enum Slot {
@@ -138,7 +145,10 @@ impl DiagramCache {
 
 /// Draws a Mermaid block; falls back to its source (plus Pele's error) when
 /// it does not parse.
-pub fn show(ui: &mut Ui, cache: &mut DiagramCache, md: &mut egui_commonmark::CommonMarkCache, src: &str, theme: Theme) {
+///
+/// Returns true when the user asked to show it on screen.
+pub fn show(ui: &mut Ui, cache: &mut DiagramCache, md: &mut egui_commonmark::CommonMarkCache, src: &str, theme: Theme) -> bool {
+    let mut pin = false;
     let ppp = ui.ctx().pixels_per_point();
     let avail = ui.available_width().max(80.0);
     // Pele picks a direction for the width it is given; bucket it so small
@@ -161,14 +171,17 @@ pub fn show(ui: &mut Ui, cache: &mut DiagramCache, md: &mut egui_commonmark::Com
                 None => {
                     slots.insert(key, Slot::Pending);
                     drop(slots);
+                    let (slots, ctx) = (cache.slots.clone(), ui.ctx().clone());
                     submit(Job {
-                        key,
                         src: src.to_string(),
                         theme,
                         max_w,
                         ppp,
-                        slots: cache.slots.clone(),
-                        ctx: ui.ctx().clone(),
+                        fit_w: f32::INFINITY,
+                        reply: Box::new(move |r| {
+                            slots.lock().unwrap().insert(key, Slot::Done(r));
+                            ctx.request_repaint();
+                        }),
                     });
                     None
                 }
@@ -198,8 +211,12 @@ pub fn show(ui: &mut Ui, cache: &mut DiagramCache, md: &mut egui_commonmark::Com
         ui.add_space(4.0);
         let resp = ui
             .add(egui::Image::new(handle).fit_to_exact_size(size).sense(egui::Sense::click()))
-            .on_hover_text("Right-click to copy the Mermaid source");
+            .on_hover_text("Right-click to show it on screen or copy the source");
         resp.context_menu(|ui| {
+            if ui.button("Show on screen").clicked() {
+                pin = true;
+                ui.close();
+            }
             if ui.button("Copy Mermaid source").clicked() {
                 ui.ctx().copy_text(src.to_string());
                 ui.close();
@@ -214,16 +231,56 @@ pub fn show(ui: &mut Ui, cache: &mut DiagramCache, md: &mut egui_commonmark::Com
     } else {
         ui.label(RichText::new("Drawing diagram…").color(theme.muted).small());
     }
+    pin
 }
 
 struct Job {
-    key: u64,
     src: String,
     theme: Theme,
+    /// Width Pele lays out for, in points.
     max_w: f32,
+    /// Pixels per point.
     ppp: f32,
-    slots: Slots,
-    ctx: egui::Context,
+    /// Shrink the raster so it is at most this many points wide.
+    fit_w: f32,
+    reply: Box<dyn FnOnce(Result<Img, String>) + Send>,
+}
+
+/// Renders on the worker and waits; for the screen overlay and the MCP
+/// draw check. Results are cached by source, width, scale and theme.
+pub fn render_blocking(src: &str, theme: Theme, max_w: f32, ppp: f32) -> Result<Arc<Img>, String> {
+    type Done = HashMap<u64, Result<Arc<Img>, String>>;
+    static DONE: OnceLock<Mutex<Done>> = OnceLock::new();
+    let key = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (src, max_w.to_bits(), ppp.to_bits(), theme).hash(&mut h);
+        h.finish()
+    };
+    let done = DONE.get_or_init(Default::default);
+    if let Some(r) = done.lock().unwrap().get(&key) {
+        return r.clone();
+    }
+    let (tx, rx) = mpsc::channel();
+    submit(Job {
+        src: src.to_string(),
+        theme,
+        max_w,
+        ppp,
+        fit_w: max_w,
+        reply: Box::new(move |r| {
+            let _ = tx.send(r);
+        }),
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "diagram engine timed out".to_string())
+        .and_then(|r| r.map(Arc::new));
+    let mut d = done.lock().unwrap();
+    if d.len() > 32 {
+        d.clear();
+    }
+    d.insert(key, r.clone());
+    r
 }
 
 fn worker() -> &'static Mutex<Option<Sender<Job>>> {
@@ -280,12 +337,11 @@ fn handle(engine: &mut Result<Engine, String>, job: Job) {
                 Some(fixed) => e.svg(&fixed, job.max_w).map_err(|_| err),
                 None => Err(err),
             });
-            svg.and_then(|svg| rasterize(&svg, &job.theme, job.ppp, &e.opts))
+            svg.and_then(|svg| rasterize(&svg, &job.theme, job.ppp, job.fit_w, &e.opts))
         }
         Err(e) => Err(e.clone()),
     };
-    job.slots.lock().unwrap().insert(job.key, Slot::Done(result));
-    job.ctx.request_repaint();
+    (job.reply)(result);
 }
 
 /// Rewrites a flowchart so free-text labels are quoted: `A -- text --> B`
@@ -526,12 +582,13 @@ fn options() -> usvg::Options<'static> {
     usvg::Options { font_family: "Segoe UI".into(), fontdb: Arc::new(db), ..Default::default() }
 }
 
-fn rasterize(svg: &str, theme: &Theme, ppp: f32, opts: &usvg::Options) -> Result<Img, String> {
+fn rasterize(svg: &str, theme: &Theme, ppp: f32, fit_w: f32, opts: &usvg::Options) -> Result<Img, String> {
     // usvg ignores CSS `rx`, which Pele uses for themeable corner radii.
     let svg = resolve_vars(svg, theme).replace("style=\"rx:6px\"", "rx=\"6\"");
     let tree = usvg::Tree::from_str(&svg, opts).map_err(|e| format!("svg: {e}"))?;
     let native = tree.size();
-    let scale = ppp.min(MAX_PX / native.width().max(native.height()).max(1.0));
+    let fit = (fit_w / native.width().max(1.0)).min(1.0);
+    let scale = (ppp * fit).min(MAX_PX / native.width().max(native.height()).max(1.0));
     let w = (native.width() * scale).ceil().max(1.0) as u32;
     let h = (native.height() * scale).ceil().max(1.0) as u32;
     let mut pm = tiny_skia::Pixmap::new(w, h).ok_or("empty diagram")?;
@@ -548,7 +605,7 @@ fn rasterize(svg: &str, theme: &Theme, ppp: f32, opts: &usvg::Options) -> Result
 fn png(src: &str, theme: &Theme) -> Result<Vec<u8>, String> {
     let mut e = Engine::new()?;
     let svg = e.svg(src, 560.0)?;
-    let img = rasterize(&svg, theme, 2.0, &e.opts)?;
+    let img = rasterize(&svg, theme, 2.0, f32::INFINITY, &e.opts)?;
     let pm = tiny_skia::Pixmap::from_vec(
         img.rgba,
         tiny_skia::IntSize::from_wh(img.size[0] as u32, img.size[1] as u32).unwrap(),

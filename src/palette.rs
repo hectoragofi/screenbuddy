@@ -1323,6 +1323,7 @@ impl Palette {
         let mut open_settings = false;
         let mut retry = false;
         let mut decision: Option<(bool, bool)> = None;
+        let mut pin: Option<String> = None;
         let accent = self.accent;
         let once = self.cfg.agent_desktop.approval == "once";
         let out = egui::ScrollArea::vertical()
@@ -1352,7 +1353,9 @@ impl Palette {
                                         .show(ui, &mut self.md, &crate::math::normalize(md));
                                 }
                                 crate::diagram::Seg::Mermaid(src) => {
-                                    crate::diagram::show(ui, &mut self.diagrams, &mut self.md, src, theme);
+                                    if crate::diagram::show(ui, &mut self.diagrams, &mut self.md, src, theme) {
+                                        pin = Some(src.to_string());
+                                    }
                                 }
                             }
                         }
@@ -1453,6 +1456,14 @@ impl Palette {
         }
         if retry {
             self.retry(ui.ctx());
+        }
+        if let Some(src) = pin {
+            // Top-right of the captured area; the overlay clamps the card on screen.
+            let (w, h) = (self.cap.img_w as f32, self.cap.img_h as f32);
+            let shape = serde_json::json!({"kind": "diagram", "mermaid": src, "x": w, "y": h * 0.06});
+            if let Err(e) = self.draw(serde_json::json!({"shapes": [shape]})) {
+                self.notice = Some(format!("Couldn't show the diagram on screen ({e})."));
+            }
         }
     }
 

@@ -131,6 +131,16 @@ fn validate(args: &Value) -> (String, bool) {
         if s["kind"].as_str().is_none() || !placed {
             return (format!("error: shape {i} needs kind and x, y (or element)"), true);
         }
+        if s["kind"] == "diagram" {
+            // Parse it here so the model sees Mermaid errors and can retry.
+            let Some(src) = s["mermaid"].as_str() else {
+                return (format!("error: shape {i}: diagram needs `mermaid` source"), true);
+            };
+            let theme = crate::overlay::card_theme([10, 132, 255]);
+            if let Err(e) = crate::diagram::render_blocking(src, theme, 520.0, 1.0) {
+                return (format!("error: shape {i}: the Mermaid diagram didn't parse ({e}); fix the syntax and draw again"), true);
+            }
+        }
     }
     (
         format!("Drew {} annotation(s) on the user's screen.", shapes.len()),
