@@ -283,10 +283,11 @@ pub unsafe fn path_from_copydata(lp: LPARAM) -> Option<PathBuf> {
 /// Tries UI Automation first; if the focused element has no text pattern
 /// and `copy_fallback` is on, simulates Ctrl+C and restores the clipboard.
 /// Runs on a helper thread with a timeout so a hung app can't stall us.
-pub fn selected_text(copy_fallback: bool) -> Option<(String, String)> {
+pub fn selected_text(copy_fallback: bool) -> PendingSelection {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(900);
     let fg = unsafe { GetForegroundWindow() };
     if fg.is_invalid() || is_own_window(fg) {
-        return None;
+        return PendingSelection { job: None, deadline };
     }
     let title = window_title(fg);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -299,9 +300,26 @@ pub fn selected_text(copy_fallback: bool) -> Option<(String, String)> {
         };
         let _ = tx.send(r);
     });
-    let text = rx.recv_timeout(std::time::Duration::from_millis(900)).ok().flatten()?;
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some((text, title))
+    PendingSelection { job: Some((rx, title)), deadline }
+}
+
+/// A selection being read in the background, so the palette's window can be made
+/// at the same time. It must be collected before the palette takes focus, since
+/// the read may press Ctrl+C in whichever app is in front.
+pub struct PendingSelection {
+    job: Option<(std::sync::mpsc::Receiver<Option<String>>, String)>,
+    deadline: std::time::Instant,
+}
+
+impl PendingSelection {
+    /// Waits for the result, up to what's left of the time limit.
+    pub fn wait(self) -> Option<Chip> {
+        let (rx, app) = self.job?;
+        let left = self.deadline.saturating_duration_since(std::time::Instant::now());
+        let text = rx.recv_timeout(left).ok().flatten()?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| Chip::selection(text, &app))
+    }
 }
 
 fn is_own_window(h: HWND) -> bool {

@@ -5,8 +5,9 @@ use crate::capture::{Capture, Rect};
 use crate::util::wide;
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform,
+    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, StrokeDash, Transform,
 };
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -42,6 +43,8 @@ pub struct Shape {
     pub label: Option<String>,
     pub color: [u8; 3],
     pub diagram: Option<Arc<crate::diagram::Img>>,
+    /// Not drawn yet: a droplet is still on its way here.
+    pub hidden: bool,
 }
 
 /// Inner padding of a diagram card, in points.
@@ -173,6 +176,7 @@ pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Resul
                 .map(str::to_owned),
             color,
             diagram,
+            hidden: false,
         });
     }
     Ok(DrawCall { clear, shapes })
@@ -475,8 +479,45 @@ fn halo_stroke(pm: &mut Pixmap, path: &tiny_skia::Path, color: [u8; 3], w: f32, 
     pm.stroke_path(path, &paint(rgba(color, 1.0)), &stroke(w), t, None);
 }
 
+/// Where a droplet lands on a shape.
+fn landing(s: &Shape) -> (f32, f32) {
+    match s.kind {
+        Kind::Arrow => (s.x2, s.y2),
+        Kind::Circle => {
+            let k = std::f32::consts::FRAC_1_SQRT_2 * s.r;
+            (s.x - k, s.y - k)
+        }
+        _ => (s.x, s.y),
+    }
+}
+
+/// The shape a ring draws around, if it has one.
+fn ring_path(s: &Shape, scale: f32) -> Option<tiny_skia::Path> {
+    match s.kind {
+        Kind::Box | Kind::Highlight => {
+            let r = tiny_skia::Rect::from_xywh(s.x, s.y, s.w.max(1.0), s.h.max(1.0))?;
+            Some(rounded_rect(r, 8.0 * scale))
+        }
+        Kind::Circle => PathBuilder::from_circle(s.x, s.y, s.r),
+        _ => None,
+    }
+}
+
+/// Small filled dot where a droplet came to rest.
+fn draw_pin(pm: &mut Pixmap, s: &Shape, scale: f32, grow: f32, alpha: f32, t: Transform) {
+    let (x, y) = landing(s);
+    let r = 6.0 * scale * grow;
+    if let Some(p) = PathBuilder::from_circle(x, y, r) {
+        pm.stroke_path(&p, &paint(Color::from_rgba8(0, 0, 0, (90.0 * alpha) as u8)), &stroke(3.0), t, None);
+        pm.fill_path(&p, &paint(rgba(s.color, alpha)), FillRule::Winding, t, None);
+    }
+}
+
 fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
     let w = 3.0 * scale;
+    if ring_path(s, scale).is_some() {
+        draw_pin(pm, s, scale, 1.0, 1.0, t);
+    }
     match s.kind {
         Kind::Arrow => {
             let (dx, dy) = (s.x2 - s.x, s.y2 - s.y);
@@ -667,6 +708,106 @@ pub struct Overlay {
     monitor: Rect,
     scale: f32,
     shapes: Vec<Shape>,
+    flights: Vec<Flight>,
+    /// The layer is on screen, so changes to it shouldn't fade it in again.
+    shown: bool,
+}
+
+/// How long a droplet takes to reach a target, by distance in pixels.
+fn flight_time(dist: f32, scale: f32) -> f32 {
+    (dist / scale.max(0.5) / 1400.0).clamp(0.22, 0.42)
+}
+
+const RING_TIME: f32 = 0.24;
+const PIN_TIME: f32 = 0.16;
+/// The ring starts just before the droplet lands, so the two read as one move.
+const RING_LEAD: f32 = 0.04;
+/// How long the bud takes to leave the palette before its droplet takes over.
+pub const BUD_TIME: f32 = 0.09;
+const MAX_FLIGHTS: usize = 6;
+
+/// A droplet travelling to one shape, then the ring it turns into. Both are tiny
+/// layered windows, so the frames cost a small bitmap instead of the whole layer.
+struct Flight {
+    shape: usize,
+    /// Set by `launch`, once the palette has settled where it's going.
+    from: Option<(f32, f32)>,
+    start: Instant,
+    delay: f32,
+    time: f32,
+    drop: Option<HWND>,
+    ring: Option<HWND>,
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        for hwnd in [self.drop.take(), self.ring.take()].into_iter().flatten() {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+}
+
+/// A click-through window for one layer, kept out of our own captures.
+fn layer_window(at: Rect) -> Option<HWND> {
+    let cls = wide(OVERLAY_CLASS);
+    unsafe {
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR(cls.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            at.x,
+            at.y,
+            1,
+            1,
+            None,
+            None,
+            Some(hinstance()),
+            None,
+        )
+        .ok()?;
+        if crate::win::exclude_from_capture() {
+            let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+        Some(hwnd)
+    }
+}
+
+fn draw_droplet(hwnd: HWND, cx: f32, cy: f32, radius: f32) {
+    let side = (radius * 2.0).ceil() as u32 + 6;
+    let Some(mut pm) = Pixmap::new(side, side) else { return };
+    let c = side as f32 / 2.0;
+    if let Some(p) = PathBuilder::from_circle(c, c, radius) {
+        let s = crate::surface::SURFACE;
+        pm.fill_path(&p, &paint(Color::from_rgba8(s.r(), s.g(), s.b(), 255)), FillRule::Winding, Transform::identity(), None);
+        pm.stroke_path(&p, &paint(Color::from_rgba8(255, 255, 255, 60)), &stroke(1.0), Transform::identity(), None);
+    }
+    unsafe { present(hwnd, &pm, (cx - c).round() as i32, (cy - c).round() as i32, false) };
+}
+
+fn draw_ring(hwnd: HWND, s: &Shape, scale: f32, age: f32) {
+    let Some(path) = ring_path(s, scale) else { return };
+    let drawn = crate::surface::bezier(crate::surface::EASE_OUT, age / RING_TIME);
+    let pad = 16.0 * scale;
+    let b = path.bounds();
+    let (x0, y0) = ((b.left() - pad).floor(), (b.top() - pad).floor());
+    let (w, h) = ((b.width() + pad * 2.0).ceil() as u32, (b.height() + pad * 2.0).ceil() as u32);
+    let Some(mut pm) = Pixmap::new(w.max(1), h.max(1)) else { return };
+    let t = Transform::from_translate(-x0, -y0);
+    // Generous on purpose: the dash just has to outrun the true perimeter.
+    let around = (b.width() + b.height()) * 2.0;
+    let dash = StrokeDash::new(vec![(around * drawn).max(0.1), around + 1.0], 0.0);
+    let line = 3.0 * scale;
+    for (color, width) in [(Color::from_rgba8(0, 0, 0, 90), line + 3.0), (rgba(s.color, 1.0), line)] {
+        let mut st = stroke(width);
+        st.dash = dash.clone();
+        pm.stroke_path(&path, &paint(color), &st, t, None);
+    }
+    let pin = crate::surface::bezier(crate::surface::EASE_OUT, age / PIN_TIME);
+    draw_pin(&mut pm, s, scale, 0.8 + 0.2 * pin, pin, t);
+    unsafe { present(hwnd, &pm, x0 as i32, y0 as i32, false) };
 }
 
 impl Overlay {
@@ -704,6 +845,8 @@ impl Overlay {
             monitor,
             scale,
             shapes: Vec::new(),
+            flights: Vec::new(),
+            shown: false,
         })
     }
 
@@ -711,12 +854,113 @@ impl Overlay {
         self.shapes.is_empty()
     }
 
-    pub fn apply(&mut self, call: DrawCall) {
+    /// Adds shapes. With `animate`, the first few wait for a droplet (see `launch`).
+    pub fn apply(&mut self, call: DrawCall, animate: bool) {
         if call.clear {
+            self.flights.clear();
             self.shapes.clear();
         }
-        self.shapes.extend(call.shapes);
-        self.render();
+        for mut shape in call.shapes {
+            let flies = matches!(shape.kind, Kind::Arrow | Kind::Box | Kind::Highlight | Kind::Circle);
+            if animate && flies && self.flights.len() < MAX_FLIGHTS {
+                shape.hidden = true;
+                self.flights.push(Flight {
+                    shape: self.shapes.len(),
+                    from: None,
+                    start: Instant::now(),
+                    delay: 0.0,
+                    time: 0.0,
+                    drop: None,
+                    ring: None,
+                });
+            }
+            self.shapes.push(shape);
+        }
+        self.render(true);
+    }
+
+    /// Sends waiting droplets from the palette, whose surface is `(x0, y0, x1,
+    /// y1)` on screen. Returns where each leaves that surface and how long after
+    /// now, so the palette can draw the bud that it breaks away from.
+    pub fn launch(&mut self, surface: (f32, f32, f32, f32)) -> Vec<((f32, f32), (f32, f32), f32)> {
+        let (x0, y0, x1, y1) = surface;
+        let now = Instant::now();
+        let mut buds = Vec::new();
+        let mut order = 0;
+        for f in self.flights.iter_mut().filter(|f| f.from.is_none()) {
+            let to = landing(&self.shapes[f.shape]);
+            let edge = (to.0.clamp(x0, x1), to.1.clamp(y0, y1));
+            let wait = crate::surface::stagger(order);
+            order += 1;
+            f.from = Some(edge);
+            f.start = now;
+            f.delay = wait + BUD_TIME;
+            f.time = flight_time((to.0 - edge.0).hypot(to.1 - edge.1), self.scale);
+            buds.push((edge, to, wait));
+        }
+        buds
+    }
+
+    /// Advances the flights one frame. True while any are still going.
+    pub fn tick(&mut self) -> bool {
+        if self.flights.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        let scale = self.scale;
+        let mut landed = false;
+        let shapes = &mut self.shapes;
+        let monitor = self.monitor;
+        self.flights.retain_mut(|f| {
+            let Some(from) = f.from else { return true };
+            let age = now.duration_since(f.start).as_secs_f32() - f.delay;
+            if age < 0.0 {
+                return true;
+            }
+            let shape = &shapes[f.shape];
+            let has_ring = ring_path(shape, scale).is_some();
+            if age < f.time {
+                let hwnd = f.drop.get_or_insert_with(|| {
+                    layer_window(monitor).unwrap_or_default()
+                });
+                let along = crate::surface::bezier(crate::surface::EASE_IN_OUT, age / f.time);
+                let to = landing(shape);
+                let grow = (age / (f.time * 0.25)).min(1.0);
+                let shrink = ((f.time - age) / (f.time * 0.2)).min(1.0);
+                let size = 11.0 * scale * (0.75 + 0.25 * grow) * (0.55 + 0.45 * shrink);
+                draw_droplet(*hwnd, from.0 + (to.0 - from.0) * along, from.1 + (to.1 - from.1) * along, size);
+            } else if let Some(hwnd) = f.drop.take() {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+            if !has_ring {
+                if age >= f.time {
+                    shapes[f.shape].hidden = false;
+                    landed = true;
+                    return false;
+                }
+                return true;
+            }
+            let ring_age = age - (f.time - RING_LEAD);
+            if ring_age >= RING_TIME {
+                shapes[f.shape].hidden = false;
+                landed = true;
+                return false;
+            }
+            if ring_age >= 0.0 {
+                let hwnd = f.ring.get_or_insert_with(|| {
+                    layer_window(monitor).unwrap_or_default()
+                });
+                draw_ring(*hwnd, shape, scale, ring_age);
+            }
+            true
+        });
+        if landed {
+            // The finished shape lands on the same pixels the ring just drew.
+            self.render(false);
+        }
+        !self.flights.is_empty()
     }
 
     /// Screen-space bounding box of everything drawn.
@@ -740,16 +984,17 @@ impl Overlay {
         })
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, fade: bool) {
         unsafe {
-            if self.shapes.is_empty() {
+            if self.shapes.iter().all(|s| s.hidden) {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
+                self.shown = false;
                 return;
             }
         }
         let m = self.monitor;
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for s in &self.shapes {
+        for s in self.shapes.iter().filter(|s| !s.hidden) {
             let b = bounds(s, self.scale, m);
             x0 = x0.min(b.0);
             y0 = y0.min(b.1);
@@ -765,10 +1010,11 @@ impl Overlay {
             return;
         };
         let t = Transform::from_translate(-x0 as f32, -y0 as f32);
-        for s in &self.shapes {
+        for s in self.shapes.iter().filter(|s| !s.hidden) {
             draw_shape(&mut pm, s, self.scale, m, t);
         }
-        unsafe { present(self.hwnd, &pm, x0, y0) };
+        unsafe { present(self.hwnd, &pm, x0, y0, fade && !self.shown) };
+        self.shown = true;
     }
 }
 
@@ -780,8 +1026,9 @@ impl Drop for Overlay {
     }
 }
 
-/// Uploads a premultiplied RGBA pixmap to a layered window at (x, y).
-unsafe fn present(hwnd: HWND, pm: &Pixmap, x: i32, y: i32) {
+/// Uploads a premultiplied RGBA pixmap to a layered window at (x, y), fading it
+/// in if `fade`, otherwise showing it at full strength straight away.
+unsafe fn present(hwnd: HWND, pm: &Pixmap, x: i32, y: i32, fade: bool) {
     unsafe {
         let (w, h) = (pm.width() as i32, pm.height() as i32);
         let screen = GetDC(None);
@@ -811,7 +1058,7 @@ unsafe fn present(hwnd: HWND, pm: &Pixmap, x: i32, y: i32) {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: 0,
+                SourceConstantAlpha: if fade { 0 } else { 255 },
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let pos = POINT { x, y };
@@ -831,8 +1078,12 @@ unsafe fn present(hwnd: HWND, pm: &Pixmap, x: i32, y: i32) {
             SelectObject(mem, old);
             let _ = DeleteObject(dib.into());
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            let _ = SetTimer(Some(hwnd), FADE_TIMER, 15, None);
+            if fade {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let _ = SetTimer(Some(hwnd), FADE_TIMER, 15, None);
+            } else {
+                let _ = KillTimer(Some(hwnd), FADE_TIMER);
+            }
             let _ = SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
@@ -1104,6 +1355,7 @@ mod tests {
     fn math_labels_render() {
         let m = Rect { x: 0, y: 0, w: 900, h: 300 };
         let mk = |kind, x, y, label: &str| Shape {
+            hidden: false,
             kind,
             x,
             y,

@@ -491,6 +491,10 @@ impl Settings {
                 ui.add(egui::Slider::new(&mut self.cfg.appearance.text_size, 12.0..=20.0).step_by(0.5).suffix(" pt"));
             });
             sep(ui);
+            row(ui, "Blur strength", Some("How much of the screen shows through. 0 is solid."), |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.appearance.blur, 0.0..=100.0).step_by(5.0).suffix("%"));
+            });
+            sep(ui);
             row(ui, "Close when clicking elsewhere", Some("Stays open while something is drawn on screen"), |ui| {
                 toggle(ui, &mut self.cfg.appearance.dismiss_on_blur, accent);
             });

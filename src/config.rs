@@ -75,6 +75,8 @@ pub struct AppearanceCfg {
     pub saved_pos: Option<[i32; 2]>,
     /// Close the palette when you click elsewhere (kept open while drawings show).
     pub dismiss_on_blur: bool,
+    /// How much of the screen shows through the palette, 0 (solid) to 100.
+    pub blur: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -189,11 +191,12 @@ impl Default for AppearanceCfg {
     fn default() -> Self {
         Self {
             accent: "#0A84FF".into(),
-            width: 680.0,
+            width: 560.0,
             text_size: 15.0,
             position: "top".into(),
             saved_pos: None,
             dismiss_on_blur: true,
+            blur: 60.0,
         }
     }
 }
