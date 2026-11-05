@@ -10,7 +10,7 @@ pub const DESC: &str = "Operate apps on the user's desktop through agent-desktop
 Pass CLI arguments as an array, e.g. [\"list-apps\"], [\"snapshot\",\"--app\",\"Slack\",\"-i\",\"--compact\"], \
 [\"click\",\"@s8f3k2p9:e8\"], [\"type\",\"@s8f3k2p9:e3\",\"hello\"], [\"press\",\"ctrl+s\"], [\"launch\",\"Notepad\"]. \
 Every command returns a JSON envelope {ok, data|error}. Refs look like @<snapshot>:e<n> and belong to the snapshot \
-that produced them; after the UI changes (STALE_REF), snapshot again. Run `<command> --help` if unsure of flags. \
+that produced them; after the UI changes (STALE_REF), snapshot again. Run `<command> --help` if unsure of flags, or [\"skills\",\"get\",\"desktop\"] for the full guide. \
 Actions are shown to the user for approval first; if one is denied, stop and tell the user briefly.";
 
 pub fn schema() -> Value {
@@ -47,7 +47,18 @@ const READ_ONLY: &[&str] = &[
     "skills",
     "wait",
     "permissions",
+    "clipboard-get",
+    "trace",
 ];
+
+/// Oldest agent-desktop release screenbuddy is tested against; older installs get an Update button.
+pub const MIN_VERSION: &str = "1.1.0";
+
+/// True when `v` ("1.0.2") is older than [`MIN_VERSION`].
+pub fn outdated(v: &str) -> bool {
+    let parse = |s: &str| s.trim().trim_start_matches('v').split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+    parse(v) < parse(MIN_VERSION)
+}
 
 pub fn is_read_only(args: &[String]) -> bool {
     let Some(cmd) = args.iter().find(|a| !a.starts_with('-')) else {
@@ -244,6 +255,15 @@ mod tests {
         assert!(!is_read_only(&v(&["click", "@s1:e2"])));
         assert!(!is_read_only(&v(&["snapshot", "--headed"])));
         assert!(!is_read_only(&v(&["batch", "x"])));
+        assert!(is_read_only(&v(&["clipboard-get"])));
+        assert!(!is_read_only(&v(&["clipboard-set", "x"])));
+    }
+    #[test]
+    fn versions() {
+        assert!(outdated("1.0.2"));
+        assert!(outdated("0.11.1"));
+        assert!(!outdated("1.1.0"));
+        assert!(!outdated("1.2.0"));
     }
     #[test]
     fn parses() {

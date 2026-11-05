@@ -13,11 +13,11 @@ Native Windows screen assistant in Rust. Press a hotkey, ask about what's on scr
 | Ask about the monitor under the cursor | `Ctrl+Shift+Space` |
 | Drag-select a region, then ask | `Ctrl+Shift+R` (Esc or right-click cancels) |
 | Send · newline · cancel/close | `Enter` · `Shift+Enter` · `Esc` |
-| Browse / search history | `Ctrl+H` or the clock button in the palette |
+| Browse / search history | `Ctrl+H`, or the clock button when you hover the palette |
 | Push to talk (when Voice is on) | hold `Ctrl+Alt+Space`, or tap it / click the mic to start and stop |
 | Close the palette | press the hotkey again, `Esc`, or `✕` |
 
-The palette is a Spotlight-style bar, centered in the upper part of the screen. It grows into a card as the answer streams in. Clicking the screenshot thumbnail retakes the screenshot. Clicking elsewhere dismisses the palette, unless something is drawn on screen, so you can still click the thing it pointed at. The model only draws when pointing actually helps you find something. If the palette covers what it drew, the palette moves out of the way. Follow-up questions keep the conversation going.
+The palette is one pill, centered in the upper part of the screen: the screenshot, your question, and a send button that turns into stop during an answer. Attached context rises out of the top of the pill as tabs, and the answer pours down out of the bottom, all as one continuous surface. Behind it is a blurred copy of the screenshot taken when you opened the palette, so it doesn't change until the next capture; **Blur strength** in Settings sets how much shows through, and 0 makes it solid. Motion follows the Windows *Animation effects* setting. Attach, history and settings appear when you hover it. Clicking the screenshot thumbnail retakes the screenshot. Clicking elsewhere dismisses the palette, unless something is drawn on screen, so you can still click the thing it pointed at. The model only draws when pointing actually helps you find something. If the palette covers what it drew, the palette moves out of the way. Follow-up questions keep the conversation going.
 
 The tray menu has: edit settings, reload settings, browse history, open the history folder, start with Windows, and quit.
 
@@ -51,7 +51,7 @@ All three are in Settings → Drawing → Seeing your screen (`[vision]` `ui_tre
 
 ## Doing things for you (agent-desktop)
 
-If [agent-desktop](https://github.com/vercel-labs/agent-desktop) is installed, just ask screenbuddy to do something: "open Notepad and type hi", "turn on dark mode", "reply 'on my way' in Slack". There's an **Install** button in Settings → Agent (it runs `npm install -g agent-desktop`). It works through the accessibility tree, not pixels. Reading apps (`snapshot`, `list-apps`, …) never asks.
+If [agent-desktop](https://github.com/vercel-labs/agent-desktop) is installed, just ask screenbuddy to do something: "open Notepad and type hi", "turn on dark mode", "reply 'on my way' in Slack". There's an **Install** button in Settings → Agent (it runs `npm install -g agent-desktop@latest`; needs v1.1.0+, older installs get an **Update** button). It works through the accessibility tree, not pixels. Reading apps (`snapshot`, `list-apps`, …) never asks.
 
 Permission for actions (Settings → Agent):
 
@@ -63,7 +63,7 @@ While it acts, the agent has its own cursor (agent-desktop's cursor overlay) wit
 
 ## Settings
 
-Tray → **Settings…**, or the ⚙ in the palette. Sections: General (shortcuts with press-to-record, open at login, history, context), Model (provider, keys, model, effort, warm-process time), Appearance (accent, position, width, text size, close on blur), Drawing (on/off, color), Voice (push to talk, model), Agent (install, permission, cursor), Advanced (custom instructions, config file, log, reset). Changes save immediately.
+Tray → **Settings…**, or the ⚙ in the palette. Sections: General (shortcuts with press-to-record, open at login, history, context), Model (provider, keys, model, effort, warm-process time), Appearance (accent, position, width, text size, blur strength, close on blur), Drawing (on/off, color), Voice (push to talk, model), Agent (install, permission, cursor), Advanced (custom instructions, config file, log, reset). Changes save immediately.
 
 Everything is stored in `%APPDATA%\screenbuddy\config.toml`, which you can also edit by hand. It's re-read every time you press the hotkey.
 

@@ -291,10 +291,13 @@ impl Browser {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&e.title).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let turns = if e.turns == 1 { "1 turn".to_string() } else { format!("{} turns", e.turns) };
                             ui.label(RichText::new(format!("{} · {turns}", e.when)).color(dimmer).size(12.0));
+                            // The date goes first so a long title shortens instead of running into it.
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                ui.add(egui::Label::new(RichText::new(&e.title).strong()).truncate());
+                            });
                         });
                     });
                     if let Some(s) = e.snippet(&terms) {

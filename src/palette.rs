@@ -16,18 +16,42 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-// Logical sizes.
-const BAR_H: f32 = 60.0;
-const MAX_H: f32 = 560.0;
+// Logical sizes. The window never changes size: it reserves room for the tabs
+// above the pill and the tallest answer below it, with a little margin, and a
+// window region keeps everything the surface isn't using click-through.
+const PILL_H: f32 = 52.0;
+const PILL_RADIUS: f32 = 26.0;
+const MAX_H: f32 = 480.0;
+/// Padding of the answer inside the surface.
 const PAD: f32 = 18.0;
-/// Height of the context-chip row under the bar.
-const CHIPS_H: f32 = 32.0;
+/// Transparent margin, so the surface's edge isn't cut off.
+const SIDE: f32 = 4.0;
+const BOTTOM: f32 = 4.0;
+const TOP: f32 = 12.0;
+const TAB_H: f32 = 30.0;
+/// A tab's shape reaches this far past its chip.
+const TAB_LIP: f32 = 4.0;
+/// The pill's top edge, in window coordinates.
+const PILL_TOP: f32 = TOP + TAB_H + TAB_LIP * 2.0;
+const WINDOW_H: f32 = PILL_TOP + MAX_H + BOTTOM;
+/// Most tabs shown; the rest are summed up in a last one.
+const MAX_TABS: usize = 4;
+/// Where the tabs start, measured from the pill's left edge.
+const TAB_INDENT: f32 = 28.0;
+const CHIP_H: f32 = 38.0;
+const ICON_H: f32 = 30.0;
 
-// Palette (dark, quiet, one accent).
-const TINT_SOLID: Color32 = Color32::from_rgb(30, 30, 32);
-const TEXT: Color32 = Color32::from_rgb(236, 236, 240);
-const TEXT_2: Color32 = Color32::from_rgb(152, 152, 160);
-const TEXT_3: Color32 = Color32::from_rgb(105, 105, 112);
+// Tab motion.
+const TAB_RISE: f32 = 0.22;
+const TAB_SINK: f32 = 0.14;
+const TAB_TEXT_DELAY: f32 = 0.12;
+const TAB_TEXT: f32 = 0.12;
+/// A plain fade replaces the movement under reduced motion.
+const REDUCED_FADE: f32 = 0.12;
+
+const TEXT: Color32 = crate::surface::TEXT;
+const TEXT_2: Color32 = crate::surface::TEXT_2;
+const SURFACE: Color32 = crate::surface::SURFACE;
 const HAIRLINE: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
 const ERROR: Color32 = Color32::from_rgb(255, 128, 118);
 
@@ -53,6 +77,10 @@ pub struct Start {
     pub history: bool,
     /// Start recording right away (push-to-talk hotkey).
     pub voice: bool,
+    /// Blurred screenshot behind the surface; None for a solid surface.
+    pub backdrop: Option<Arc<crate::surface::Backdrop>>,
+    /// Selected text still being read; becomes a chip before the palette shows.
+    pub selection: Option<context::PendingSelection>,
 }
 
 /// A user-facing error: a short sentence, an optional action, and the raw detail.
@@ -111,8 +139,23 @@ pub struct Palette {
     overlay: Option<Overlay>,
     hwnd: Option<HWND>,
     frames: u32,
-    height: f32,
+    /// The surface's height, following the measured content.
+    pour: crate::surface::Smooth,
+    /// A narrower column that gets there first, so the surface pours.
+    lead: crate::surface::Smooth,
     body_h: f32,
+    /// None if the shader didn't build; the surface is then plain rectangles.
+    renderer: Option<Arc<crate::surface::Renderer>>,
+    backdrop: Option<Arc<crate::surface::Backdrop>>,
+    selection: Option<context::PendingSelection>,
+    reduce: bool,
+    /// Window pixels per point right now.
+    scale: f32,
+    last_time: f64,
+    tabs: Vec<Tab>,
+    buds: Vec<Bud>,
+    /// The window region now set: (top, bottom) in pixels.
+    region: Option<(i32, i32)>,
     was_focused: bool,
     md: egui_commonmark::CommonMarkCache,
     math: std::rc::Rc<std::cell::RefCell<crate::math::MathCache>>,
@@ -155,16 +198,47 @@ pub struct Palette {
     send_when_ready: bool,
     /// Give the input focus back on the next frame.
     refocus: bool,
+    /// Move the input's cursor to the end of the text on the next frame.
+    cursor_end: bool,
+    /// Recent mic levels for the recording waveform, oldest first.
+    wave: Vec<f32>,
+    wave_t: f64,
+}
+
+/// A context tab's motion. It outlives its chip by the time it takes to sink.
+struct Tab {
+    key: String,
+    born: f64,
+    gone: Option<f64>,
+    x: crate::surface::Smooth,
+    width: f32,
+    /// Index into `chips`; None for the "Attaching…" tab and after removal.
+    chip: Option<usize>,
+}
+
+/// The droplet as it breaks away from the surface, before the overlay takes over.
+struct Bud {
+    from: egui::Pos2,
+    to: egui::Pos2,
+    start: f64,
 }
 
 /// Opens the palette and blocks until it closes.
 #[allow(dead_code)]
 pub fn run(cfg: Config, cap: Capture, notice: Option<String>) -> Outcome {
-    run_with(cfg, cap, notice, Start::default())
+    run_with(cfg, move || Ok(cap), notice, Start::default())
 }
 
 /// Like `run`, with extra context or a different starting view.
-pub fn run_with(cfg: Config, cap: Capture, notice: Option<String>, start: Start) -> Outcome {
+///
+/// `cap` hands over the screenshot once the window exists, so it can still be
+/// encoding while the window is being made.
+pub fn run_with(
+    cfg: Config,
+    cap: impl FnOnce() -> anyhow::Result<Capture> + 'static,
+    notice: Option<String>,
+    start: Start,
+) -> Outcome {
     let outcome = Arc::new(std::sync::Mutex::new(Outcome::Closed));
     let accent = accent_of(&cfg);
     let text_size = cfg.appearance.text_size.clamp(11.0, 22.0);
@@ -173,7 +247,7 @@ pub fn run_with(cfg: Config, cap: Capture, notice: Option<String>, start: Start)
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("screenbuddy")
-            .with_inner_size([width, BAR_H])
+            .with_inner_size([width + SIDE * 2.0, WINDOW_H])
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
@@ -186,6 +260,7 @@ pub fn run_with(cfg: Config, cap: Capture, notice: Option<String>, start: Start)
         "screenbuddy",
         options,
         Box::new(move |cc| {
+            let cap = cap().map_err(|e| format!("Screenshot encoding failed: {e}"))?;
             setup_style(&cc.egui_ctx, accent, text_size);
             win::set_ctx(Some(cc.egui_ctx.clone()));
             Ok(Box::new(Palette::new(cfg, cap, notice, out2, start)))
@@ -254,7 +329,7 @@ pub fn setup_style(ctx: &egui::Context, accent: Color32, text_size: f32) {
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 7.0);
         s.text_styles = [
-            (TextStyle::Heading, FontId::proportional(text_size + 4.0)),
+            (TextStyle::Heading, FontId::proportional(text_size + 1.0)),
             (TextStyle::Body, FontId::proportional(text_size)),
             (TextStyle::Button, FontId::proportional(14.0)),
             (TextStyle::Small, FontId::proportional(12.5)),
@@ -284,6 +359,20 @@ pub fn apply_chrome(hwnd: HWND) {
             4,
         );
     }
+}
+
+/// The surface draws its own corners, and Windows shouldn't add a shadow either.
+fn plain_chrome(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::*;
+    let square = DWMWCP_DONOTROUND;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&square as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            4,
+        )
+    };
 }
 
 fn thumbnail(ctx: &egui::Context, jpeg: &[u8]) -> Option<egui::TextureHandle> {
@@ -335,8 +424,18 @@ impl Palette {
             overlay: None,
             hwnd: None,
             frames: 0,
-            height: BAR_H,
+            pour: crate::surface::Smooth::new(PILL_H),
+            lead: crate::surface::Smooth::new(PILL_H),
             body_h: 0.0,
+            renderer: None,
+            backdrop: start.backdrop,
+            selection: start.selection,
+            reduce: crate::surface::reduced_motion(),
+            scale: 1.0,
+            last_time: 0.0,
+            tabs: Vec::new(),
+            buds: Vec::new(),
+            region: None,
             was_focused: false,
             md: Default::default(),
             math: Default::default(),
@@ -365,8 +464,12 @@ impl Palette {
             attaching: Vec::new(),
             send_when_ready: false,
             refocus: false,
+            cursor_end: false,
+            wave: Vec::new(),
+            wave_t: 0.0,
         }
     }
+
 
     fn busy(&self) -> bool {
         self.rx.is_some()
@@ -444,6 +547,15 @@ impl Palette {
         }
     }
 
+    /// Stops the answer in progress. The worker notices the flag and hands the
+    /// conversation back via Done.
+    fn stop_turn(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(x) = self.exchanges.last_mut() {
+            x.error = Some(friendly("cancelled"));
+        }
+    }
+
     /// Asks the last question again after it failed or was stopped. The
     /// worker already rolled the conversation back to before that question.
     fn retry(&mut self, ctx: &egui::Context) {
@@ -462,8 +574,16 @@ impl Palette {
         if self.busy() {
             return;
         }
-        match capture::grab_monitor_under_cursor().and_then(|shot| capture::encode(&shot, None)) {
+        let shot = capture::grab_monitor_under_cursor();
+        let backdrop = shot.as_ref().ok().and_then(|s| {
+            crate::surface::Backdrop::new(s, self.cfg.appearance.blur)
+        });
+        match shot.and_then(|shot| capture::encode(&shot, None)) {
             Ok(mut cap) => {
+                self.backdrop = backdrop.clone();
+                if let Some(r) = &self.renderer {
+                    r.set_backdrop(backdrop);
+                }
                 cap.cursor = self.cap.cursor;
                 crate::vision::set_capture(&cap, &self.cfg);
                 self.save_history();
@@ -498,15 +618,52 @@ impl Palette {
             self.overlay = Some(ov);
         }
         let ov = self.overlay.as_mut().unwrap();
-        ov.apply(call);
+        ov.apply(call, !self.reduce);
         let drawn = ov.drawn_bounds();
         self.dodge(drawn);
         self.raise();
+        self.launch_droplets();
         Ok(format!("Drew {n} annotation(s) on the user's screen."))
     }
 
-    /// Moves the palette out of the way if it covers the annotations: tries
-    /// the four corners of the work area and picks the least-overlapping one.
+    /// Window pixels per point, as this monitor uses them.
+    fn ppp(&self) -> f32 {
+        self.scale
+    }
+
+    /// Top-left of the window in virtual-screen pixels.
+    fn window_pos(&self) -> (i32, i32) {
+        let mut r = RECT::default();
+        if let Some(h) = self.hwnd {
+            let _ = unsafe { GetWindowRect(h, &mut r) };
+        }
+        (r.left, r.top)
+    }
+
+    /// Lets droplets go toward whatever was just drawn, each from a bud at the
+    /// edge of the surface nearest its target.
+    fn launch_droplets(&mut self) {
+        let (wx, wy) = self.window_pos();
+        let ppp = self.ppp();
+        let left = wx as f32 + SIDE * ppp;
+        let top = wy as f32 + PILL_TOP * ppp;
+        let surface = (left, top, left + self.width * ppp, top + self.pour.value * ppp);
+        let now = self.last_time;
+        let Some(ov) = self.overlay.as_mut() else { return };
+        for (edge, to, wait) in ov.launch(surface) {
+            let pt = |p: (f32, f32)| egui::pos2((p.0 - wx as f32) / ppp, (p.1 - wy as f32) / ppp);
+            let (edge, to) = (pt(edge), pt(to));
+            let out = (to - edge).normalized();
+            self.buds.push(Bud {
+                from: edge - out * 14.0,
+                to: edge + out * 8.0,
+                start: now + wait as f64,
+            });
+        }
+    }
+
+    /// Moves the palette out of the way if it covers the annotations: tries the
+    /// four corners of the work area and picks the least-overlapping one.
     fn dodge(&self, drawn: Option<capture::Rect>) {
         let (Some(h), Some(d)) = (self.hwnd, drawn) else {
             return;
@@ -516,50 +673,41 @@ impl Palette {
             let h = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
             (w.max(0) as i64) * (h.max(0) as i64)
         };
-        unsafe {
-            let mut r = RECT::default();
-            if GetWindowRect(h, &mut r).is_err() {
-                return;
-            }
-            // Account for the height the card will grow to.
-            let mut cur = capture::Rect::from_win(r);
-            cur.h = cur.h.max((MAX_H * self.cap.monitor.scale) as i32);
-            if overlap(cur, d) == 0 {
-                return;
-            }
-            let wa = self.cap.monitor.work;
-            let m = (16.0 * self.cap.monitor.scale) as i32;
-            let corners = [
-                (wa.x + wa.w - cur.w - m, wa.y + wa.h - cur.h - m),
-                (wa.x + m, wa.y + wa.h - cur.h - m),
-                (wa.x + wa.w - cur.w - m, wa.y + m),
-                (wa.x + m, wa.y + m),
-            ];
-            let best = corners
-                .iter()
-                .map(|&(x, y)| {
-                    (
-                        overlap(
-                            capture::Rect {
-                                x,
-                                y,
-                                w: cur.w,
-                                h: cur.h,
-                            },
-                            d,
-                        ),
-                        x,
-                        y,
-                    )
-                })
-                .min_by_key(|c| c.0)
-                .unwrap();
-            if best.0 < overlap(cur, d) {
+        let s = self.ppp();
+        let (off_x, off_y) = ((SIDE * s) as i32, (PILL_TOP * s) as i32);
+        let (wx, wy) = self.window_pos();
+        // The surface, not the window: most of the window is see-through. Account
+        // for the height the surface can grow to.
+        let cur = capture::Rect {
+            x: wx + off_x,
+            y: wy + off_y,
+            w: (self.width * s) as i32,
+            h: (MAX_H * s) as i32,
+        };
+        if overlap(cur, d) == 0 {
+            return;
+        }
+        let wa = self.cap.monitor.work;
+        let m = (16.0 * s) as i32;
+        let top = wa.y + ((PILL_TOP - TOP) * s) as i32;
+        let corners = [
+            (wa.x + wa.w - cur.w - m, wa.y + wa.h - cur.h - m),
+            (wa.x + m, wa.y + wa.h - cur.h - m),
+            (wa.x + wa.w - cur.w - m, top),
+            (wa.x + m, top),
+        ];
+        let best = corners
+            .iter()
+            .map(|&(x, y)| (overlap(capture::Rect { x, y, w: cur.w, h: cur.h }, d), x, y))
+            .min_by_key(|c| c.0)
+            .unwrap();
+        if best.0 < overlap(cur, d) {
+            unsafe {
                 let _ = SetWindowPos(
                     h,
                     Some(HWND_TOPMOST),
-                    best.1,
-                    best.2,
+                    best.1 - off_x,
+                    best.2 - off_y,
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOACTIVATE,
@@ -822,7 +970,15 @@ impl Palette {
     /// Places the bar Spotlight-style: centered, upper third of the monitor
     /// the user is working on.
     fn first_frame(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
+        // Before anything can take focus away from the app it's reading.
+        if let Some(chip) = self.selection.take().and_then(|s| s.wait()) {
+            self.chips.insert(0, chip);
+        }
         self.thumb = thumbnail(ctx, &self.jpeg);
+        let opacity = crate::surface::glass_opacity(self.cfg.appearance.blur);
+        self.renderer = frame
+            .gl()
+            .and_then(|gl| crate::surface::Renderer::new(gl, self.backdrop.clone(), opacity));
         let Ok(handle) = frame.window_handle() else {
             return;
         };
@@ -831,23 +987,23 @@ impl Palette {
         };
         let hwnd = HWND(h.hwnd.get() as *mut _);
         self.hwnd = Some(hwnd);
-        apply_chrome(hwnd);
+        plain_chrome(hwnd);
         unsafe {
             if win::exclude_from_capture() {
                 let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
             }
-            let mut r = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut r);
-            let w = r.right - r.left;
             let work = capture::monitor_at(self.cap.cursor.0, self.cap.cursor.1).work;
             let s = self.cap.monitor.scale;
+            // (x, y) below place the pill; the window sits around it.
+            let w = (self.width * s) as i32;
             let (x, y) = match self.cfg.appearance.position.as_str() {
                 "cursor" => {
                     let gap = (16.0 * s) as i32;
                     let max_h = (MAX_H * s) as i32;
                     let (cx, cy) = self.cap.cursor;
                     let x = (cx - w / 2).clamp(work.x, (work.x + work.w - w).max(work.x));
-                    let y = if cy + gap + max_h <= work.y + work.h { cy + gap } else { (cy - gap - max_h).max(work.y) };
+                    let top = work.y + ((PILL_TOP - TOP) * s) as i32;
+                    let y = if cy + gap + max_h <= work.y + work.h { cy + gap } else { (cy - gap - max_h).max(top) };
                     (x, y)
                 }
                 "center" => (
@@ -857,7 +1013,7 @@ impl Palette {
                 "last" if self.cfg.appearance.saved_pos.is_some_and(on_screen) => {
                     let [x, y] = self.cfg.appearance.saved_pos.unwrap();
                     let wa = capture::monitor_at(x, y).work;
-                    let h = (BAR_H * s) as i32;
+                    let h = (PILL_H * s) as i32;
                     (
                         x.clamp(wa.x, (wa.x + wa.w - w).max(wa.x)),
                         y.clamp(wa.y, (wa.y + wa.h - h).max(wa.y)),
@@ -868,6 +1024,7 @@ impl Palette {
                     work.y + (work.h as f32 * 0.2) as i32,
                 ),
             };
+            let (x, y) = (x - (SIDE * s) as i32, y - (PILL_TOP * s) as i32);
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE);
             let _ = SetForegroundWindow(hwnd);
         }
@@ -900,34 +1057,35 @@ impl Palette {
             return;
         }
         cfg.appearance.position = "last".into();
-        cfg.appearance.saved_pos = Some([r.left, r.top]);
+        // The pill's corner, not the window's, which has room around it.
+        let s = self.ppp();
+        cfg.appearance.saved_pos = Some([r.left + (SIDE * s) as i32, r.top + (PILL_TOP * s) as i32]);
         if let Err(e) = config::save(&cfg) {
             config::log(&format!("saving palette position failed: {e}"));
         }
     }
 
-    /// Keeps the bottom edge on screen as the card grows (e.g. after it was
+    /// Keeps the bottom of the surface on screen as it grows (e.g. after it was
     /// dragged near the bottom of the monitor).
-    fn keep_on_screen(&self, ctx: &egui::Context, height: f32) {
+    fn keep_on_screen(&self, height: f32) {
         let Some(h) = self.hwnd else {
             return;
         };
-        unsafe {
-            let mut r = RECT::default();
-            if GetWindowRect(h, &mut r).is_err() {
-                return;
-            }
-            let wa = capture::monitor_at((r.left + r.right) / 2, r.top).work;
-            let px = (height * ctx.pixels_per_point()).round() as i32;
-            let bottom = wa.y + wa.h;
-            if r.top + px > bottom {
-                let y = (bottom - px).max(wa.y);
-                if y != r.top {
+        let s = self.ppp();
+        let (wx, wy) = self.window_pos();
+        let top = wy + (PILL_TOP * s) as i32;
+        let wa = capture::monitor_at(wx + (SIDE * s) as i32, top).work;
+        let px = (height * s).round() as i32;
+        let bottom = wa.y + wa.h;
+        if top + px > bottom {
+            let new_top = (bottom - px).max(wa.y);
+            if new_top != top {
+                unsafe {
                     let _ = SetWindowPos(
                         h,
                         Some(HWND_TOPMOST),
-                        r.left,
-                        y,
+                        wx,
+                        new_top - (PILL_TOP * s) as i32,
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
@@ -1038,26 +1196,26 @@ impl Palette {
         let mut clicked = None;
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, true])
-            .max_height(MAX_H - self.top_h() - 24.0)
+            .max_height(MAX_H - PILL_H - 8.0)
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 let items = menu.filtered(&q);
                 if items.is_empty() {
-                    ui.label(RichText::new("No matches").color(TEXT_3));
+                    ui.label(RichText::new("No matches").color(TEXT_2));
                 }
                 for (i, it) in items.iter().enumerate() {
                     let fill = if i == selected { Color32::from_white_alpha(14) } else { Color32::TRANSPARENT };
                     let r = egui::Frame::new()
                         .fill(fill)
-                        .corner_radius(6)
-                        .inner_margin(Margin::symmetric(8, 5))
+                        .corner_radius(10)
+                        .inner_margin(Margin::symmetric(10, 6))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 let name = RichText::new(format!("@{}", it.name)).strong();
-                                ui.label(if it.disabled { name.color(TEXT_3) } else { name.color(accent) });
+                                ui.label(if it.disabled { name.color(TEXT_2) } else { name.color(accent) });
                                 ui.add_space(6.0);
-                                ui.label(RichText::new(&it.desc).color(if it.disabled { TEXT_3 } else { TEXT_2 }));
+                                ui.label(RichText::new(&it.desc).color(TEXT_2));
                             });
                         })
                         .response
@@ -1126,15 +1284,18 @@ impl Palette {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if focused {
             self.was_focused = true;
-        } else if self.was_focused
-            && self.cfg.appearance.dismiss_on_blur
+        } else if self.was_focused && self.may_dismiss() {
+            self.close(ctx);
+        }
+    }
+
+    /// True when clicking away should close the palette right now.
+    fn may_dismiss(&self) -> bool {
+        self.cfg.appearance.dismiss_on_blur
             && !self.busy()
             && self.rec.is_none()
             && self.transcribing.is_none()
             && self.overlay.as_ref().is_none_or(|o| o.is_empty())
-        {
-            self.close(ctx);
-        }
     }
 
     fn start_drag(&mut self, ctx: &egui::Context) {
@@ -1142,170 +1303,465 @@ impl Palette {
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 
-    /// Six-dot handle at the left of the bar: grab it to move the palette.
-    fn grip(&mut self, ui: &mut egui::Ui) {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 28.0), egui::Sense::drag());
-        let resp = resp
-            .on_hover_cursor(egui::CursorIcon::Grab)
-            .on_hover_text("Drag to move");
-        let col = if resp.hovered() || resp.dragged() {
-            TEXT_2
-        } else {
-            TEXT_3
-        };
-        let c = rect.center();
-        for dx in [-2.5, 2.5] {
-            for dy in [-5.0, 0.0, 5.0] {
-                ui.painter().circle_filled(c + egui::vec2(dx, dy), 1.3, col);
-            }
-        }
+    /// The chip at the left of the pill: what the question is about. Click to
+    /// retake the screenshot. It says Agent while waiting on an approval, and
+    /// shows a dot loader during an answer.
+    fn screen_chip(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy();
+        let agent = self.pending.is_some();
+        let label = if agent { "Agent" } else { "Screen" };
+        let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), TEXT);
+        let pic = 24.0;
+        let size = egui::vec2(7.0 + pic + 7.0 + galley.size().x + 12.0, CHIP_H);
+        let idle = !busy && !agent;
+        let sense = if idle { egui::Sense::click_and_drag() } else { egui::Sense::drag() };
+        let (rect, resp) = ui.allocate_exact_size(size, sense);
         if resp.drag_started() {
             self.start_drag(ui.ctx());
         }
+        let fill = if resp.hovered() && idle { 40 } else { 28 };
+        ui.painter().rect_filled(rect, CHIP_H / 2.0, Color32::from_white_alpha(fill));
+        let spot = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 7.0 + pic / 2.0, rect.center().y),
+            egui::vec2(pic, pic),
+        );
+        if busy {
+            dot_loader(ui, spot.center(), TEXT, self.reduce);
+        } else if agent {
+            let c = spot.center();
+            let p = [c + egui::vec2(-5.0, -6.0), c + egui::vec2(6.0, -1.0), c + egui::vec2(1.0, 1.0), c + egui::vec2(-1.0, 6.0)];
+            ui.painter().add(egui::Shape::closed_line(p.to_vec(), egui::Stroke::new(1.6, TEXT)));
+        } else if let Some(t) = &self.thumb {
+            let tex = t.size_vec2();
+            let side = tex.x.min(tex.y);
+            let uv = egui::Rect::from_center_size(
+                egui::pos2(0.5, 0.5),
+                egui::vec2(side / tex.x, side / tex.y),
+            );
+            egui::Image::new((t.id(), spot.size()))
+                .uv(uv)
+                .corner_radius(pic / 2.0)
+                .paint_at(ui, spot);
+        }
+        let text_pos = egui::pos2(spot.right() + 7.0, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(text_pos, galley, TEXT);
+        if idle {
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let clicked = resp.clicked();
+            resp.on_hover_text("Screenshot attached · click to retake · drag to move");
+            if clicked {
+                self.recapture(ui.ctx());
+            }
+        }
     }
 
-    fn bar(&mut self, ui: &mut egui::Ui, enter: bool) {
-        ui.horizontal(|ui| {
-            ui.set_height(BAR_H - 2.0 * 10.0);
-            self.grip(ui);
-            // Screenshot chip: what the question is about. Click to retake.
-            if let Some(t) = &self.thumb {
-                let size = t.size_vec2();
-                let h = 30.0;
-                let w = (size.x / size.y * h).clamp(30.0, 54.0);
-                let img = egui::Image::new((t.id(), egui::vec2(w, h)))
-                    .corner_radius(5)
-                    .sense(egui::Sense::click());
-                let r = ui
-                    .add(img)
-                    .on_hover_text("Screenshot attached · click to retake");
-                ui.painter().rect_stroke(
-                    r.rect,
-                    5,
-                    egui::Stroke::new(1.0, HAIRLINE),
-                    egui::StrokeKind::Outside,
-                );
-                if r.clicked() {
-                    self.recapture(ui.ctx());
+    /// Mic levels as a row of dots that swell with your voice, newest on the
+    /// right, in place of the text field while recording.
+    fn waveform(&mut self, ui: &mut egui::Ui) {
+        let now = ui.input(|i| i.time);
+        if let Some(r) = &self.rec {
+            if now - self.wave_t >= 0.05 {
+                self.wave_t = now;
+                self.wave.push(r.level());
+                if self.wave.len() > 256 {
+                    self.wave.remove(0);
                 }
-                ui.add_space(4.0);
             }
-            let hint = if self.rec.is_some() {
-                "Listening…"
-            } else if self.transcribing.is_some() {
-                "Transcribing…"
-            } else if self.browser.is_some() {
-                "Search history"
-            } else if self.exchanges.is_empty() {
-                "Ask about your screen"
-            } else {
-                "Ask a follow-up"
-            };
-            let edit = egui::TextEdit::singleline(&mut self.input)
-                .hint_text(RichText::new(hint).color(TEXT_3))
-                .font(TextStyle::Heading)
-                .frame(egui::Frame::NONE)
-                .desired_width(f32::INFINITY);
-            let voice_on = self.cfg.voice.enabled;
-            let gear_w = 26.0 + 34.0 + if voice_on { 34.0 } else { 0.0 };
-            let resp = ui.add_sized([ui.available_width() - gear_w, 28.0], edit);
-            let hist = icon_button(ui, Icon::History, self.browser.is_some(), self.accent)
+        }
+        let size = egui::vec2(ui.available_width(), CHIP_H);
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let p = ui.painter();
+        let y = rect.center().y;
+        let step = 5.0;
+        let n = (rect.width() / step) as usize;
+        for i in 0..n {
+            let x = rect.right() - 2.0 - i as f32 * step;
+            let level = self.wave.iter().rev().nth(i).copied();
+            match level {
+                Some(l) if l > 0.02 => {
+                    let h = 3.0 + l.clamp(0.0, 1.0) * (CHIP_H - 14.0);
+                    let bar = egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(2.5, h));
+                    p.rect_filled(bar, 1.25, TEXT);
+                }
+                Some(_) => {
+                    p.circle_filled(egui::pos2(x, y), 1.25, TEXT_2);
+                }
+                None => {
+                    p.circle_filled(egui::pos2(x, y), 1.0, TEXT_2.gamma_multiply(0.5));
+                }
+            }
+        }
+    }
+
+    /// The text field, or the waveform while recording.
+    fn input_field(&mut self, ui: &mut egui::Ui, enter: bool) {
+        if self.rec.is_some() {
+            self.refocus = true; // back to the text when recording ends
+            self.waveform(ui);
+            return;
+        }
+        self.wave.clear();
+        let hint = if self.transcribing.is_some() {
+            "Transcribing…"
+        } else if self.browser.is_some() {
+            "Search history"
+        } else if self.exchanges.is_empty() {
+            "Ask about your screen"
+        } else {
+            "Ask a follow-up"
+        };
+        let edit = egui::TextEdit::singleline(&mut self.input)
+            .id_salt("composer")
+            .hint_text(RichText::new(hint).color(TEXT_2).text_style(TextStyle::Heading))
+            .font(TextStyle::Heading)
+            .frame(egui::Frame::NONE)
+            .align(egui::Align2::LEFT_CENTER)
+            .desired_width(f32::INFINITY);
+        let resp = ui.add_sized([ui.available_width(), ICON_H], edit);
+        if std::mem::take(&mut self.cursor_end) {
+            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
+                let end = egui::text::CCursor::new(self.input.chars().count());
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+                st.store(ui.ctx(), resp.id);
+            }
+        }
+        if self.refocus {
+            self.refocus = false;
+            resp.request_focus();
+        }
+        if !resp.has_focus() && self.frames < 8 {
+            resp.request_focus();
+        }
+        if enter && self.browser.is_none() {
+            self.send(ui.ctx());
+            resp.request_focus();
+        }
+    }
+
+    /// Attach, history and settings, shown only while the pointer is over the
+    /// palette so the bar stays quiet. Added right to left.
+    fn quiet_tools(&mut self, ui: &mut egui::Ui) {
+        let browsing = self.browser.is_some();
+        let over = ui.input(|i| i.pointer.hover_pos().is_some());
+        let shown = ui.ctx().animate_bool(ui.scope_id().with("tools"), over || browsing);
+        ui.scope(|ui| {
+            ui.set_opacity(shown);
+            let gear = icon_button(ui, Icon::Gear, false, self.accent).on_hover_text("Settings");
+            if gear.clicked() {
+                self.open_settings(ui.ctx());
+            }
+            let hist = icon_button(ui, Icon::History, browsing, self.accent)
                 .on_hover_text("History (Ctrl+H)");
             if hist.clicked() {
                 self.toggle_browser();
             }
-            if voice_on {
-                let tip = if self.rec.is_some() {
-                    "Stop and transcribe"
-                } else {
-                    "Speak your question"
-                };
-                let level = self.rec.as_ref().map(|r| r.level());
-                let mic = icon_button(ui, Icon::Mic(level), self.rec.is_some(), self.accent)
-                    .on_hover_text(format!("{tip} (hold {})", self.cfg.voice.hotkey));
-                if mic.clicked() {
-                    self.mic(ui.ctx(), false);
+            if browsing || self.rec.is_some() {
+                return;
+            }
+            let add = icon_button(ui, Icon::Plus, false, self.accent)
+                .on_hover_text("Attach a file, page, or the clipboard (@)");
+            if add.clicked() {
+                if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) {
+                    self.input.push(' ');
                 }
-            }
-            let gear = ui
-                .add(egui::Button::new(RichText::new("⚙").color(TEXT_3).size(16.0)).frame(false))
-                .on_hover_text("Settings");
-            if gear.clicked() {
-                self.open_settings(ui.ctx());
-            }
-            if self.refocus {
-                self.refocus = false;
-                resp.request_focus();
-            }
-            if !resp.has_focus() && self.frames < 8 {
-                resp.request_focus();
-            }
-            if enter && self.browser.is_none() {
-                self.send(ui.ctx());
-                resp.request_focus();
+                self.input.push('@');
+                self.refocus = true;
+                self.cursor_end = true;
             }
         });
-        if !self.chips.is_empty() || !self.attaching.is_empty() {
-            self.chip_row(ui);
+    }
+
+    /// White send arrow; a stop square during an answer or a recording.
+    fn send_button(&mut self, ui: &mut egui::Ui) {
+        let recording = self.rec.is_some();
+        let stop = self.busy() || recording;
+        let enabled = stop
+            || (self.browser.is_none()
+                && self.transcribing.is_none()
+                && !self.input.trim().is_empty());
+        let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(CHIP_H, CHIP_H), sense);
+        let c = rect.center();
+        let p = ui.painter();
+        let (fill, fg) = if enabled {
+            let fill = if resp.hovered() { Color32::from_gray(214) } else { Color32::WHITE };
+            (fill, SURFACE)
+        } else {
+            (Color32::from_white_alpha(28), TEXT_2)
+        };
+        p.circle_filled(c, CHIP_H / 2.0, fill);
+        if stop {
+            p.rect_filled(egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0)), 2, fg);
+        } else {
+            let st = egui::Stroke::new(1.9, fg);
+            let top = c + egui::vec2(0.0, -5.5);
+            p.line_segment([top, c + egui::vec2(0.0, 5.5)], st);
+            p.line_segment([top, top + egui::vec2(-4.5, 4.5)], st);
+            p.line_segment([top, top + egui::vec2(4.5, 4.5)], st);
+        }
+        if enabled && resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let clicked = resp.clicked();
+        resp.on_hover_text(if recording {
+            "Stop and transcribe (Enter)"
+        } else if stop {
+            "Stop (Esc)"
+        } else {
+            "Send (Enter)"
+        });
+        if clicked {
+            if recording {
+                self.stop_rec();
+            } else if stop {
+                self.stop_turn();
+            } else {
+                self.send(ui.ctx());
+                self.refocus = true;
+            }
         }
     }
 
-    /// Context chips: what goes along with the next question. ✕ removes one.
-    fn chip_row(&mut self, ui: &mut egui::Ui) {
-        let mut remove = None;
-        ui.horizontal(|ui| {
-            ui.set_height(CHIPS_H - 8.0);
-            ui.add_space(2.0);
-            for (i, c) in self.chips.iter().enumerate() {
-                egui::Frame::new()
-                    .fill(Color32::from_white_alpha(14))
-                    .corner_radius(6)
-                    .inner_margin(Margin { left: 8, right: 4, top: 2, bottom: 2 })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let mark = if c.image.is_some() { "▣" } else if c.label == "Selected text" { "❝" } else { "▤" };
-                        let label: String = if c.label.chars().count() > 28 {
-                            format!("{}…", c.label.chars().take(27).collect::<String>())
-                        } else {
-                            c.label.clone()
-                        };
-                        ui.label(RichText::new(format!("{mark} {label}")).size(12.5).color(TEXT_2))
-                            .on_hover_text(&c.hover);
-                        if ui
-                            .add(egui::Button::new(RichText::new("✕").size(11.0).color(TEXT_3)).frame(false))
-                            .on_hover_text("Remove")
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
-                    });
-            }
-            if !self.attaching.is_empty() {
+    /// The pill: chip, text, tools, send.
+    fn bar(&mut self, ui: &mut egui::Ui, enter: bool) {
+        ui.horizontal_centered(|ui| {
+            self.screen_chip(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                self.send_button(ui);
+                if self.cfg.voice.enabled {
+                    let tip = if self.rec.is_some() {
+                        "Stop and transcribe"
+                    } else {
+                        "Speak your question"
+                    };
+                    let level = self.rec.as_ref().map(|r| r.level());
+                    let mic = icon_button(ui, Icon::Mic(level), self.rec.is_some(), self.accent)
+                        .on_hover_text(format!("{tip} (hold {})", self.cfg.voice.hotkey));
+                    if mic.clicked() {
+                        self.mic(ui.ctx(), false);
+                    }
+                }
+                self.quiet_tools(ui);
                 ui.add_space(4.0);
-                ui.label(RichText::new("Attaching…").size(12.5).color(TEXT_3));
-            }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    self.input_field(ui, enter);
+                });
+            });
         });
+    }
+
+    /// Matches the tabs to the chips: new chips rise, removed chips start to sink.
+    fn reconcile_tabs(&mut self, now: f64, pill_left: f32) {
+        let mut want: Vec<(String, Option<usize>)> =
+            self.chips.iter().enumerate().map(|(i, c)| (c.label.clone(), Some(i))).collect();
+        if !self.attaching.is_empty() {
+            want.push(("Attaching…".to_string(), None));
+        }
+        let mut fresh = 0;
+        let mut open: Vec<usize> = (0..self.tabs.len()).filter(|&i| self.tabs[i].gone.is_none()).collect();
+        for (key, chip) in &want {
+            if let Some(at) = open.iter().position(|&i| &self.tabs[i].key == key) {
+                self.tabs[open.remove(at)].chip = *chip;
+            } else {
+                // Tabs already there when the hotkey opens the palette just appear:
+                // this runs on nearly every use, so it shouldn't make you wait.
+                let born = if self.frames <= 1 { f64::MIN } else { now + crate::surface::stagger(fresh) as f64 };
+                fresh += 1;
+                self.tabs.push(Tab {
+                    key: key.clone(),
+                    born,
+                    gone: None,
+                    x: crate::surface::Smooth::new(pill_left + TAB_INDENT),
+                    width: 0.0,
+                    chip: *chip,
+                });
+            }
+        }
+        for i in open {
+            self.tabs[i].gone = Some(now);
+            self.tabs[i].chip = None;
+        }
+        self.tabs.retain(|t| t.gone.is_none_or(|g| now - g < TAB_SINK as f64));
+    }
+
+    /// How far a tab has risen out of the pill, 0..=1, and its label's opacity.
+    fn tab_state(&self, t: &Tab, now: f64) -> (f32, f32) {
+        use crate::surface::{EASE_OUT, ease};
+        if self.reduce {
+            let fade = match t.gone {
+                Some(g) => 1.0 - ((now - g) as f32 / TAB_SINK).clamp(0.0, 1.0),
+                None if t.born == f64::MIN => 1.0,
+                None => ((now - t.born) as f32 / REDUCED_FADE).clamp(0.0, 1.0),
+            };
+            return (if t.gone.is_some() || fade > 0.0 { 1.0 } else { 0.0 }, fade);
+        }
+        if let Some(g) = t.gone {
+            let out = 1.0 - ease(EASE_OUT, now, g, TAB_SINK);
+            return (out, out);
+        }
+        if t.born == f64::MIN {
+            return (1.0, 1.0);
+        }
+        let text = ((now - t.born) as f32 - TAB_TEXT_DELAY) / TAB_TEXT;
+        (ease(EASE_OUT, now, t.born, TAB_RISE), text.clamp(0.0, 1.0))
+    }
+
+    /// The context tabs, rising out of the top of the pill. Adds their shapes to
+    /// `blobs`; true while any are moving.
+    fn tabs_ui(&mut self, ui: &mut egui::Ui, pill: egui::Rect, now: f64, dt: f32, blobs: &mut Vec<crate::surface::Blob>) -> bool {
+        self.reconcile_tabs(now, pill.left());
+        if self.tabs.is_empty() {
+            return false;
+        }
+        let font = FontId::proportional(12.0);
+        let room = pill.width() - TAB_INDENT * 2.0;
+        let label_of = |key: &str| -> String {
+            if key.chars().count() > 28 {
+                format!("{}…", key.chars().take(27).collect::<String>())
+            } else {
+                key.to_string()
+            }
+        };
+
+        // Which tabs fit; anything past them is summed up as "+N".
+        let mut x = pill.left() + TAB_INDENT;
+        let mut shown = 0;
+        let live = self.tabs.iter().filter(|t| t.gone.is_none()).count();
+        for t in self.tabs.iter_mut().filter(|t| t.gone.is_none()) {
+            let g = ui.painter().layout_no_wrap(label_of(&t.key), font.clone(), TEXT);
+            t.width = 11.0 + g.size().x + 27.0;
+            if shown >= MAX_TABS || (x + t.width > pill.left() + TAB_INDENT + room && shown > 0) {
+                break;
+            }
+            if t.x.target != x {
+                t.x.target = x;
+            }
+            if self.reduce {
+                t.x.snap(x);
+            }
+            x += t.width + TAB_LIP;
+            shown += 1;
+        }
+        let hidden = live - shown;
+
+        let mut moving = false;
+        let mut remove = None;
+        let tabs = std::mem::take(&mut self.tabs);
+        let mut sinking = false;
+        let mut shown_seen = 0;
+        let mut more: Vec<String> = Vec::new();
+        let mut new_tabs = Vec::with_capacity(tabs.len());
+        for mut t in tabs {
+            let live_index = if t.gone.is_none() {
+                shown_seen += 1;
+                Some(shown_seen - 1)
+            } else {
+                None
+            };
+            if live_index.is_some_and(|i| i >= shown) {
+                more.push(t.key.clone());
+                new_tabs.push(t);
+                continue;
+            }
+            t.x.step(dt, 0.06);
+            let (rise, text) = self.tab_state(&t, now);
+            moving |= !t.x.settled() || rise < 1.0 || text < 1.0 || t.gone.is_some() || now < t.born;
+            let top = pill.top() - TAB_LIP - TAB_H;
+            let shift = (1.0 - rise) * (TAB_H + TAB_LIP);
+            let chip = egui::Rect::from_min_size(egui::pos2(t.x.value, top + shift), egui::vec2(t.width, TAB_H));
+            if t.gone.is_none() || !std::mem::replace(&mut sinking, true) {
+                blobs.push(crate::surface::Blob {
+                    rect: egui::Rect::from_min_max(
+                        chip.min - egui::vec2(TAB_LIP, TAB_LIP),
+                        egui::pos2(chip.right() + TAB_LIP, pill.top() + PILL_RADIUS),
+                    ),
+                    radius: 19.0,
+                    merge: 20.0,
+                });
+            }
+            if text > 0.0 {
+                let chip_index = t.chip;
+                ui.scope(|ui| {
+                    ui.set_opacity(text);
+                    ui.painter().rect_filled(chip, TAB_H / 2.0, Color32::from_white_alpha(20));
+                    let g = ui.painter().layout_no_wrap(label_of(&t.key), font.clone(), TEXT);
+                    ui.painter().galley(
+                        egui::pos2(chip.left() + 11.0, chip.center().y - g.size().y / 2.0),
+                        g,
+                        TEXT,
+                    );
+                    let Some(i) = chip_index.filter(|&i| i < self.chips.len()) else { return };
+                    let hover = self.chips[i].hover.clone();
+                    let close = egui::Rect::from_center_size(
+                        egui::pos2(chip.right() - 15.0, chip.center().y),
+                        egui::vec2(TAB_H, TAB_H),
+                    );
+                    let id = ui.scope_id().with(("tab", &t.key, i));
+                    let area = ui.interact(chip, id.with("body"), egui::Sense::hover());
+                    area.on_hover_text(hover);
+                    let r = ui.interact(close, id.with("close"), egui::Sense::click()).on_hover_text("Remove");
+                    if r.hovered() {
+                        ui.painter().circle_filled(close.center(), 10.0, Color32::from_white_alpha(20));
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    let c = close.center();
+                    let st = egui::Stroke::new(1.6, TEXT_2);
+                    ui.painter().line_segment([c + egui::vec2(-3.0, -3.0), c + egui::vec2(3.0, 3.0)], st);
+                    ui.painter().line_segment([c + egui::vec2(3.0, -3.0), c + egui::vec2(-3.0, 3.0)], st);
+                    if r.clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            new_tabs.push(t);
+        }
+        self.tabs = new_tabs;
+
+        if hidden > 0 {
+            let names = more;
+            let g = ui.painter().layout_no_wrap(format!("+{hidden}"), font.clone(), TEXT);
+            let w = g.size().x + 22.0;
+            let top = pill.top() - TAB_LIP - TAB_H;
+            let chip = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(w, TAB_H));
+            blobs.push(crate::surface::Blob {
+                rect: egui::Rect::from_min_max(
+                    chip.min - egui::vec2(TAB_LIP, TAB_LIP),
+                    egui::pos2(chip.right() + TAB_LIP, pill.top() + PILL_RADIUS),
+                ),
+                radius: 19.0,
+                merge: 20.0,
+            });
+            ui.painter().rect_filled(chip, TAB_H / 2.0, Color32::from_white_alpha(20));
+            ui.painter().galley(
+                egui::pos2(chip.left() + 11.0, chip.center().y - g.size().y / 2.0),
+                g,
+                TEXT,
+            );
+            ui.interact(chip, ui.scope_id().with("tab-more"), egui::Sense::hover())
+                .on_hover_text(names.join("\n"));
+        }
         if let Some(i) = remove {
             self.chips.remove(i);
+            self.refocus = true;
         }
-    }
-
-    fn top_h(&self) -> f32 {
-        BAR_H + if self.chips.is_empty() && self.attaching.is_empty() { 0.0 } else { CHIPS_H }
+        moving
     }
 
     /// The history list, in place of the conversation.
     fn history_body(&mut self, ui: &mut egui::Ui, keys: (bool, bool, bool)) {
         let accent = self.accent;
         let query = self.input.clone();
-        let max_h = MAX_H - self.top_h() - 24.0;
+        let max_h = MAX_H - PILL_H - 8.0;
         let Some(b) = self.browser.as_mut() else { return };
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .max_height(max_h)
             .show(ui, |ui| {
                 ui.add_space(8.0);
-                let a = b.show(ui, &query, keys, accent, TEXT_2, TEXT_3);
+                let a = b.show(ui, &query, keys, accent, TEXT_2, TEXT_2);
                 ui.add_space(10.0);
                 a
             });
@@ -1329,22 +1785,22 @@ impl Palette {
         let out = egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .auto_shrink([false, true])
-            .max_height(MAX_H - self.top_h() - 24.0)
+            .max_height(MAX_H - PILL_H - 8.0)
             .show(ui, |ui| {
                 ui.add_space(10.0);
                 for (i, x) in self.exchanges.iter().enumerate() {
                     let last = i + 1 == n;
                     // Earlier turns and the current question read as quiet context.
                     if n > 1 || !x.answer.is_empty() || x.error.is_some() || busy {
-                        ui.label(RichText::new(&x.question).color(TEXT_2).size(13.0));
-                        ui.add_space(2.0);
+                        ui.label(RichText::new(&x.question).color(TEXT_2).size(13.5));
+                        ui.add_space(4.0);
                     }
                     if !x.answer.is_empty() {
                         let math = self.math.clone();
                         let render = move |ui: &mut egui::Ui, tex: &str, inline: bool| {
                             crate::math::show(ui, &math, tex, inline)
                         };
-                        let theme = crate::diagram::Theme { bg: TINT_SOLID, fg: TEXT, muted: TEXT_2, accent };
+                        let theme = crate::diagram::Theme { bg: SURFACE, fg: TEXT, muted: TEXT_2, accent };
                         for seg in crate::diagram::split(&x.answer) {
                             match seg {
                                 crate::diagram::Seg::Md(md) => {
@@ -1382,7 +1838,7 @@ impl Palette {
                             }
                         });
                         if e.text != "Stopped." {
-                            ui.label(RichText::new(&e.detail).color(TEXT_3).small());
+                            ui.label(RichText::new(&e.detail).color(TEXT_2).small());
                         }
                     }
                     if !last {
@@ -1391,22 +1847,21 @@ impl Palette {
                 }
                 if let Some((intent, detail, _)) = &self.pending {
                     ui.add_space(6.0);
+                    // The surface carries the shape change; only the text fades.
+                    let shown = ui.ctx().animate_bool_with_time(ui.scope_id().with("approval"), true, 0.14);
                     egui::Frame::new()
-                        .fill(Color32::from_white_alpha(12))
-                        .stroke(egui::Stroke::new(1.0, HAIRLINE))
-                        .corner_radius(10)
-                        .inner_margin(Margin::same(14))
                         .show(ui, |ui| {
+                            ui.set_opacity(shown);
                             ui.set_width(ui.available_width());
                             ui.label(
                                 RichText::new(format!(
                                     "Allow screenbuddy to {}?",
                                     lowercase_first(intent)
                                 ))
-                                .strong(),
+                                .size(15.0),
                             );
-                            ui.label(RichText::new(detail).monospace().color(TEXT_3).size(12.0));
-                            ui.add_space(6.0);
+                            ui.label(RichText::new(detail).monospace().color(TEXT_2).size(12.5));
+                            ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 if ui
                                     .link(RichText::new("Always allow").size(13.0))
@@ -1416,23 +1871,25 @@ impl Palette {
                                     decision = Some((true, true));
                                 }
                                 if once {
-                                    ui.label(RichText::new("Allowing covers the rest of this conversation").color(TEXT_3).size(12.0));
+                                    ui.label(RichText::new("Allowing covers the rest of this conversation").color(TEXT_2).size(12.5));
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         let allow = egui::Button::new(
-                                            RichText::new("Allow").color(Color32::WHITE),
+                                            RichText::new("Allow").color(SURFACE).size(13.0),
                                         )
-                                        .fill(accent)
-                                        .corner_radius(7)
-                                        .min_size(egui::vec2(84.0, 28.0));
+                                        .fill(Color32::WHITE)
+                                        .corner_radius(CHIP_H / 2.0)
+                                        .min_size(egui::vec2(76.0, ICON_H + 2.0));
                                         if ui.add(allow).clicked() {
                                             decision = Some((true, false));
                                         }
-                                        let deny = egui::Button::new("Don't Allow")
-                                            .corner_radius(7)
-                                            .min_size(egui::vec2(100.0, 28.0));
+                                        let deny = egui::Button::new(RichText::new("Don't Allow").size(13.0))
+                                            .fill(Color32::TRANSPARENT)
+                                            .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(46)))
+                                            .corner_radius(CHIP_H / 2.0)
+                                            .min_size(egui::vec2(94.0, ICON_H + 2.0));
                                         if ui.add(deny).clicked() {
                                             decision = Some((false, false));
                                         }
@@ -1443,7 +1900,7 @@ impl Palette {
                 }
                 if let Some(n) = &self.notice {
                     ui.add_space(4.0);
-                    ui.label(RichText::new(n).color(TEXT_3).small());
+                    ui.label(RichText::new(n).color(TEXT_2).small());
                 }
                 ui.add_space(14.0);
             });
@@ -1496,28 +1953,97 @@ impl Palette {
         !self.exchanges.is_empty() || self.notice.is_some() || self.browser.is_some() || self.mention.is_some()
     }
 
-    /// Grows/shrinks the window smoothly toward its content height.
-    fn animate_height(&mut self, ctx: &egui::Context) {
-        let has_body = self.has_body();
-        let target = if has_body {
-            (self.top_h() + 1.0 + self.body_h).min(MAX_H)
+    /// Moves the surface toward its measured height. True while it's moving.
+    fn pour_surface(&mut self, dt: f32) -> bool {
+        let target = if self.has_body() {
+            (PILL_H + 4.0 + self.body_h).min(MAX_H)
         } else {
-            self.top_h()
+            PILL_H
         };
-        let diff = target - self.height;
-        if diff.abs() > 0.5 {
-            self.height += diff * 0.35;
-            if diff.abs() < 2.0 {
-                self.height = target;
+        if target != self.pour.target {
+            if target > self.pour.target {
+                self.keep_on_screen(target);
             }
-            if diff > 0.0 {
-                self.keep_on_screen(ctx, self.height.round());
+            self.pour.target = target;
+            self.lead.target = target;
+        }
+        if self.reduce {
+            self.pour.snap(target);
+            self.lead.snap(target);
+            return false;
+        }
+        let time = crate::surface::smooth_time_for(target - self.pour.value);
+        self.pour.step(dt, time);
+        // The center column leads when pouring out; on the way back up it just
+        // follows the surface instead of leaving a gap.
+        self.lead.step(dt, time * 0.6);
+        !self.pour.settled() || !self.lead.settled()
+    }
+
+    /// Everything that makes up the surface this frame, in window points.
+    fn main_blobs(&self, pill: egui::Rect) -> Vec<crate::surface::Blob> {
+        let mut blobs = vec![crate::surface::Blob {
+            rect: egui::Rect::from_min_size(pill.min, egui::vec2(pill.width(), self.pour.value)),
+            radius: PILL_RADIUS,
+            merge: 0.0,
+        }];
+        let ahead = self.lead.value - self.pour.value;
+        if ahead > 0.5 {
+            let inset = pill.width() * 0.15;
+            blobs.push(crate::surface::Blob {
+                rect: egui::Rect::from_min_size(
+                    pill.min + egui::vec2(inset, 0.0),
+                    egui::vec2(pill.width() - inset * 2.0, self.lead.value),
+                ),
+                radius: PILL_RADIUS,
+                // Fades out as the surface catches up, so nothing pops or bulges.
+                merge: 30.0 * (ahead / 20.0).min(1.0),
+            });
+        }
+        blobs
+    }
+
+    /// The buds breaking away toward what was just drawn.
+    fn bud_blobs(&mut self, now: f64, blobs: &mut Vec<crate::surface::Blob>) {
+        self.buds.retain(|b| now - b.start < overlay::BUD_TIME as f64);
+        for b in &self.buds {
+            if blobs.len() >= crate::surface::MAX_BLOBS {
+                break;
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                self.width,
-                self.height.round(),
-            )));
-            ctx.request_repaint();
+            let t = crate::surface::ease(crate::surface::EASE_IN_OUT, now, b.start, overlay::BUD_TIME);
+            if now >= b.start {
+                let c = b.from + (b.to - b.from) * t;
+                blobs.push(crate::surface::Blob {
+                    rect: egui::Rect::from_center_size(c, egui::vec2(20.0, 20.0)),
+                    radius: 10.0,
+                    merge: 26.0,
+                });
+            }
+        }
+    }
+
+    /// Clips the window to the part the surface uses, so everything else stays
+    /// click-through. It grows right away and only shrinks once settled, so this
+    /// isn't redone on every frame of an animation.
+    fn update_region(&mut self, settled: bool, hovering: bool) {
+        let Some(hwnd) = self.hwnd else { return };
+        let s = self.ppp();
+        let tabs_up = !self.tabs.is_empty() || !self.buds.is_empty();
+        let top = if tabs_up { 0.0 } else { PILL_TOP - TOP };
+        // Tooltips can be several lines long, so give them the whole window while
+        // the pointer is over the surface. Moving off it closes the region again.
+        let h = self.pour.value.max(self.pour.target).max(self.lead.value);
+        let bottom = if hovering { WINDOW_H } else { (PILL_TOP + h + BOTTOM).min(WINDOW_H) };
+        let want = ((top * s) as i32, (bottom * s).ceil() as i32);
+        let grows = self.region.is_none_or(|r| want.0 < r.0 || want.1 > r.1);
+        if self.region != Some(want) && (grows || settled) {
+            let w = ((self.width + SIDE * 2.0) * s).ceil() as i32 + 2;
+            unsafe {
+                use windows::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
+                let rgn = CreateRectRgn(0, want.0, w, want.1);
+                SetWindowRgn(hwnd, Some(rgn), true);
+            }
+            self.region = Some(want);
         }
     }
 }
@@ -1576,11 +2102,7 @@ impl eframe::App for Palette {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
             if self.busy() {
-                // The worker notices the flag and hands the conversation back via Done.
-                self.cancel.store(true, Ordering::Relaxed);
-                if let Some(x) = self.exchanges.last_mut() {
-                    x.error = Some(friendly("cancelled"));
-                }
+                self.stop_turn();
             } else {
                 self.close(&ctx);
                 return;
@@ -1588,45 +2110,105 @@ impl eframe::App for Palette {
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
 
-        // Background: solid card; DWM rounds the corners.
         let full = ui.max_rect();
-        let fill = TINT_SOLID;
-        ui.painter().rect_filled(full, 8, fill);
-        // Drag any empty part of the card to move it; widgets on top win.
-        let bg = ui.interact(full, ui.scope_id().with("drag-bg"), egui::Sense::drag());
-        if bg.drag_started() {
+        self.scale = ctx.pixels_per_point();
+        let now = ctx.input(|i| i.time);
+        let dt = ((now - self.last_time) as f32).clamp(0.0, 0.05);
+        self.last_time = now;
+        let pill = egui::Rect::from_min_size(
+            full.min + egui::vec2(SIDE, PILL_TOP),
+            egui::vec2(self.width, PILL_H),
+        );
+        let mut moving = self.pour_surface(dt);
+        let surface = egui::Rect::from_min_size(pill.min, egui::vec2(pill.width(), self.pour.value));
+
+        // Paint the surface first; its shapes are finished further down, through
+        // a shared slot, once the tabs have said where they are this frame.
+        let bg = ui.painter().add(egui::Shape::Noop);
+
+        // Dragging any empty part of the surface moves it; widgets on top win.
+        let drag = ui.interact(surface, ui.scope_id().with("drag-bg"), egui::Sense::drag());
+        if drag.drag_started() {
             self.start_drag(&ctx);
         }
-
-        egui::Frame::new()
-            .inner_margin(Margin {
-                left: PAD as i8 - 4,
-                right: PAD as i8,
-                top: 10,
-                bottom: 10,
-            })
-            .show(ui, |ui| {
-                ui.set_width(full.width() - 2.0 * PAD + 4.0);
-                self.bar(ui, enter);
-            });
-        if self.has_body() {
-            let y = ui.cursor().top();
-            ui.painter()
-                .hline(full.x_range(), y, egui::Stroke::new(1.0, HAIRLINE));
-            egui::Frame::new()
-                .inner_margin(Margin::symmetric(PAD as i8, 0))
-                .show(ui, |ui| {
-                    ui.set_width(full.width() - 2.0 * PAD);
-                    if self.browser.is_some() {
-                        self.history_body(ui, keys);
-                    } else if self.mention.is_some() {
-                        self.mention_body(ui);
-                    } else {
-                        self.body(ui);
-                    }
-                });
+        let mut blobs = self.main_blobs(pill);
+        moving |= self.tabs_ui(ui, pill, now, dt, &mut blobs);
+        // The margin is part of the window, but isn't part of the palette.
+        let clicked_away = ctx.input(|i| {
+            i.pointer.any_pressed()
+                && i.pointer.interact_pos().is_some_and(|p| !blobs.iter().any(|b| b.rect.contains(p)))
+        });
+        if clicked_away && self.may_dismiss() {
+            self.close(&ctx);
+            return;
         }
-        self.animate_height(&ctx);
+        self.bud_blobs(now, &mut blobs);
+        blobs.truncate(crate::surface::MAX_BLOBS);
+        moving |= !self.buds.is_empty();
+        if self.overlay.as_mut().is_some_and(|o| o.tick()) {
+            moving = true;
+        }
+
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(pill.shrink2(egui::vec2((PILL_H - CHIP_H) / 2.0, (PILL_H - CHIP_H) / 2.0))),
+            |ui| self.bar(ui, enter),
+        );
+
+        let has_body = self.has_body();
+        let shown = ctx.animate_bool_with_time(ui.scope_id().with("body-fade"), has_body, 0.12);
+        if has_body || shown > 0.0 {
+            let room = egui::Rect::from_min_max(
+                egui::pos2(pill.left() + PAD, pill.bottom()),
+                egui::pos2(pill.right() - PAD, pill.top() + MAX_H),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(room), |ui| {
+                ui.set_clip_rect(surface);
+                ui.set_opacity(shown);
+                if self.browser.is_some() {
+                    self.history_body(ui, keys);
+                } else if self.mention.is_some() {
+                    self.mention_body(ui);
+                } else if has_body {
+                    self.body(ui);
+                }
+            });
+            // Text comes up from under the moving edge instead of being cut off.
+            let edge = (self.pour.target - self.pour.value).abs().min(16.0) / 16.0;
+            if edge > 0.0 {
+                let (y1, y0) = (surface.bottom(), (surface.bottom() - 18.0).max(pill.bottom()));
+                let mut mesh = egui::Mesh::default();
+                let solid = SURFACE.gamma_multiply(edge);
+                mesh.colored_vertex(egui::pos2(surface.left(), y0), Color32::TRANSPARENT);
+                mesh.colored_vertex(egui::pos2(surface.right(), y0), Color32::TRANSPARENT);
+                mesh.colored_vertex(egui::pos2(surface.right(), y1), solid);
+                mesh.colored_vertex(egui::pos2(surface.left(), y1), solid);
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                ui.painter().with_clip_rect(surface.shrink(1.0)).add(mesh);
+            }
+        }
+
+        let hovering = ctx.input(|i| i.pointer.hover_pos())
+            .is_some_and(|p| blobs.iter().any(|b| b.rect.contains(p)));
+        // Now the shapes are known, fill the slot under the widgets.
+        let (wx, wy) = self.window_pos();
+        let scene = crate::surface::Scene { blobs, window_px: (wx as f32, wy as f32) };
+        match &self.renderer {
+            Some(r) => {
+                let painter = ui.painter().clone();
+                let cb = r.callback(full, scene);
+                painter.set(bg, cb);
+            }
+            None => {
+                let shapes: Vec<egui::Shape> = crate::surface::fallback_shapes(&scene);
+                ui.painter().set(bg, egui::Shape::Vec(shapes));
+            }
+        }
+
+        self.update_region(!moving, hovering);
+        if moving {
+            ctx.request_repaint();
+        }
         self.trim_when_idle(&ctx);
         if self.busy() {
             // Guide mode can wait for minutes: pulse slowly instead of at 30 fps.
@@ -1661,25 +2243,40 @@ fn lowercase_first(s: &str) -> String {
 }
 
 enum Icon {
+    Plus,
     History,
+    Gear,
     /// Microphone; `Some(level)` while recording.
     Mic(Option<f32>),
 }
 
+/// Four dots that take turns swelling: the composer's "working" mark. Under
+/// reduced motion they only change opacity.
+fn dot_loader(ui: &egui::Ui, c: egui::Pos2, color: Color32, reduce: bool) {
+    let t = ui.input(|i| i.time) as f32;
+    let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    for (i, (dx, dy)) in corners.into_iter().enumerate() {
+        let phase = (t * 5.0 - i as f32 * std::f32::consts::FRAC_PI_2).sin() * 0.5 + 0.5;
+        let pos = c + egui::vec2(dx, dy) * 4.5;
+        let size = if reduce { 1.8 } else { 1.0 + 1.3 * phase };
+        ui.painter().circle_filled(pos, size, color.gamma_multiply(0.45 + 0.55 * phase));
+    }
+}
+
 /// A small painted icon button (no font glyph dependency).
 fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ICON_H, ICON_H), egui::Sense::click());
     let c = rect.center();
     let p = ui.painter();
-    let fg = if active { Color32::WHITE } else if resp.hovered() { TEXT_2 } else { TEXT_3 };
+    let fg = if active { Color32::WHITE } else if resp.hovered() { TEXT } else { TEXT_2 };
     if active {
         let bg = match icon {
             Icon::Mic(_) => Color32::from_rgb(220, 60, 60),
-            Icon::History => accent,
+            _ => accent,
         };
-        p.circle_filled(c, 12.0, bg);
+        p.circle_filled(c, ICON_H / 2.0, bg);
     } else if resp.hovered() {
-        p.circle_filled(c, 12.0, Color32::from_white_alpha(10));
+        p.circle_filled(c, ICON_H / 2.0, Color32::from_white_alpha(16));
     }
     let st = egui::Stroke::new(1.5, fg);
     match icon {
@@ -1688,9 +2285,21 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> 
             p.line_segment([c, c + egui::vec2(0.0, -4.5)], st);
             p.line_segment([c, c + egui::vec2(3.5, 1.5)], st);
         }
+        Icon::Plus => {
+            p.line_segment([c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)], st);
+            p.line_segment([c + egui::vec2(0.0, -6.0), c + egui::vec2(0.0, 6.0)], st);
+        }
+        Icon::Gear => {
+            p.circle_stroke(c, 3.6, st);
+            for i in 0..8 {
+                let a = std::f32::consts::FRAC_PI_4 * i as f32;
+                let d = egui::vec2(a.cos(), a.sin());
+                p.line_segment([c + d * 5.2, c + d * 7.4], st);
+            }
+        }
         Icon::Mic(level) => {
             if let Some(l) = level {
-                p.circle_stroke(c, 12.0 + 3.0 * l, egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60).gamma_multiply(0.6)));
+                p.circle_stroke(c, ICON_H / 2.0 + 3.0 * l, egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 60).gamma_multiply(0.6)));
             }
             let body = egui::Rect::from_center_size(c + egui::vec2(0.0, -2.5), egui::vec2(6.0, 10.0));
             p.rect_stroke(body, 3, st, egui::StrokeKind::Middle);

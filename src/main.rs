@@ -13,6 +13,7 @@ mod mention;
 mod overlay;
 mod palette;
 mod settings;
+mod surface;
 mod tray;
 mod uia;
 mod util;
@@ -106,8 +107,12 @@ impl App {
         llm::warm_on_hotkey(&self.cfg);
         let mode = self.cfg.context.selection.as_str();
         if grab && mode != "off" {
-            if let Some((text, app)) = context::selected_text(mode == "uia+copy") {
-                start.chips.insert(0, context::Chip::selection(&text, &app));
+            let selection = context::selected_text(mode == "uia+copy");
+            if region {
+                // The region picker takes over the screen, so finish first.
+                start.chips.splice(0..0, selection.wait());
+            } else {
+                start.selection = Some(selection);
             }
         }
         let out = self.open_palette(region, start);
@@ -116,7 +121,7 @@ impl App {
         out
     }
 
-    fn open_palette(&mut self, region: bool, start: palette::Start) -> palette::Outcome {
+    fn open_palette(&mut self, region: bool, mut start: palette::Start) -> palette::Outcome {
         let shot = match capture::grab_monitor_under_cursor() {
             Ok(s) => s,
             Err(e) => {
@@ -132,15 +137,15 @@ impl App {
         } else {
             None
         };
-        let cap = match capture::encode(&shot, area) {
-            Ok(c) => c,
-            Err(e) => {
-                win::message_box(&format!("Screenshot encoding failed: {e}"));
-                return palette::Outcome::Closed;
-            }
+        start.backdrop = surface::Backdrop::new(&shot, self.cfg.appearance.blur);
+        // Encoding takes about as long as making the window, so do both at once.
+        let encoding = std::thread::spawn(move || capture::encode(&shot, area));
+        let cfg = self.cfg.clone();
+        let cap = move || {
+            let cap = encoding.join().map_err(|_| anyhow::anyhow!("the encoder stopped"))??;
+            vision::set_capture(&cap, &cfg);
+            Ok(cap)
         };
-        drop(shot); // free the raw pixels before the window opens
-        vision::set_capture(&cap, &self.cfg);
         palette::run_with(self.cfg.clone(), cap, self.cfg_error.clone(), start)
     }
 }
