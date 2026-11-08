@@ -112,6 +112,8 @@ pub struct View {
     /// Tallest the card may get, logical px.
     pub max_h: f32,
     pub chrome: Chrome,
+    /// A notice from an agent: the footer opens its card, not the palette.
+    pub notice: bool,
 }
 
 impl Default for View {
@@ -125,6 +127,7 @@ impl Default for View {
             hover: false,
             max_h: 420.0,
             chrome: Chrome::Answer,
+            notice: false,
         }
     }
 }
@@ -953,7 +956,9 @@ pub fn render(v: &View, scale: f32) -> Option<Pixmap> {
         let nw = text_w(next, LABEL_PX * s, false, track);
         draw_text(&mut pm, next, m + (w - PAD) * s - nw, fy, LABEL_PX * s, false, track, SIGNAL, a);
     } else if footer {
-        let text = if cut_bottom {
+        let text = if v.notice {
+            "SHOW CARD  ›"
+        } else if cut_bottom {
             "MORE IN PALETTE  ›"
         } else {
             "OPEN IN PALETTE  ›"
@@ -995,6 +1000,12 @@ pub enum Cmd {
     /// Drawings for the overlay on `monitor`.
     Draw(DrawCall, Rect, f32),
     Hide,
+    /// A short notice beside the cursor ("‹name› is done") for agent `id`.
+    /// Never replaces a quick ask in progress; a click goes to the notice sink.
+    Notice {
+        text: String,
+        id: String,
+    },
     /// A walkthrough card beside `near` (or the cursor), with an optional
     /// pointer drawn on the overlay. Replaces whatever the caption showed.
     Walk(Card),
@@ -1029,6 +1040,14 @@ static TX: Mutex<Option<Sender<Cmd>>> = Mutex::new(None);
 static THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static EVENTS: Mutex<Vec<Sender<CaptionEvent>>> = Mutex::new(Vec::new());
 const WM_WAKE: u32 = WM_APP + 3;
+
+type NoticeSink = Box<dyn Fn(String) + Send + Sync>;
+static NOTICE_SINK: Mutex<Option<NoticeSink>> = Mutex::new(None);
+
+/// Where clicks on a [`Cmd::Notice`] go (with its id).
+pub fn set_notice_sink(f: impl Fn(String) + Send + Sync + 'static) {
+    *NOTICE_SINK.lock().unwrap() = Some(Box::new(f));
+}
 
 /// Where clicks and dismissals go (every subscriber gets every event;
 /// dropped receivers are forgotten).
@@ -1081,6 +1100,8 @@ struct St {
     dirty: bool,
     /// Walkthrough: the target rect the card sits beside.
     near: Option<Rect>,
+    /// The agent whose notice is showing.
+    notice: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1217,6 +1238,7 @@ fn thread_main(rx: Receiver<Cmd>, ready: Sender<()>) {
             overlay: None,
             dirty: false,
             near: None,
+            notice: None,
         };
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.hwnd.0.is_null() && msg.message == WM_TIMER {
@@ -1246,6 +1268,10 @@ fn thread_main(rx: Receiver<Cmd>, ready: Sender<()>) {
 
 impl St {
     fn apply(&mut self, cmd: Cmd) {
+        if !matches!(cmd, Cmd::Notice { .. } | Cmd::Level(_)) {
+            self.notice = None;
+            self.view.notice = false;
+        }
         match cmd {
             Cmd::Listen { at } => {
                 self.overlay = None;
@@ -1322,6 +1348,36 @@ impl St {
             }
             Cmd::Hide => self.hide(),
             Cmd::Walk(card) => self.walk(card),
+            Cmd::Notice { text, id } => {
+                let busy = self.visible
+                    && self.notice.is_none()
+                    && matches!(
+                        self.view.phase,
+                        Phase::Listening
+                            | Phase::Thinking
+                            | Phase::Streaming
+                            | Phase::Step
+                            | Phase::Ask
+                    );
+                if busy {
+                    return;
+                }
+                self.overlay = None;
+                self.near = None;
+                let at = crate::capture::cursor_pos();
+                self.anchor = at;
+                self.monitor = Some(crate::capture::monitor_at(at.0, at.1));
+                self.view = View {
+                    phase: Phase::Done,
+                    label: "Agent".into(),
+                    body: text,
+                    notice: true,
+                    ..Default::default()
+                };
+                self.notice = Some(id);
+                self.show();
+                self.linger();
+            }
         }
         self.dirty = true;
     }
@@ -1450,6 +1506,12 @@ impl St {
                     }
                     Chrome::Answer => {
                         self.hide();
+                        if let Some(id) = self.notice.take() {
+                            if let Some(f) = NOTICE_SINK.lock().unwrap().as_ref() {
+                                f(id);
+                            }
+                            return;
+                        }
                         emit(CaptionEvent::Clicked);
                     }
                 }
@@ -1460,6 +1522,9 @@ impl St {
                     return;
                 }
                 self.hide();
+                if self.notice.take().is_some() {
+                    return;
+                }
                 emit(CaptionEvent::Dismissed);
             }
         }
@@ -1501,7 +1566,9 @@ impl St {
             let k = f.elapsed().as_secs_f32() / FADE_OUT;
             if k >= 1.0 {
                 self.hide();
-                emit(CaptionEvent::Dismissed);
+                if self.notice.take().is_none() {
+                    emit(CaptionEvent::Dismissed);
+                }
                 return;
             }
             alpha *= 1.0 - ease_out(k);

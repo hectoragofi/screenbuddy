@@ -1330,8 +1330,11 @@ impl Palette {
                 | AppEvent::TrayClick
                 | AppEvent::IslandClick
                 | AppEvent::AltDoubleTap => self.close(ctx),
-                // Agent rows are the app's business once the palette is gone.
-                ev @ AppEvent::Island(_) => requeue.push(ev),
+                // Island rows open their card, even over the palette.
+                AppEvent::Island(crate::island::IslandEvent::OpenAgent(id)) => {
+                    crate::cards::open(&id)
+                }
+                AppEvent::AgentPalette(id) => self.show_agent(id),
                 AppEvent::OpenChat(dir) => self.open_chat(ctx, dir),
                 // More files from Explorer join the current question.
                 AppEvent::OpenFile(p) => {

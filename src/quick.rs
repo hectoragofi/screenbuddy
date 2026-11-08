@@ -47,6 +47,8 @@ pub fn status(s: Status) {
 
 enum Msg {
     Key(KeyEvent),
+    /// The mic on an agent card: start, or finish, a spoken follow-up.
+    Mic(String),
     Caption(CaptionEvent),
     Config(Box<Config>),
 }
@@ -94,6 +96,34 @@ pub fn configure(cfg: &Config) {
     }
 }
 
+/// Toggles a spoken follow-up to agent `id` (the mic button on its card):
+/// the first call starts listening, the next sends the transcript to
+/// `agents::follow_up`.
+pub fn mic_follow_up(id: &str) {
+    if let Some(tx) = TX.get() {
+        let _ = tx.send(Msg::Mic(id.to_string()));
+    }
+}
+
+static LISTENING_FOR: Mutex<Option<String>> = Mutex::new(None);
+
+/// The agent a spoken follow-up is being recorded for (its card shows it).
+pub fn listening_for() -> Option<String> {
+    LISTENING_FOR.lock().unwrap().clone()
+}
+
+fn set_listening_for(id: Option<String>) {
+    let changed = {
+        let mut g = LISTENING_FOR.lock().unwrap();
+        let changed = *g != id;
+        *g = id;
+        changed
+    };
+    if changed {
+        crate::cards::refresh();
+    }
+}
+
 /// Spoken questions answer in a caption, so keep them short.
 const BRIEF: &str = "This question was spoken aloud (hold-to-talk) and your answer appears in a small caption next to the cursor. Answer in one to three short sentences unless the user asks for detail; point at things by drawing rather than describing where they are.";
 
@@ -116,6 +146,8 @@ struct Quick {
     turn: Option<Turn>,
     /// The last finished quick ask, saved so the palette can continue it.
     last: Option<PathBuf>,
+    /// Alt was held over this agent's card: the words are a follow-up to it.
+    follow: Option<String>,
 }
 
 impl Quick {
@@ -127,6 +159,7 @@ impl Quick {
             transcript: None,
             turn: None,
             last: None,
+            follow: None,
         }
     }
 
@@ -150,6 +183,19 @@ impl Quick {
             };
             match msg {
                 Some(Msg::Key(k)) => self.key(k),
+                Some(Msg::Mic(id)) => {
+                    if self.rec.is_some() {
+                        self.key(KeyEvent::HoldEnd {
+                            cursor: capture::cursor_pos(),
+                            target: Some(id),
+                        });
+                    } else {
+                        self.key(KeyEvent::HoldStart {
+                            cursor: capture::cursor_pos(),
+                            target: Some(id),
+                        });
+                    }
+                }
                 Some(Msg::Caption(c)) => self.caption(c),
                 Some(Msg::Config(c)) => self.cfg = *c,
                 None => {}
@@ -160,7 +206,7 @@ impl Quick {
 
     fn key(&mut self, k: KeyEvent) {
         match k {
-            KeyEvent::HoldStart { cursor, target: _ } => {
+            KeyEvent::HoldStart { cursor, target } => {
                 if win::ui_open() {
                     return; // the palette has its own voice input
                 }
@@ -168,26 +214,36 @@ impl Quick {
                 self.stop_turn();
                 self.rec = None;
                 self.transcript = None;
+                self.follow = target.filter(|id| crate::agents::get(id).is_some());
                 if !self.cfg.voice.enabled || !voice::model_ready() {
                     caption::send(Cmd::Error(
                         "Turn on voice in Settings › Voice to ask by holding Alt.".into(),
                     ));
                     return;
                 }
-                // The screen as it is when you start talking about it.
-                self.shot = capture::grab_monitor_under_cursor()
-                    .ok()
-                    .map(|s| std::thread::spawn(move || capture::encode(&s, None)));
+                // The screen as it is when you start talking about it (a
+                // follow-up goes to the agent, which has its own context).
+                self.shot = if self.follow.is_some() {
+                    None
+                } else {
+                    capture::grab_monitor_under_cursor()
+                        .ok()
+                        .map(|s| std::thread::spawn(move || capture::encode(&s, None)))
+                };
                 llm::warm_on_hotkey(&self.cfg);
                 caption::send(Cmd::Listen { at: cursor });
                 status(Status::Listening(0.0));
                 match voice::Recording::start(&self.cfg.voice.language, egui::Context::default()) {
-                    Ok(r) => self.rec = Some(r),
+                    Ok(r) => {
+                        self.rec = Some(r);
+                        set_listening_for(self.follow.clone());
+                    }
                     Err(e) => self.fail(e),
                 }
             }
             KeyEvent::HoldEnd { .. } => {
                 if let Some(r) = self.rec.take() {
+                    set_listening_for(None);
                     self.transcript = Some(r.finish());
                     caption::send(Cmd::Think {
                         question: "Transcribing".into(),
@@ -197,7 +253,9 @@ impl Quick {
             }
             KeyEvent::HoldCancel => {
                 if self.rec.take().is_some() {
+                    set_listening_for(None);
                     self.shot = None;
+                    self.follow = None;
                     // A walkthrough puts its card back.
                     if !crate::walk::hear("", true) {
                         caption::send(Cmd::Hide);
@@ -242,9 +300,17 @@ impl Quick {
                 Ok(r) => {
                     self.transcript = None;
                     match r {
+                        Ok(t) if self.follow.is_some() && !t.trim().is_empty() => {
+                            // A hold aimed at a card (even mid-walk): the card shows the agent picking it up.
+                            let id = self.follow.take().unwrap_or_default();
+                            crate::agents::follow_up(&id, t.trim());
+                            caption::send(Cmd::Hide);
+                            status(Status::Idle);
+                        }
                         // During a walkthrough, speech goes to it.
                         Ok(t) if crate::walk::hear(t.trim(), true) => self.shot = None,
                         Ok(t) if t.trim().is_empty() => {
+                            self.follow = None;
                             caption::send(Cmd::Hide);
                             status(Status::Idle);
                         }
@@ -395,6 +461,8 @@ impl Quick {
     fn fail(&mut self, e: String) {
         self.rec = None;
         self.shot = None;
+        self.follow = None;
+        set_listening_for(None);
         config::log(&format!("quick ask: {e}"));
         caption::send(Cmd::Error(short_error(&e)));
         status(Status::Error(e));

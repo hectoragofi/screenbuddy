@@ -238,6 +238,37 @@ fn approval_ask_and_conversation_scope() {
 }
 
 #[test]
+fn allow_once_asks_again() {
+    let (rt, _) = runtime(
+        "once",
+        Duration::ZERO,
+        Box::new(|_, sink| {
+            let first = sink.approve("Send the email", "click @s1:e4");
+            let second = sink.approve("Send another", "click @s1:e5"); // asks again
+            Ok(format!("{first} {second}"))
+        }),
+    );
+    let rx = rt.subscribe();
+    let id = rt.spawn(Spawn {
+        brief: "email".into(),
+        ..Default::default()
+    });
+    let evs = until(&rx, &id, |e| matches!(e, AgentEvent::Ask(_)));
+    let AgentEvent::Ask(q) = evs.last().unwrap().clone() else {
+        unreachable!()
+    };
+    assert!(rt.answer(&id, q.id, Answer::AllowOnce));
+    let evs = until(&rx, &id, |e| matches!(e, AgentEvent::Ask(_)));
+    let AgentEvent::Ask(q2) = evs.last().unwrap().clone() else {
+        unreachable!()
+    };
+    assert_eq!(q2.text, "Send another");
+    assert!(rt.answer(&id, q2.id, Answer::Deny));
+    let evs = until(&rx, &id, finished);
+    assert!(evs.contains(&AgentEvent::Result("true false".into())));
+}
+
+#[test]
 fn deny_and_retry_after_failure() {
     let (rt, fake) = runtime(
         "retry",

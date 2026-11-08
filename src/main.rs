@@ -5,6 +5,7 @@ mod agents;
 mod apeiron;
 mod buddy;
 mod caption;
+mod cards;
 mod capture;
 mod config;
 mod context;
@@ -215,6 +216,7 @@ fn run() -> anyhow::Result<()> {
     }
     apeiron::start();
     wire::start();
+    cards::start();
     config::log("started");
     win::trim_memory();
 
@@ -231,8 +233,11 @@ fn run() -> anyhow::Result<()> {
             let outcome = match ev {
                 AppEvent::Hotkey(win::HK_ASK) => app.ask(false, true, Default::default()),
                 AppEvent::TrayClick | AppEvent::IslandClick => app.ask(false, false, Default::default()),
-                // Agent cards (wave 2) take this over; for now the palette shows its line.
-                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => app.ask(
+                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => {
+                    cards::open(&id);
+                    palette::Outcome::Closed
+                }
+                AppEvent::AgentPalette(id) => app.ask(
                     false,
                     false,
                     palette::Start { open_agent: Some(id), ..Default::default() },

@@ -528,7 +528,7 @@ impl Ui for Sink {
     fn ask(&self, text: &str, detail: &str) -> bool {
         matches!(
             Sink::ask(self, AskKind::Approval, text, detail, Vec::new()),
-            Answer::Allow
+            Answer::Allow | Answer::AllowOnce
         )
     }
     fn event(&self, ev: DriveEvent) {

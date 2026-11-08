@@ -43,7 +43,8 @@
 //!
 //! Approvals: desktop actions run immediately; only destructive / outbound /
 //! money ones (see `desktop::needs_approval`) raise `Ask` with
-//! `AskKind::Approval`. A yes covers the rest of that agent's conversation.
+//! `AskKind::Approval`. A yes (`Answer::Allow`) covers the rest of that
+//! agent's conversation; `Answer::AllowOnce` covers just that action.
 //! `agents.always_approve` skips asking.
 //!
 //! Runner: with the `claude-cli` provider each turn is its own
@@ -122,7 +123,10 @@ pub struct Question {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Answer {
+    /// Yes, and to the rest of this conversation's approvals.
     Allow,
+    /// Yes to this one action only; the next one asks again.
+    AllowOnce,
     Deny,
     Text(String),
 }
@@ -750,11 +754,14 @@ impl Sink {
         if self.always || self.ctl.approved.load(Ordering::SeqCst) {
             return true;
         }
-        let ok = matches!(self.ask(AskKind::Approval, intent, detail, Vec::new()), Answer::Allow);
-        if ok {
-            self.ctl.approved.store(true, Ordering::SeqCst);
+        match self.ask(AskKind::Approval, intent, detail, Vec::new()) {
+            Answer::Allow => {
+                self.ctl.approved.store(true, Ordering::SeqCst);
+                true
+            }
+            Answer::AllowOnce => true,
+            _ => false,
         }
-        ok
     }
 
     /// A desktop action finished (`t0_ms` = when it began): grows the desk.
