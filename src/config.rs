@@ -26,6 +26,21 @@ pub struct Config {
     pub island: IslandCfg,
     pub input: InputCfg,
     pub agents: AgentsCfg,
+    pub walk: WalkCfg,
+}
+
+/// Step-by-step walkthroughs ("show me how to ...").
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct WalkCfg {
+    /// Let the assistant start a walkthrough when you ask how to do something.
+    pub enabled: bool,
+}
+
+impl Default for WalkCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -90,11 +105,14 @@ pub struct AgentsCfg {
     pub always_approve: bool,
     /// Claude CLI model for agents; empty = same as claude_cli.model.
     pub model: String,
+    /// "ask": an agent may ask to use the real mouse and keyboard while the
+    /// user watches; "never": agents only work in the background.
+    pub drive: String,
 }
 
 impl Default for AgentsCfg {
     fn default() -> Self {
-        Self { enabled: true, always_approve: false, model: String::new() }
+        Self { enabled: true, always_approve: false, model: String::new(), drive: "ask".into() }
     }
 }
 
@@ -236,6 +254,7 @@ impl Default for Config {
             island: IslandCfg::default(),
             input: InputCfg::default(),
             agents: AgentsCfg::default(),
+            walk: WalkCfg::default(),
         }
     }
 }

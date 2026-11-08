@@ -1,9 +1,11 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod agent_history;
 mod agents;
 mod apeiron;
 mod buddy;
 mod caption;
+mod cards;
 mod capture;
 mod config;
 mod context;
@@ -27,6 +29,7 @@ mod uia;
 mod util;
 mod vision;
 mod voice;
+mod walk;
 mod win;
 mod wire;
 
@@ -60,6 +63,14 @@ fn main() {
             .and_then(|i| std::env::args().nth(i + 1));
         let yes = std::env::args().any(|a| a == "--yes");
         std::process::exit(agents::headless(&brief, follow, yes, provider));
+    }
+    if let Some(i) = std::env::args().position(|a| a == "--walk") {
+        // Headless debug mode: plan the next walkthrough step for this screen.
+        let goal = std::env::args().nth(i + 1).unwrap_or_default();
+        let provider = std::env::args()
+            .position(|a| a == "--provider")
+            .and_then(|i| std::env::args().nth(i + 1));
+        std::process::exit(walk::headless(&goal, provider));
     }
     if let Some(i) = std::env::args().position(|a| a == "--ask") {
         // Headless debug mode: capture, ask, print the stream to stdout.
@@ -205,6 +216,7 @@ fn run() -> anyhow::Result<()> {
     }
     apeiron::start();
     wire::start();
+    cards::start();
     config::log("started");
     win::trim_memory();
 
@@ -221,8 +233,11 @@ fn run() -> anyhow::Result<()> {
             let outcome = match ev {
                 AppEvent::Hotkey(win::HK_ASK) => app.ask(false, true, Default::default()),
                 AppEvent::TrayClick | AppEvent::IslandClick => app.ask(false, false, Default::default()),
-                // Agent cards (wave 2) take this over; for now the palette shows its line.
-                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => app.ask(
+                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => {
+                    cards::open(&id);
+                    palette::Outcome::Closed
+                }
+                AppEvent::AgentPalette(id) => app.ask(
                     false,
                     false,
                     palette::Start { open_agent: Some(id), ..Default::default() },

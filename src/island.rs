@@ -117,6 +117,28 @@ impl IslandHandle {
 }
 
 static HANDLE: OnceLock<IslandHandle> = OnceLock::new();
+type Waker = Box<dyn Fn() + Send + Sync>;
+static ANCHOR_WAKER: Mutex<Option<Waker>> = Mutex::new(None);
+
+/// Called (on the island thread; keep it short) whenever [`IslandHandle::anchor`]
+/// changes, so surfaces hanging from the island can follow without polling.
+pub fn on_anchor_change(f: impl Fn() + Send + Sync + 'static) {
+    *ANCHOR_WAKER.lock().unwrap() = Some(Box::new(f));
+}
+
+fn set_anchor(shared: &Shared, r: RECT) {
+    let changed = {
+        let mut a = shared.anchor.lock().unwrap();
+        let changed = *a != r;
+        *a = r;
+        changed
+    };
+    if changed {
+        if let Some(f) = ANCHOR_WAKER.lock().unwrap().as_ref() {
+            f();
+        }
+    }
+}
 
 /// Spawns the island thread (once; later calls return the same handle).
 pub fn start() -> IslandHandle {
@@ -168,7 +190,8 @@ pub fn buddy(s: BuddyState) {
 // ---------------------------------------------------------------- layout (logical px)
 
 const TOP_GAP: f32 = 8.0;
-const PILL_H: f32 = 36.0;
+/// Rest pill height (logical px); the anchor is taller while peeking.
+pub const PILL_H: f32 = 36.0;
 const PEEK_W: f32 = 360.0;
 const PAD_X: f32 = 13.0;
 const PITCH: f32 = 3.2;
@@ -994,7 +1017,7 @@ impl Island {
             self.body.release_memory();
             self.shadow.release_memory();
             self.shadow_key = None;
-            *self.shared.anchor.lock().unwrap() = RECT::default();
+            set_anchor(&self.shared, RECT::default());
             return;
         }
         self.draw(now, opacity);
@@ -1011,12 +1034,15 @@ impl Island {
         let y = m.y + (TOP_GAP * s).round() as i32;
         let first = !self.body.visible();
         self.body.present(&pm, x, y, opacity);
-        *self.shared.anchor.lock().unwrap() = RECT {
-            left: x,
-            top: y,
-            right: x + bw,
-            bottom: y + bh,
-        };
+        set_anchor(
+            &self.shared,
+            RECT {
+                left: x,
+                top: y,
+                right: x + bw,
+                bottom: y + bh,
+            },
+        );
 
         let (side, top, _) = shadow_margins(s);
         let key = (x, y, bw as u32, bh as u32, self.view.radius().to_bits());

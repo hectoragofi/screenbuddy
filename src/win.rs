@@ -30,6 +30,8 @@ pub enum AppEvent {
     AltDoubleTap,
     /// Continue a saved conversation (a quick-ask caption was clicked).
     OpenChat(std::path::PathBuf),
+    /// An agent card's "Open in palette": its full chat in the palette.
+    AgentPalette(String),
 }
 
 static QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());

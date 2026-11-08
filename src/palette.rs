@@ -179,6 +179,8 @@ pub struct Palette {
     chips: Vec<context::Chip>,
     /// History browser, while it is showing (the input is its search box).
     browser: Option<history::Browser>,
+    /// The Agents tab of the history browser, when it is the one showing.
+    agent_view: Option<crate::agent_history::View>,
     /// What was typed before the browser opened.
     draft: String,
     /// Earlier turns of a reopened chat, sent with the next question.
@@ -310,9 +312,22 @@ pub fn setup_fonts(ctx: &egui::Context) {
     if let Some(b) = read("CascadiaMono.ttf").or_else(|| read("consola.ttf")) {
         put("mono", b, FontFamily::Monospace, true);
     }
+    // Geist Mono, for the agent history view (design tokens).
+    for (key, bytes, name) in [
+        ("geist", &include_bytes!("../assets/fonts/GeistMono-Regular.ttf")[..], "geist"),
+        ("geist-medium", &include_bytes!("../assets/fonts/GeistMono-Medium.ttf")[..], "geist-medium"),
+    ] {
+        put(key, bytes.to_vec(), FontFamily::Name(name.into()), true);
+    }
     if let Some(b) = read("seguisym.ttf") {
         put("sym", b.clone(), FontFamily::Proportional, false);
-        put("sym", b, FontFamily::Monospace, false);
+        put("sym", b.clone(), FontFamily::Monospace, false);
+        put("sym", b, FontFamily::Name("geist".into()), false);
+    }
+    if let Some(b) = read("SegUIVar.ttf").or_else(|| read("segoeui.ttf")) {
+        // Glyph fallback for the Geist families (e.g. non-Latin agent output).
+        put("ui2", b.clone(), FontFamily::Name("geist".into()), false);
+        put("ui2", b, FontFamily::Name("geist-medium".into()), false);
     }
     ctx.set_fonts(defs);
 }
@@ -460,6 +475,7 @@ impl Palette {
             width,
             chips: start.chips,
             browser: start.history.then(history::Browser::open),
+            agent_view: None,
             draft: String::new(),
             resume: None,
             created: None,
@@ -499,6 +515,12 @@ impl Palette {
         }
         let q = self.input.trim().to_string();
         if q.is_empty() || self.busy() {
+            return;
+        }
+        // A walkthrough asked a question: this is the answer.
+        if crate::walk::asking() && crate::walk::hear(&q, false) {
+            self.input.clear();
+            self.close(ctx);
             return;
         }
         let Some(mut conv) = self.conv.take() else {
@@ -907,6 +929,7 @@ impl Palette {
     }
 
     fn toggle_browser(&mut self) {
+        self.agent_view = None;
         if self.browser.take().is_some() {
             self.input = std::mem::take(&mut self.draft);
         } else {
@@ -1307,8 +1330,11 @@ impl Palette {
                 | AppEvent::TrayClick
                 | AppEvent::IslandClick
                 | AppEvent::AltDoubleTap => self.close(ctx),
-                // Agent rows are the app's business once the palette is gone.
-                ev @ AppEvent::Island(_) => requeue.push(ev),
+                // Island rows open their card, even over the palette.
+                AppEvent::Island(crate::island::IslandEvent::OpenAgent(id)) => {
+                    crate::cards::open(&id)
+                }
+                AppEvent::AgentPalette(id) => self.show_agent(id),
                 AppEvent::OpenChat(dir) => self.open_chat(ctx, dir),
                 // More files from Explorer join the current question.
                 AppEvent::OpenFile(p) => {
@@ -1469,6 +1495,8 @@ impl Palette {
         self.wave.clear();
         let hint = if self.transcribing.is_some() {
             "Transcribing…"
+        } else if self.agent_view.is_some() {
+            "Search agents"
         } else if self.browser.is_some() {
             "Search history"
         } else if self.exchanges.is_empty() {
@@ -1814,26 +1842,64 @@ impl Palette {
         moving
     }
 
-    /// The history list, in place of the conversation.
+    /// The history list, in place of the conversation: chats, or agents.
     fn history_body(&mut self, ui: &mut egui::Ui, keys: (bool, bool, bool)) {
         let accent = self.accent;
         let query = self.input.clone();
         let max_h = MAX_H - PILL_H - 8.0;
+        let agents_tab = self.agent_view.is_some();
+        let mut switch = false;
         let Some(b) = self.browser.as_mut() else { return };
+        let mut view = self.agent_view.take();
+        let md = &mut self.md;
         let out = egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .max_height(max_h)
             .show(ui, |ui| {
                 ui.add_space(8.0);
-                let a = b.show(ui, &query, keys, accent, TEXT_2, TEXT_2);
+                ui.horizontal(|ui| {
+                    for (name, on) in [("Chats", !agents_tab), ("Agents", agents_tab)] {
+                        let mut t = crate::agent_history::label(name);
+                        if on {
+                            t = t.color(TEXT);
+                        }
+                        let r = ui.add(egui::Button::new(t).frame(false));
+                        if on {
+                            let y = r.rect.bottom();
+                            ui.painter().hline(r.rect.x_range(), y, egui::Stroke::new(1.5, crate::agent_history::accent()));
+                        } else if r.clicked() {
+                            switch = true;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                let a = match view.as_mut() {
+                    Some(v) => {
+                        v.show(ui, &query, keys, md);
+                        None
+                    }
+                    None => b.show(ui, &query, keys, accent, TEXT_2, TEXT_2),
+                };
                 ui.add_space(10.0);
                 a
             });
+        self.agent_view = view;
+        if switch {
+            self.switch_history_tab();
+        }
         self.body_h = out.content_size.y;
         if let Some(history::Action::Open(dir)) = out.inner {
             let ctx = ui.ctx().clone();
             self.open_chat(&ctx, dir);
         }
+    }
+
+    /// Chats <-> Agents in the history browser.
+    fn switch_history_tab(&mut self) {
+        self.agent_view = match self.agent_view {
+            Some(_) => None,
+            None => Some(crate::agent_history::View::default()),
+        };
     }
 
     fn body(&mut self, ui: &mut egui::Ui) {
@@ -2127,6 +2193,13 @@ impl eframe::App for Palette {
         }
         self.frames += 1;
         self.pump();
+        if self.rx.is_none() {
+            // The brain chose a walkthrough: get out of the way of the app.
+            if let Some(goal) = crate::walk::take_request() {
+                crate::walk::start(goal, &self.cfg);
+                self.close(&ctx);
+            }
+        }
         self.handle_app_events(&ctx);
         self.dismiss_on_blur(&ctx);
         if self.voice_pending && self.frames == 2 {
@@ -2147,8 +2220,14 @@ impl eframe::App for Palette {
                     i.consume_key(egui::Modifiers::NONE, Key::Enter),
                 )
             });
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab)) {
+                self.switch_history_tab();
+            }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-                self.toggle_browser();
+                match self.agent_view.as_mut() {
+                    Some(v) if v.in_detail() => v.back(),
+                    _ => self.toggle_browser(),
+                }
             }
         }
         if self.rec.is_some() {

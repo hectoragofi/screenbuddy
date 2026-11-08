@@ -238,6 +238,37 @@ fn approval_ask_and_conversation_scope() {
 }
 
 #[test]
+fn allow_once_asks_again() {
+    let (rt, _) = runtime(
+        "once",
+        Duration::ZERO,
+        Box::new(|_, sink| {
+            let first = sink.approve("Send the email", "click @s1:e4");
+            let second = sink.approve("Send another", "click @s1:e5"); // asks again
+            Ok(format!("{first} {second}"))
+        }),
+    );
+    let rx = rt.subscribe();
+    let id = rt.spawn(Spawn {
+        brief: "email".into(),
+        ..Default::default()
+    });
+    let evs = until(&rx, &id, |e| matches!(e, AgentEvent::Ask(_)));
+    let AgentEvent::Ask(q) = evs.last().unwrap().clone() else {
+        unreachable!()
+    };
+    assert!(rt.answer(&id, q.id, Answer::AllowOnce));
+    let evs = until(&rx, &id, |e| matches!(e, AgentEvent::Ask(_)));
+    let AgentEvent::Ask(q2) = evs.last().unwrap().clone() else {
+        unreachable!()
+    };
+    assert_eq!(q2.text, "Send another");
+    assert!(rt.answer(&id, q2.id, Answer::Deny));
+    let evs = until(&rx, &id, finished);
+    assert!(evs.contains(&AgentEvent::Result("true false".into())));
+}
+
+#[test]
 fn deny_and_retry_after_failure() {
     let (rt, fake) = runtime(
         "retry",
@@ -411,4 +442,67 @@ fn parses_cli_stream() {
 #[test]
 fn router_tool_input() {
     assert!(spawn_from_tool(&json!({"name": "x", "brief": "  "}), None).is_err());
+}
+
+#[test]
+fn archive_hides_from_browse_but_not_from_search() {
+    let root = tmp_root("archive");
+    let mk = |n: u32, name: &str, brief: &str| Agent {
+        id: format!("20260101-00000{n}-000{n}"),
+        name: name.into(),
+        brief: brief.into(),
+        status: Status::Done,
+        created: n as u64,
+        ..Default::default()
+    };
+    let a = mk(1, "Lisbon flights", "find flights");
+    let mut b = mk(2, "Tidy desktop", "sort files");
+    b.files = vec![PathBuf::from("C:/work/report-final.pdf")];
+    store::save(&root, &a).unwrap();
+    store::save(&root, &b).unwrap();
+    let rt = Runtime::new(
+        root.clone(),
+        Arc::new(Fake(Box::new(|_, _| Ok(String::new())), Mutex::new(Vec::new()))),
+        Duration::ZERO,
+        Arc::new(Config::default),
+    );
+    let ids = |v: Vec<Agent>| v.into_iter().map(|x| x.id).collect::<Vec<_>>();
+    assert_eq!(ids(store::browse(rt.list(), "")), vec![b.id.clone(), a.id.clone()]);
+
+    assert!(rt.archive(&b.id, true));
+    assert!(!rt.archive("missing", true));
+    assert!(store::load(&root, &b.id).unwrap().archived, "persisted");
+    // Hidden unless searching.
+    assert_eq!(ids(store::browse(rt.list(), "")), vec![a.id.clone()]);
+    assert_eq!(ids(store::browse(rt.list(), "  ")), vec![a.id.clone()]);
+    assert_eq!(ids(store::browse(rt.list(), "tidy")), vec![b.id.clone()]);
+    // Files are searched too.
+    assert_eq!(ids(store::browse(rt.list(), "report-final")), vec![b.id.clone()]);
+    assert!(store::browse(rt.list(), "report banana").is_empty());
+
+    assert!(rt.archive(&b.id, false));
+    assert_eq!(store::browse(rt.list(), "").len(), 2);
+}
+
+#[test]
+fn old_records_without_archived_load_and_delete_removes_dir() {
+    let root = tmp_root("delete");
+    let dir = root.join("20260101-000000-0001");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("agent.json"), r#"{"id":"20260101-000000-0001","name":"Old","status":"done"}"#).unwrap();
+    std::fs::write(dir.join("notes.md"), "x").unwrap();
+    let rt = Runtime::new(
+        root.clone(),
+        Arc::new(Fake(Box::new(|_, _| Ok(String::new())), Mutex::new(Vec::new()))),
+        Duration::ZERO,
+        Arc::new(Config::default),
+    );
+    let all = rt.list();
+    assert_eq!(all.len(), 1);
+    assert!(!all[0].archived);
+    assert!(!rt.delete("../escape"));
+    assert!(dir.exists());
+    assert!(rt.delete("20260101-000000-0001"));
+    assert!(!dir.exists());
+    assert!(rt.list().is_empty());
 }

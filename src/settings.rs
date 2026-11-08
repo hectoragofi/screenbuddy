@@ -609,6 +609,17 @@ impl Settings {
             row(ui, "Always approve agent actions", Some("Agents delete, send or pay without asking"), |ui| {
                 toggle(ui, &mut self.cfg.agents.always_approve, accent);
             });
+            sep(ui);
+            row(ui, "Let agents use your mouse", Some("Only when you ask to watch; it asks first and pauses the moment you touch anything"), |ui| {
+                let mut on = self.cfg.agents.drive != "never";
+                toggle(ui, &mut on, accent);
+                self.cfg.agents.drive = if on { "ask" } else { "never" }.into();
+            });
+        });
+        group(ui, "Walkthroughs", |ui| {
+            row(ui, "Show me how", Some("Asking how to do something points at each step and waits for your click"), |ui| {
+                toggle(ui, &mut self.cfg.walk.enabled, accent);
+            });
         });
         group(ui, "Agent cursor", |ui| {
             row(ui, "Show cursor while acting", Some("A separate pointer, so you can see what it's doing"), |ui| {

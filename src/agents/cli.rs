@@ -156,6 +156,10 @@ pub(crate) fn run(job: &TurnJob, sink: &Sink) -> Result<String, String> {
     if desktop {
         allowed.push("mcp__screenbuddy__desktop");
     }
+    allowed.push("mcp__screenbuddy__window_screenshot");
+    if super::drive::enabled(cfg) {
+        allowed.push("mcp__screenbuddy__drive");
+    }
     let allowed = allowed.join(" ");
     let system = super::agent_prompt(cfg, desktop);
     let model = if cfg.agents.model.trim().is_empty() {
@@ -308,7 +312,10 @@ fn died(proc: &mut Child, err: &std::sync::Mutex<String>) -> String {
 
 /// Answers the agent's `screenbuddy --mcp`: one JSON line in, one line out.
 /// `{"intent","detail"}` (approval) -> "allow" | "deny";
-/// `{"kind":"ask","questions":[..]}` -> `{"answer": "..."}`.
+/// `{"kind":"ask","questions":[..]}` -> `{"answer": "..."}`;
+/// `{"kind":"desk","args","out","t0"}` -> "ok" (a desktop action ran);
+/// `{"kind":"desk_windows"}` -> `{"windows":[{hwnd,title}]}`;
+/// `{"kind":"drive","input"}` -> `{"text","is_error"}`.
 fn serve(listener: std::net::TcpListener, sink: Sink, done: Arc<AtomicBool>) {
     let _ = listener.set_nonblocking(true);
     std::thread::spawn(move || {
@@ -323,6 +330,15 @@ fn serve(listener: std::net::TcpListener, sink: Sink, done: Arc<AtomicBool>) {
                         let req: Value = serde_json::from_str(&line).unwrap_or_default();
                         let reply = if req["kind"] == "ask" {
                             json!({"answer": sink.questions(strs(&req["questions"]))}).to_string()
+                        } else if req["kind"] == "desk" {
+                            sink.desk_action(&strs(&req["args"]), req["out"].as_str().unwrap_or(""), req["t0"].as_u64().unwrap_or(0));
+                            "ok".to_string()
+                        } else if req["kind"] == "desk_windows" {
+                            let w: Vec<Value> = sink.desk_windows().into_iter().map(|(h, t)| json!({"hwnd": h, "title": t})).collect();
+                            json!({"windows": w}).to_string()
+                        } else if req["kind"] == "drive" {
+                            let (text, is_error) = super::drive::call(&sink, &req["input"]);
+                            json!({"text": text, "is_error": is_error}).to_string()
                         } else {
                             let ok = sink.approve(
                                 req["intent"].as_str().unwrap_or("perform an action"),
