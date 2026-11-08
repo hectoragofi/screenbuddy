@@ -25,8 +25,15 @@ pub const DRAW_PROMPT: &str = "You can also point at things on their screen with
 
 pub const DRAW_DESC: &str = "Point at something on the user's screen. Use only when the user needs to locate a UI element and words alone would leave them searching; never for decoration or emphasis. Coordinates are screenshot pixels, origin top-left. Kinds: box (x,y,w,h outline around the target; the default choice), circle (x,y center, r), highlight (x,y,w,h translucent fill for a text span or region), arrow (x,y tail -> x2,y2 head on a small target), text (a label at x,y), diagram (a Mermaid diagram drawn on a dark card with its top-left at x,y; put the source in `mermaid`, optional w caps the card width; place it in empty space beside what it explains, not over it). One shape is usually right.";
 
-fn anthropic_tools(draw: bool, desktop: bool, agents: bool) -> Value {
+fn anthropic_tools(draw: bool, desktop: bool, agents: bool, walk: bool) -> Value {
     let mut tools = Vec::new();
+    if walk {
+        tools.push(json!({
+            "name": "start_walkthrough",
+            "description": crate::walk::DESC,
+            "input_schema": crate::walk::schema()
+        }));
+    }
     if agents {
         tools.push(json!({
             "name": "spawn_agent",
@@ -244,6 +251,7 @@ impl Out {
             },
             ("desktop", Some(exe)) => self.desktop(&input, exe),
             ("spawn_agent", _) => self.spawn_agent(&input),
+            ("start_walkthrough", _) => crate::walk::request(&input),
             _ => ("error: unknown tool".into(), true),
         }
     }
@@ -355,6 +363,10 @@ fn system_prompt(cfg: &Config) -> String {
     if crate::agents::router_enabled(cfg) && (cfg.provider != "openai" || cfg.openai.tools) {
         p.push_str("\n\n");
         p.push_str(crate::agents::ROUTER_PROMPT);
+    }
+    if crate::walk::router_enabled(cfg) {
+        p.push_str("\n\n");
+        p.push_str(crate::walk::PROMPT);
     }
     if !cfg.extra_instructions.trim().is_empty() {
         p.push_str("\n\n");
@@ -480,7 +492,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
             "messages": conv.anthropic,
             "stream": true,
             "output_config": {"effort": cfg.effort},
-            "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some(), crate::agents::router_enabled(&turn.cfg)), &turn.cfg),
+            "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some(), crate::agents::router_enabled(&turn.cfg), crate::walk::router_enabled(&turn.cfg)), &turn.cfg),
         });
         if turn.cfg.vision.web_search {
             if let Some(t) = body["tools"].as_array_mut() {
@@ -706,6 +718,9 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             }
             if crate::agents::router_enabled(&turn.cfg) {
                 tools.push(json!({"type": "function", "function": {"name": "spawn_agent", "description": crate::agents::SPAWN_DESC, "parameters": crate::agents::spawn_schema()}}));
+            }
+            if crate::walk::router_enabled(&turn.cfg) {
+                tools.push(json!({"type": "function", "function": {"name": "start_walkthrough", "description": crate::walk::DESC, "parameters": crate::walk::schema()}}));
             }
             tools.extend(crate::vision::openai_tools(&turn.cfg));
             if !tools.is_empty() {
@@ -1070,6 +1085,9 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
     if crate::agents::router_enabled(full_cfg) {
         allowed_list.push("mcp__screenbuddy__spawn_agent");
     }
+    if crate::walk::router_enabled(full_cfg) {
+        allowed_list.push("mcp__screenbuddy__start_walkthrough");
+    }
     allowed_list.extend(crate::vision::cli_allowed(full_cfg));
     let web = full_cfg.vision.web_search;
     if web {
@@ -1276,6 +1294,11 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
                             if b["name"].as_str().is_some_and(|n| n.ends_with("spawn_agent")) =>
                         {
                             let _ = out.spawn_agent(&b["input"]);
+                        }
+                        Some("tool_use")
+                            if b["name"].as_str().is_some_and(|n| n.ends_with("start_walkthrough")) =>
+                        {
+                            let _ = crate::walk::request(&b["input"]);
                         }
                         // Partial streaming unavailable: fall back to the full message text.
                         Some("text") if !streamed_this_msg => {

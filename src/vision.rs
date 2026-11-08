@@ -183,7 +183,7 @@ pub fn prompt(cfg: &Config) -> String {
     if v.zoom {
         p.push_str("\n\nIf text or icons you need are too small to read reliably, call `zoom` with that region of the screenshot to see it at full resolution before answering. Don't zoom when the screenshot is already clear.");
     }
-    if v.guide {
+    if v.guide && !crate::walk::router_enabled(cfg) {
         p.push_str("\n\nWhen the user wants to be walked through doing something on screen, guide one step at a time: point at only the next target (draw with clear: true), say that one step in a short sentence, then call `watch`. It waits until the user acts and returns a fresh screenshot; check it and continue with the next step, or correct them if something went wrong. When the task is done, say so briefly and stop calling `watch`. If watch says the user stopped, stop guiding.");
     }
     p
@@ -217,7 +217,7 @@ fn defs(cfg: &Config) -> Vec<(&'static str, &'static str, Value)> {
     if cfg.vision.zoom {
         v.push(("zoom", ZOOM_DESC, zoom_schema()));
     }
-    if cfg.vision.guide {
+    if cfg.vision.guide && !crate::walk::router_enabled(cfg) {
         v.push(("watch", WATCH_DESC, watch_schema()));
     }
     v
@@ -264,7 +264,7 @@ pub fn cli_allowed(cfg: &Config) -> Vec<&'static str> {
     if cfg.vision.zoom {
         v.push("mcp__screenbuddy__zoom");
     }
-    if cfg.vision.guide {
+    if cfg.vision.guide && !crate::walk::router_enabled(cfg) {
         v.push("mcp__screenbuddy__watch");
     }
     v
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn element_snaps() {
         let b = base();
-        let el = Element { kind: "button", name: "Save".into(), rect: Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }, focused: false };
+        let el = Element { kind: "button", name: "Save".into(), rect: Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }, focused: false, automation_id: String::new() };
         let out = resolve(json!({"shapes": [{"kind": "box", "element": "e1"}, {"kind": "circle", "element": "e1"}, {"kind": "arrow", "element": "e1"}]}), b, &[], &[el.clone()]).unwrap();
         let bx = &out["shapes"][0];
         assert!((bx["x"].as_f64().unwrap() - 143.0).abs() < 0.1 && (bx["w"].as_f64().unwrap() - 143.0).abs() < 0.1, "{bx}");
@@ -825,7 +825,7 @@ mod tests {
         assert!((143.0..=286.1).contains(&hx) && (80.3..=160.9).contains(&hy), "{a}");
         assert!(a["x"].as_f64().unwrap() > 286.0);
         assert!(resolve(json!({"shapes": [{"kind": "box", "element": "e2"}]}), b, &[], &[el]).is_err());
-        let txt = format_elements(&[Element { kind: "button", name: "Save".into(), rect: Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }, focused: true }], b);
+        let txt = format_elements(&[Element { kind: "button", name: "Save".into(), rect: Rect { x: 1920 + 384, y: 216, w: 384, h: 216 }, focused: true, automation_id: String::new() }], b);
         assert!(txt.contains("e1 button \"Save\" 143,80,143,80 *"), "{txt}");
     }
 
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn select_prefers_named() {
-        let e = |n: &str| Element { kind: "button", name: n.into(), rect: Rect::default(), focused: false };
+        let e = |n: &str| Element { kind: "button", name: n.into(), rect: Rect::default(), focused: false, automation_id: String::new() };
         let got = select(vec![e(""), e("a"), e(""), e("b")], 2);
         assert_eq!(got.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     }

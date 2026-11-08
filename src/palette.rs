@@ -501,6 +501,12 @@ impl Palette {
         if q.is_empty() || self.busy() {
             return;
         }
+        // A walkthrough asked a question: this is the answer.
+        if crate::walk::asking() && crate::walk::hear(&q, false) {
+            self.input.clear();
+            self.close(ctx);
+            return;
+        }
         let Some(mut conv) = self.conv.take() else {
             return;
         };
@@ -2127,6 +2133,13 @@ impl eframe::App for Palette {
         }
         self.frames += 1;
         self.pump();
+        if self.rx.is_none() {
+            // The brain chose a walkthrough: get out of the way of the app.
+            if let Some(goal) = crate::walk::take_request() {
+                crate::walk::start(goal, &self.cfg);
+                self.close(&ctx);
+            }
+        }
         self.handle_app_events(&ctx);
         self.dismiss_on_blur(&ctx);
         if self.voice_pending && self.frames == 2 {

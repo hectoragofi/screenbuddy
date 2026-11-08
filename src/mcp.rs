@@ -62,6 +62,9 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
             if crate::agents::router_enabled(&crate::config::load().0) {
                 tools.push(crate::agents::mcp_spawn_tool());
             }
+            if crate::walk::router_enabled(&crate::config::load().0) {
+                tools.push(json!({"name": "start_walkthrough", "description": crate::walk::DESC, "inputSchema": crate::walk::schema()}));
+            }
             Ok(json!({"tools": tools}))
         }
         "tools/call" => {
@@ -72,6 +75,8 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
                 _ if agent_tool.is_some() => agent_tool.unwrap_or_default(),
                 Some("draw") if crate::agents::is_agent_mcp() => return Err((-32602, "unknown tool draw".into())),
                 Some("draw") => validate(&p["arguments"]),
+                // The parent reads the call from the CLI's stream and starts it.
+                Some("start_walkthrough") if !crate::agents::is_agent_mcp() => (crate::walk::ACK.to_string(), false),
                 Some("desktop") => desktop(&p["arguments"]),
                 Some(n) if crate::vision::is_tool(n) => return Ok(crate::vision::mcp_call(n, &p["arguments"])),
                 _ => return Err((-32602, format!("unknown tool {}", p["name"]))),

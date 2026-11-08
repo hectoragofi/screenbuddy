@@ -38,6 +38,8 @@ pub struct Element {
     /// Bounds in virtual-screen pixels.
     pub rect: Rect,
     pub focused: bool,
+    /// UIA AutomationId (stable across languages; often empty).
+    pub automation_id: String,
 }
 
 /// Top-level windows worth describing, in priority order: the foreground
@@ -145,6 +147,7 @@ unsafe fn walk(
             UIA_IsOffscreenPropertyId,
             UIA_IsKeyboardFocusablePropertyId,
             UIA_HasKeyboardFocusPropertyId,
+            UIA_AutomationIdPropertyId,
         ] {
             cache.AddProperty(p)?;
         }
@@ -184,6 +187,7 @@ unsafe fn walk(
                     name: name.clone(),
                     rect,
                     focused: el.CachedHasKeyboardFocus().map(|b| b.as_bool()).unwrap_or(false),
+                    automation_id: clean(&el.CachedAutomationId().map(|b| b.to_string()).unwrap_or_default()),
                 });
             }
             if depth >= MAX_DEPTH {

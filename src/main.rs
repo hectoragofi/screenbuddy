@@ -27,6 +27,7 @@ mod uia;
 mod util;
 mod vision;
 mod voice;
+mod walk;
 mod win;
 mod wire;
 
@@ -60,6 +61,14 @@ fn main() {
             .and_then(|i| std::env::args().nth(i + 1));
         let yes = std::env::args().any(|a| a == "--yes");
         std::process::exit(agents::headless(&brief, follow, yes, provider));
+    }
+    if let Some(i) = std::env::args().position(|a| a == "--walk") {
+        // Headless debug mode: plan the next walkthrough step for this screen.
+        let goal = std::env::args().nth(i + 1).unwrap_or_default();
+        let provider = std::env::args()
+            .position(|a| a == "--provider")
+            .and_then(|i| std::env::args().nth(i + 1));
+        std::process::exit(walk::headless(&goal, provider));
     }
     if let Some(i) = std::env::args().position(|a| a == "--ask") {
         // Headless debug mode: capture, ask, print the stream to stdout.
