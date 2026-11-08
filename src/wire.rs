@@ -4,12 +4,16 @@
 use crate::agents::{self, Agent, Status};
 use crate::island::{self, AgentRow, AgentStatus, BuddyState};
 use crate::{apeiron, keys, quick};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Unix seconds when the user last looked at agents (opened the palette or an
 /// agent). Agents that finished after this count as unseen on the island.
 static SEEN: AtomicU64 = AtomicU64::new(0);
+/// Finished agents whose card the user opened since.
+static SEEN_IDS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// Hooks everything up (once, after the island, quick ask and Apeiron start).
 pub fn start() {
@@ -48,16 +52,42 @@ pub fn start() {
         });
 }
 
+/// The user opened this agent's card: its island row is no longer new.
+pub fn mark_agent_seen(id: &str) {
+    let fresh = SEEN_IDS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashSet::new)
+        .insert(id.to_string());
+    if fresh {
+        push_rows();
+    }
+}
+
 /// The user looked at agents: clear the island's "new" marks.
 pub fn mark_seen() {
     SEEN.store(now(), Ordering::Relaxed);
+    *SEEN_IDS.lock().unwrap() = None;
     push_rows();
 }
 
 fn push_rows() {
     if let Some(h) = island::handle() {
         let seen = SEEN.load(Ordering::Relaxed);
-        h.set_agents(agents::list().iter().map(|a| row(a, seen)).collect());
+        let opened = SEEN_IDS.lock().unwrap().clone().unwrap_or_default();
+        h.set_agents(
+            agents::list()
+                .iter()
+                .map(|a| {
+                    let mut r = row(a, seen);
+                    // Opening a card covers its run; a new run is new again.
+                    if r.kind != AgentStatus::Asking && opened.contains(&a.id) {
+                        r.unseen = false;
+                    }
+                    r
+                })
+                .collect(),
+        );
     }
 }
 

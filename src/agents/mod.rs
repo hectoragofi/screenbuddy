@@ -47,6 +47,7 @@
 
 mod api;
 mod cli;
+pub mod desk;
 mod store;
 
 pub use store::Agent;
