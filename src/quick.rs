@@ -337,7 +337,9 @@ impl Quick {
             question: question.clone(),
         });
         status(Status::Thinking);
-        let mut cfg = self.cfg.clone();
+        let mut cfg = self
+            .cfg
+            .overridden(&self.cfg.input.provider, &self.cfg.input.model, "");
         cfg.extra_instructions = if cfg.extra_instructions.trim().is_empty() {
             BRIEF.to_string()
         } else {

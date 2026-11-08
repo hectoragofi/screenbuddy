@@ -255,15 +255,23 @@ pub fn run(exe: &std::path::Path, args: &[String]) -> String {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     const MAX: usize = 40_000;
 
-    let child = Command::new(exe)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+    let spawn = |flags: u32| {
+        Command::new(exe)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(flags)
+            .spawn()
+    };
+    // Outside the turn's kill-on-close job: whatever agent-desktop launches
+    // must keep running after the answer ends. A foreign job that forbids
+    // breakaway refuses the flag, so fall back to a plain spawn.
+    let child = spawn(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|_| spawn(CREATE_NO_WINDOW));
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return json!({"ok": false, "error": {"message": format!("could not start agent-desktop: {e}")}}).to_string(),
