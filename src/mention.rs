@@ -18,6 +18,8 @@ const PAGE_CAP: usize = 30_000;
 const PAGE_BYTES: u64 = 3 * 1024 * 1024;
 /// Recent chats offered as `@chat` items.
 const RECENT_CHATS: usize = 6;
+/// Apeiron windows offered as `@window` items.
+const MAX_WINDOWS: usize = 12;
 
 #[derive(Clone)]
 pub enum Kind {
@@ -27,6 +29,8 @@ pub enum Kind {
     Url(Option<String>),
     Screen(Rect),
     Chat(PathBuf),
+    /// An Apeiron window (hwnd, title), captured even when off-screen.
+    Window(isize, String),
 }
 
 #[derive(Clone)]
@@ -103,6 +107,15 @@ impl Menu {
             }
             items.push(item(&format!("screen{}", i + 1), &format!("Screenshot of monitor {} ({}×{})", i + 1, r.w, r.h), Kind::Screen(r)));
         }
+        // Apeiron windows, including ones panned away or hidden as tabs.
+        if let Some(l) = crate::apeiron::get() {
+            for w in l.windows.iter().filter(|w| !w.title.trim().is_empty()).take(MAX_WINDOWS) {
+                let title = cap_chars(w.title.trim(), 60);
+                let where_ = if w.visible() { "" } else { " · off-screen" };
+                let exe = w.exe.trim_end_matches(".exe");
+                items.push(item("window", &format!("Window: {title} · {exe}{where_}"), Kind::Window(w.hwnd, title)));
+            }
+        }
         if cfg.history {
             for dir in crate::history::list_dirs(&crate::config::history_dir()).into_iter().take(RECENT_CHATS * 2) {
                 if items.iter().filter(|i| matches!(i.kind, Kind::Chat(_))).count() >= RECENT_CHATS {
@@ -157,6 +170,7 @@ pub fn resolve(kind: Kind, owner: Option<HWND>) -> Option<Pending> {
             Kind::Url(None) => Err("Copy a link first, or type @https://… and a space".into()),
             Kind::Screen(r) => screen_chip(r),
             Kind::Chat(dir) => chat_chip(&dir),
+            Kind::Window(hwnd, title) => window_chip(hwnd, &title),
             Kind::File => unreachable!(),
         };
         let _ = tx.send(r);
@@ -197,6 +211,16 @@ fn screen_chip(r: Rect) -> Result<Chip, String> {
         label: format!("Monitor {}×{}", r.w, r.h),
         hover: format!("Screenshot of the monitor at {},{}", r.x, r.y),
         prompt: "[Screenshot of the user's other monitor, sent as the image after the main screenshot]".into(),
+        image: Some(crate::llm::Image { jpeg: std::sync::Arc::new(cap.jpeg), w: cap.img_w, h: cap.img_h }),
+    })
+}
+
+fn window_chip(hwnd: isize, title: &str) -> Result<Chip, String> {
+    let cap = capture::window_capture(hwnd).map_err(|e| format!("Could not capture that window: {e}"))?;
+    Ok(Chip {
+        label: format!("Window: {}", cap_chars(title, 32)),
+        hover: format!("Screenshot of \"{title}\" ({}×{})", cap.src.w, cap.src.h),
+        prompt: format!("[Screenshot of the user's window \"{title}\", sent as the image after the main screenshot]"),
         image: Some(crate::llm::Image { jpeg: std::sync::Arc::new(cap.jpeg), w: cap.img_w, h: cap.img_h }),
     })
 }

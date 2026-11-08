@@ -54,6 +54,13 @@ pub fn pop() -> Option<AppEvent> {
     QUEUE.lock().unwrap().pop_front()
 }
 
+/// Repaints the open palette, if any (from any thread).
+pub fn request_repaint() {
+    if let Some(ctx) = CTX.lock().unwrap().as_ref() {
+        ctx.request_repaint();
+    }
+}
+
 /// Registers the egui context of the open palette so events repaint it.
 pub fn set_ctx(ctx: Option<egui::Context>) {
     *CTX.lock().unwrap() = ctx;

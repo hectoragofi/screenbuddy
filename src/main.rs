@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod apeiron;
 mod buddy;
 mod caption;
 mod capture;
@@ -187,6 +188,7 @@ fn run() -> anyhow::Result<()> {
     if let Some(e) = &app.cfg_error {
         config::log(e);
     }
+    apeiron::start();
     config::log("started");
     win::trim_memory();
 
