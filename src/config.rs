@@ -24,6 +24,7 @@ pub struct Config {
     pub context: ContextCfg,
     pub voice: VoiceCfg,
     pub island: IslandCfg,
+    pub input: InputCfg,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -60,6 +61,23 @@ pub struct VoiceCfg {
     pub auto_send: bool,
     /// "" = detect, or en | de | fr | es | it | nl | pl.
     pub language: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct InputCfg {
+    /// Hold Alt alone to ask by voice; the answer appears beside the cursor.
+    pub alt_hold: bool,
+    /// How long Alt must be held before recording starts.
+    pub alt_hold_ms: u32,
+    /// Double-tap Alt to open the palette.
+    pub alt_double_tap: bool,
+}
+
+impl Default for InputCfg {
+    fn default() -> Self {
+        Self { alt_hold: true, alt_hold_ms: 600, alt_double_tap: true }
+    }
 }
 
 impl Default for ContextCfg {
@@ -198,6 +216,7 @@ impl Default for Config {
             context: ContextCfg::default(),
             voice: VoiceCfg::default(),
             island: IslandCfg::default(),
+            input: InputCfg::default(),
         }
     }
 }
