@@ -775,6 +775,8 @@ struct Island {
     dirty: bool,
     shadow_key: Option<(i32, i32, u32, u32, u32)>,
     shadow_alpha: f32,
+    /// A click opened the palette: no peeking again until the cursor leaves.
+    no_peek: bool,
 }
 
 fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
@@ -796,6 +798,7 @@ fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
         dirty: true,
         shadow_key: None,
         shadow_alpha: -1.0,
+        no_peek: false,
     };
     isl.shown.set(1.0);
     unsafe {
@@ -921,8 +924,11 @@ impl Island {
             }
         }
         let since = changed.map_or(Duration::MAX, |t| now.saturating_duration_since(t));
+        if !hovered {
+            self.no_peek = false;
+        }
         let peek = if hovered {
-            self.view.peek || since >= PEEK_DELAY
+            !self.no_peek && (self.view.peek || since >= PEEK_DELAY)
         } else {
             self.view.peek && since < UNPEEK_DELAY
         };
@@ -946,6 +952,7 @@ impl Island {
             match self.view.hit(x as f32 / s, y as f32 / s) {
                 Hit::Pill | Hit::Ask => {
                     self.view.peek = false;
+                    self.no_peek = true;
                     crate::win::push(crate::win::AppEvent::IslandClick);
                 }
                 Hit::Agent(i) => {
@@ -1049,7 +1056,7 @@ impl Island {
             (i.hovered, i.changed_at)
         });
         if let Some(c) = changed {
-            if hovered && !self.view.peek {
+            if hovered && !self.view.peek && !self.no_peek {
                 at.push(c + PEEK_DELAY);
             } else if !hovered && self.view.peek {
                 at.push(c + UNPEEK_DELAY);
