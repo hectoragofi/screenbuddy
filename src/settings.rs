@@ -616,6 +616,11 @@ impl Settings {
                 self.cfg.agents.drive = if on { "ask" } else { "never" }.into();
             });
         });
+        group(ui, "Walkthroughs", |ui| {
+            row(ui, "Show me how", Some("Asking how to do something points at each step and waits for your click"), |ui| {
+                toggle(ui, &mut self.cfg.walk.enabled, accent);
+            });
+        });
         group(ui, "Agent cursor", |ui| {
             row(ui, "Show cursor while acting", Some("A separate pointer, so you can see what it's doing"), |ui| {
                 toggle(ui, &mut self.cfg.agent_desktop.cursor, accent);

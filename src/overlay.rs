@@ -556,7 +556,7 @@ fn draw_pin(pm: &mut Pixmap, s: &Shape, scale: f32, grow: f32, alpha: f32, t: Tr
     }
 }
 
-fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
+pub(crate) fn draw_shape(pm: &mut Pixmap, s: &Shape, scale: f32, m: Rect, t: Transform) {
     let w = 3.0 * scale;
     if ring_path(s, scale).is_some() {
         draw_pin(pm, s, scale, 1.0, 1.0, t);

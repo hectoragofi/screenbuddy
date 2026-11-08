@@ -26,6 +26,21 @@ pub struct Config {
     pub island: IslandCfg,
     pub input: InputCfg,
     pub agents: AgentsCfg,
+    pub walk: WalkCfg,
+}
+
+/// Step-by-step walkthroughs ("show me how to ...").
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct WalkCfg {
+    /// Let the assistant start a walkthrough when you ask how to do something.
+    pub enabled: bool,
+}
+
+impl Default for WalkCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -239,6 +254,7 @@ impl Default for Config {
             island: IslandCfg::default(),
             input: InputCfg::default(),
             agents: AgentsCfg::default(),
+            walk: WalkCfg::default(),
         }
     }
 }

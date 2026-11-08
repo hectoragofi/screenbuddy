@@ -41,6 +41,7 @@ pub const LINE_ALPHA: f32 = tokens::LINE.a as f32 / 255.0;
 pub const SIGNAL: [u8; 3] = rgb3(tokens::SIGNAL);
 pub const OK: [u8; 3] = rgb3(tokens::OK);
 pub const ERR: [u8; 3] = rgb3(tokens::ERR);
+pub const ASK: [u8; 3] = rgb3(tokens::ASK);
 
 /// Logical px.
 const MAX_W: f32 = 380.0;
@@ -77,6 +78,22 @@ pub enum Phase {
     Streaming,
     Done,
     Error,
+    /// A walkthrough step waiting for the user (calm, no animation).
+    Step,
+    /// A walkthrough question waiting for an answer.
+    Ask,
+}
+
+/// What the card's footer offers.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Chrome {
+    /// "Open in palette" once done (quick ask).
+    #[default]
+    Answer,
+    /// Walkthrough: "Stop" left, `next` label right.
+    Step { next: &'static str },
+    /// No footer.
+    Plain,
 }
 
 /// Everything the card shows. Pure data, so it renders headlessly.
@@ -94,6 +111,7 @@ pub struct View {
     pub hover: bool,
     /// Tallest the card may get, logical px.
     pub max_h: f32,
+    pub chrome: Chrome,
 }
 
 impl Default for View {
@@ -106,6 +124,7 @@ impl Default for View {
             t: 0.0,
             hover: false,
             max_h: 420.0,
+            chrome: Chrome::Answer,
         }
     }
 }
@@ -651,8 +670,10 @@ fn fit_label(s: &str, w: f32) -> String {
 pub fn render(v: &View, scale: f32) -> Option<Pixmap> {
     let s = scale;
     let blocks = parse(&v.body);
-    let has_body =
-        matches!(v.phase, Phase::Streaming | Phase::Done | Phase::Error) && !blocks.is_empty();
+    let has_body = matches!(
+        v.phase,
+        Phase::Streaming | Phase::Done | Phase::Error | Phase::Step | Phase::Ask
+    ) && !blocks.is_empty();
     let label_w_nat = text_w(
         &v.label.to_uppercase(),
         LABEL_PX,
@@ -670,7 +691,11 @@ pub fn render(v: &View, scale: f32) -> Option<Pixmap> {
     } else {
         Vec::new()
     };
-    let footer = matches!(v.phase, Phase::Done);
+    let footer = match v.chrome {
+        Chrome::Answer => v.phase == Phase::Done,
+        Chrome::Step { .. } => true,
+        Chrome::Plain => false,
+    };
     let label_h = LABEL_PX + 6.0;
     let body_top = PAD + label_h + 8.0;
     let meter_h = 22.0;
@@ -745,6 +770,8 @@ pub fn render(v: &View, scale: f32) -> Option<Pixmap> {
         Phase::Streaming => (SIGNAL, 1.0),
         Phase::Done => (OK, 1.0),
         Phase::Error => (ERR, 1.0),
+        Phase::Step => (SIGNAL, 1.0),
+        Phase::Ask => (ASK, 1.0),
     };
     let label_mid = y0 + label_h * s * 0.5;
     circle(&mut pm, x0 + 3.0 * s, label_mid, 3.0 * s, rgba(dot, pulse));
@@ -917,7 +944,15 @@ pub fn render(v: &View, scale: f32) -> Option<Pixmap> {
             }
         }
     }
-    if footer {
+    if let (true, Chrome::Step { next }) = (footer, v.chrome) {
+        // Two big targets: Stop on the left half, Next on the right.
+        let fy = m + (h - PAD - 2.0) * s;
+        let col = if v.hover { PAPER } else { MUTE };
+        let a = if v.hover { 1.0 } else { 0.8 };
+        draw_text(&mut pm, "STOP", x0, fy, LABEL_PX * s, false, track, col, a);
+        let nw = text_w(next, LABEL_PX * s, false, track);
+        draw_text(&mut pm, next, m + (w - PAD) * s - nw, fy, LABEL_PX * s, false, track, SIGNAL, a);
+    } else if footer {
         let text = if cut_bottom {
             "MORE IN PALETTE  ›"
         } else {
@@ -960,6 +995,22 @@ pub enum Cmd {
     /// Drawings for the overlay on `monitor`.
     Draw(DrawCall, Rect, f32),
     Hide,
+    /// A walkthrough card beside `near` (or the cursor), with an optional
+    /// pointer drawn on the overlay. Replaces whatever the caption showed.
+    Walk(Card),
+}
+
+/// One walkthrough card (see `walk.rs`).
+#[derive(Debug, Clone)]
+pub struct Card {
+    pub phase: Phase,
+    pub label: String,
+    pub body: String,
+    pub chrome: Chrome,
+    /// Screen rect to sit beside (physical px); None = beside the cursor.
+    pub near: Option<Rect>,
+    /// The ring/pointer at the target (screen px).
+    pub pointer: Option<crate::overlay::Shape>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -968,16 +1019,21 @@ pub enum CaptionEvent {
     Clicked,
     /// Right click, or it faded away.
     Dismissed,
+    /// Walkthrough card: "Next" (or "Skip").
+    Next,
+    /// Walkthrough card: "Stop", or a right click.
+    Stop,
 }
 
 static TX: Mutex<Option<Sender<Cmd>>> = Mutex::new(None);
 static THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static EVENTS: Mutex<Option<Sender<CaptionEvent>>> = Mutex::new(None);
+static EVENTS: Mutex<Vec<Sender<CaptionEvent>>> = Mutex::new(Vec::new());
 const WM_WAKE: u32 = WM_APP + 3;
 
-/// Where clicks and dismissals go.
+/// Where clicks and dismissals go (every subscriber gets every event;
+/// dropped receivers are forgotten).
 pub fn subscribe(tx: Sender<CaptionEvent>) {
-    *EVENTS.lock().unwrap() = Some(tx);
+    EVENTS.lock().unwrap().push(tx);
 }
 
 /// Sends a command, starting the caption thread on first use.
@@ -1008,9 +1064,7 @@ pub fn send(cmd: Cmd) {
 }
 
 fn emit(ev: CaptionEvent) {
-    if let Some(tx) = EVENTS.lock().unwrap().as_ref() {
-        let _ = tx.send(ev);
-    }
+    EVENTS.lock().unwrap().retain(|tx| tx.send(ev).is_ok());
 }
 
 struct St {
@@ -1025,13 +1079,16 @@ struct St {
     linger_timer: usize,
     overlay: Option<Overlay>,
     dirty: bool,
+    /// Walkthrough: the target rect the card sits beside.
+    near: Option<Rect>,
 }
 
 #[derive(Clone, Copy)]
 enum Mouse {
     Enter,
     Leave,
-    Click,
+    /// Left button up at window coords.
+    Click(i32, i32),
     Dismiss,
 }
 
@@ -1094,7 +1151,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                push(Mouse::Click);
+                let (x, y) = ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32);
+                push(Mouse::Click(x, y));
                 LRESULT(0)
             }
             WM_RBUTTONUP => {
@@ -1158,6 +1216,7 @@ fn thread_main(rx: Receiver<Cmd>, ready: Sender<()>) {
             linger_timer: 0,
             overlay: None,
             dirty: false,
+            near: None,
         };
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.hwnd.0.is_null() && msg.message == WM_TIMER {
@@ -1190,6 +1249,7 @@ impl St {
         match cmd {
             Cmd::Listen { at } => {
                 self.overlay = None;
+                self.near = None;
                 self.anchor = at;
                 self.monitor = Some(crate::capture::monitor_at(at.0, at.1));
                 self.view = View {
@@ -1211,6 +1271,7 @@ impl St {
                     self.monitor = Some(crate::capture::monitor_at(at.0, at.1));
                     self.show();
                 }
+                self.view.chrome = Chrome::Answer;
                 self.view.phase = Phase::Thinking;
                 self.view.label = question;
                 self.view.body.clear();
@@ -1234,6 +1295,7 @@ impl St {
                     self.show();
                 }
                 self.view.phase = Phase::Error;
+                self.view.chrome = Chrome::Answer;
                 self.view.label = "Couldn't answer".into();
                 self.view.body = e;
                 self.linger();
@@ -1259,8 +1321,58 @@ impl St {
                 }
             }
             Cmd::Hide => self.hide(),
+            Cmd::Walk(card) => self.walk(card),
         }
         self.dirty = true;
+    }
+
+    fn walk(&mut self, c: Card) {
+        let at = c
+            .near
+            .map_or_else(crate::capture::cursor_pos, |r| (r.x + r.w / 2, r.y + r.h / 2));
+        let moved = self.near != c.near || !self.visible;
+        if c.near.is_some() || !self.visible || self.near.is_some() {
+            self.anchor = at;
+        }
+        self.near = c.near;
+        self.monitor = Some(crate::capture::monitor_at(self.anchor.0, self.anchor.1));
+        self.overlay = None;
+        if let (Some(p), Some(mon)) = (c.pointer, self.monitor) {
+            self.overlay = Overlay::new(mon.rect, mon.scale).ok();
+            if let Some(o) = self.overlay.as_mut() {
+                o.apply(DrawCall { clear: true, shapes: vec![p] }, false);
+            }
+            // Stay above the pointer.
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+        let hover = self.view.hover;
+        self.view = View {
+            phase: c.phase,
+            label: c.label,
+            body: c.body,
+            chrome: c.chrome,
+            hover,
+            ..Default::default()
+        };
+        if moved {
+            self.show();
+        } else {
+            self.fade_out = None;
+            self.kill_linger();
+        }
+        if matches!(c.phase, Phase::Done | Phase::Error) {
+            self.linger();
+        }
     }
 
     fn show(&mut self) {
@@ -1272,6 +1384,7 @@ impl St {
 
     fn hide(&mut self) {
         self.visible = false;
+        self.near = None;
         self.fade_out = None;
         self.overlay = None;
         self.kill_linger();
@@ -1312,14 +1425,40 @@ impl St {
                     self.linger();
                 }
             }
-            Mouse::Click => {
+            Mouse::Click(x, y) => {
                 if matches!(self.view.phase, Phase::Listening) {
                     return;
                 }
-                self.hide();
-                emit(CaptionEvent::Clicked);
+                match self.view.chrome {
+                    Chrome::Step { .. } => {
+                        // Only the footer is a button; the card stays up
+                        // until the walkthrough moves on.
+                        let (l, _, r, b) = CARD.with(|c| c.get());
+                        let s = self.monitor.map_or(1.0, |m| m.scale.max(0.5));
+                        let footer_top = b - ((LABEL_PX + 12.0 + PAD) * s) as i32;
+                        if y >= footer_top && y < b {
+                            emit(if x < (l + r) / 2 {
+                                CaptionEvent::Stop
+                            } else {
+                                CaptionEvent::Next
+                            });
+                        }
+                    }
+                    Chrome::Plain => {
+                        self.hide();
+                        emit(CaptionEvent::Dismissed);
+                    }
+                    Chrome::Answer => {
+                        self.hide();
+                        emit(CaptionEvent::Clicked);
+                    }
+                }
             }
             Mouse::Dismiss => {
+                if let Chrome::Step { .. } = self.view.chrome {
+                    emit(CaptionEvent::Stop);
+                    return;
+                }
                 self.hide();
                 emit(CaptionEvent::Dismissed);
             }
@@ -1377,19 +1516,48 @@ impl St {
         let (cw, ch) = (pm.width() as i32 - 2 * m, pm.height() as i32 - 2 * m);
         let gap = (GAP * s) as i32;
         let work = mon.work;
-        let mut x = self.anchor.0 + gap;
-        if x + cw > work.x + work.w - 8 {
-            x = self.anchor.0 - gap - cw;
-        }
-        x = x.clamp(work.x + 8, (work.x + work.w - cw - 8).max(work.x + 8));
-        let mut y = self.anchor.1 + gap;
-        if y + ch > work.y + work.h - 8 {
-            y = work.y + work.h - 8 - ch;
-        }
-        y = y.max(work.y + 8) + (rise * s) as i32;
+        let (x, y) = match self.near {
+            Some(r) => beside((cw, ch), work, r, gap),
+            None => {
+                let mut x = self.anchor.0 + gap;
+                if x + cw > work.x + work.w - 8 {
+                    x = self.anchor.0 - gap - cw;
+                }
+                x = x.clamp(work.x + 8, (work.x + work.w - cw - 8).max(work.x + 8));
+                let mut y = self.anchor.1 + gap;
+                if y + ch > work.y + work.h - 8 {
+                    y = work.y + work.h - 8 - ch;
+                }
+                (x, y.max(work.y + 8))
+            }
+        };
+        let y = y + (rise * s) as i32;
         CARD.with(|c| c.set((m, m, m + cw, m + ch)));
         unsafe { present(self.hwnd, &pm, x - m, y - m, (alpha * 255.0) as u8) };
     }
+}
+
+/// Where a `w`x`h` card goes so it sits next to `target` without covering
+/// it: right of it, else left, else below, else above; always inside `work`.
+pub fn beside((w, h): (i32, i32), work: Rect, target: Rect, gap: i32) -> (i32, i32) {
+    let (l, t, r, b) = (work.x + 8, work.y + 8, work.x + work.w - 8, work.y + work.h - 8);
+    let clamp_x = |x: i32| x.clamp(l, (r - w).max(l));
+    let clamp_y = |y: i32| y.clamp(t, (b - h).max(t));
+    let mid = clamp_y(target.y + target.h / 2 - h / 2);
+    if target.x + target.w + gap + w <= r {
+        return (target.x + target.w + gap, mid);
+    }
+    if target.x - gap - w >= l {
+        return (target.x - gap - w, mid);
+    }
+    let left = clamp_x(target.x);
+    if target.y + target.h + gap + h <= b {
+        return (left, target.y + target.h + gap);
+    }
+    if target.y - gap - h >= t {
+        return (left, target.y - gap - h);
+    }
+    (clamp_x(target.x + target.w + gap), mid)
 }
 
 fn ease_out(t: f32) -> f32 {

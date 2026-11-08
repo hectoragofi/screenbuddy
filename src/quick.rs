@@ -38,7 +38,8 @@ pub fn set_status_sink(f: impl Fn(Status) + Send + Sync + 'static) {
     *STATUS.lock().unwrap() = Some(Box::new(f));
 }
 
-fn status(s: Status) {
+/// Reports a buddy state (also used by walkthroughs).
+pub fn status(s: Status) {
     if let Some(f) = STATUS.lock().unwrap().as_ref() {
         f(s);
     }
@@ -197,8 +198,11 @@ impl Quick {
             KeyEvent::HoldCancel => {
                 if self.rec.take().is_some() {
                     self.shot = None;
-                    caption::send(Cmd::Hide);
-                    status(Status::Idle);
+                    // A walkthrough puts its card back.
+                    if !crate::walk::hear("", true) {
+                        caption::send(Cmd::Hide);
+                        status(Status::Idle);
+                    }
                 }
             }
             KeyEvent::DoubleTap { .. } => {} // the palette opens via AppEvent
@@ -218,6 +222,7 @@ impl Quick {
                 self.stop_turn();
                 status(Status::Idle);
             }
+            CaptionEvent::Next | CaptionEvent::Stop => {} // walkthrough cards
         }
     }
 
@@ -237,6 +242,8 @@ impl Quick {
                 Ok(r) => {
                     self.transcript = None;
                     match r {
+                        // During a walkthrough, speech goes to it.
+                        Ok(t) if crate::walk::hear(t.trim(), true) => self.shot = None,
                         Ok(t) if t.trim().is_empty() => {
                             caption::send(Cmd::Hide);
                             status(Status::Idle);
@@ -356,6 +363,11 @@ impl Quick {
         if finished {
             let t = self.turn.take().unwrap();
             self.last = save(&self.cfg, &t);
+            if let Some(goal) = crate::walk::take_request() {
+                // The brain chose a walkthrough: it takes over the caption.
+                crate::walk::start(goal, &self.cfg);
+                return;
+            }
             match &t.error {
                 Some(e) if t.answer.trim().is_empty() => {
                     caption::send(Cmd::Error(short_error(e)));
