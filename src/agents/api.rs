@@ -37,6 +37,10 @@ fn tools(desktop: bool) -> Vec<(&'static str, &'static str, Value)> {
     if desktop {
         v.push(("desktop", crate::desktop::DESC, crate::desktop::schema()));
     }
+    v.push(("window_screenshot", super::desk::SHOT_DESC, super::desk::shot_schema()));
+    if super::drive::enabled(&crate::config::load().0) {
+        v.push(("drive", super::drive::DESC, super::drive::schema()));
+    }
     v
 }
 
@@ -148,15 +152,26 @@ fn call(name: &str, input: &Value, job: &TurnJob, sink: &Sink) -> (String, bool)
                 sink.step(&intent);
             }
             let ctx = crate::desktop::Ctx::from_config(&job.cfg, format!("screenbuddy-agent-{}", job.id));
+            let t0 = super::desk::now_ms();
             let out = crate::desktop::exec(&exe, &args, &intent, &ctx);
+            sink.desk_action(&args, &out, t0);
             let ok = serde_json::from_str::<Value>(&out)
                 .ok()
                 .and_then(|v| v["ok"].as_bool())
                 .unwrap_or(true);
             (out, !ok)
         }
+        "drive" => super::drive::call(sink, input),
+        "window_screenshot" => match shot(input, sink) {
+            Ok((_, text)) => (format!("{text} (this provider can't see images; use the accessibility tree)"), false),
+            Err(e) => (e, true),
+        },
         _ => ("error: unknown tool".into(), true),
     }
+}
+
+fn shot(input: &Value, sink: &Sink) -> Result<(Vec<u8>, String), String> {
+    super::desk::shot(input["hwnd"].as_i64().map(|h| h as isize), &sink.desk_windows())
 }
 
 fn client() -> Result<reqwest::blocking::Client, String> {
@@ -257,7 +272,16 @@ fn anthropic(job: &TurnJob, sink: &Sink) -> Result<String, String> {
         msgs.push(json!({"role": "assistant", "content": blocks}));
         let mut results = Vec::new();
         for b in &blocks {
-            if b["type"] == "tool_use" {
+            if b["type"] == "tool_use" && b["name"] == "window_screenshot" {
+                let content = match shot(&b["input"], sink) {
+                    Ok((jpeg, text)) => json!([
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(jpeg)}},
+                        {"type": "text", "text": text}
+                    ]),
+                    Err(e) => json!(e),
+                };
+                results.push(json!({"type": "tool_result", "tool_use_id": b["id"], "content": content}));
+            } else if b["type"] == "tool_use" {
                 let (text, is_error) = call(b["name"].as_str().unwrap_or(""), &b["input"], job, sink);
                 if sink.stopped() {
                     return Err("stopped".into());

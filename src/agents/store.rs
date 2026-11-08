@@ -37,6 +37,10 @@ pub struct Agent {
     pub provider: String,
     /// Hidden from the history list unless searching.
     pub archived: bool,
+    /// Windows on the agent's desk (hwnds, in arrival order).
+    pub desk: Vec<isize>,
+    /// Its Apeiron canvas region `[x, y, w, h]`, once reserved.
+    pub region: Option<[f64; 4]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
