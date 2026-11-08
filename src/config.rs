@@ -171,6 +171,9 @@ pub struct AppearanceCfg {
     pub dismiss_on_blur: bool,
     /// How much of the screen shows through the palette, 0 (solid) to 100.
     pub blur: f32,
+    /// Open the palette as part of the island (hanging from it at the top of
+    /// the screen). Off: it floats at `position` and can be dragged.
+    pub attach: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -295,6 +298,7 @@ impl Default for AppearanceCfg {
             saved_pos: None,
             dismiss_on_blur: true,
             blur: 60.0,
+            attach: true,
         }
     }
 }

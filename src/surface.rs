@@ -9,10 +9,13 @@ use egui::Color32;
 use std::sync::{Arc, Mutex};
 
 /// Surface color. Opaque at blur 0; see `glass_opacity` otherwise.
-pub const SURFACE: Color32 = Color32::from_rgb(14, 22, 38);
-pub const TEXT: Color32 = Color32::from_rgb(241, 244, 248);
-/// Secondary text. Stays above 4.5:1 at every blur strength (tested below).
-pub const TEXT_2: Color32 = Color32::from_rgb(169, 182, 200);
+/// The island's INK, so the palette and the island read as one object.
+pub const SURFACE: Color32 = Color32::from_rgb(0x0E, 0x0E, 0x0E);
+/// PAPER.
+pub const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF0, 0xEB);
+/// Secondary text: MUTE, lifted a touch so it stays above 4.5:1 at every blur
+/// strength (tested below).
+pub const TEXT_2: Color32 = Color32::from_rgb(0xA0, 0x9D, 0x96);
 
 /// Most shapes the shader merges at once.
 pub const MAX_BLOBS: usize = 8;
@@ -288,11 +291,12 @@ uniform float u_opacity;
 uniform vec4 u_map;       // window offset on the backdrop in pixels, then 1 / its size
 uniform int u_has_backdrop;
 uniform sampler2D u_backdrop;
+uniform float u_shadow;   // drop shadow opacity (tokens: 0 8 24 / .35)
 out vec4 o_color;
 
 // The backdrop's brightest channel can't go above this, which keeps secondary text
 // at 4.5:1 over anything. Colors keep their hue. Same value as the test's `PEAK`.
-const float PEAK = 70.0 / 255.0;
+const float PEAK = 50.0 / 255.0;
 
 float box_at(vec2 p, int i) {
     vec2 q = abs(p - u_box[i].xy) - u_box[i].zw + u_shape[i].x;
@@ -327,10 +331,14 @@ void main() {
         float noise = fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
         rgb = mix(behind, u_tint, u_opacity) + noise / 255.0;
     }
-    float rim = clamp(1.0 - abs(d + 0.75 * u_ppp) / u_ppp, 0.0, 1.0) * 0.10;
+    // The island's hairline: white at 8 % just inside the edge. Matte, no gloss.
+    float rim = clamp(1.0 - abs(d + 0.5 * u_ppp) / u_ppp, 0.0, 1.0) * 0.08;
     rgb += (vec3(1.0) - rgb) * rim;
 
-    o_color = vec4(rgb * cover, cover);
+    // Soft drop shadow, offset down; black, so it only adds alpha.
+    float ds = field(p - vec2(0.0, 8.0 * u_ppp));
+    float sh = u_shadow * pow(1.0 - smoothstep(-12.0 * u_ppp, 18.0 * u_ppp, ds), 1.6);
+    o_color = vec4(rgb * cover, cover + sh * (1.0 - cover));
 }
 "#;
 
@@ -345,6 +353,7 @@ struct Uniforms {
     map: glow::UniformLocation,
     has_backdrop: glow::UniformLocation,
     backdrop: glow::UniformLocation,
+    shadow: glow::UniformLocation,
 }
 
 struct Texture {
@@ -388,6 +397,7 @@ impl Renderer {
                 map: u("u_map")?,
                 has_backdrop: u("u_has_backdrop")?,
                 backdrop: u("u_backdrop")?,
+                shadow: u("u_shadow")?,
             };
             let vao = gl.create_vertex_array().ok()?;
             let id = gl.create_texture().ok()?;
@@ -479,6 +489,7 @@ impl Renderer {
             let [r, g, b, _] = SURFACE.to_normalized_gamma_f32();
             gl.uniform_3_f32(Some(&u.tint), r, g, b);
             gl.uniform_1_f32(Some(&u.opacity), self.opacity);
+            gl.uniform_1_f32(Some(&u.shadow), crate::ui::tokens::SHADOW_ALPHA);
             let current = self.current.lock().unwrap();
             // Dragged off the captured monitor there's nothing to show: go solid.
             let shown = current.as_ref().filter(|b| {
@@ -570,7 +581,7 @@ mod tests {
 
     #[test]
     fn secondary_text_stays_readable_over_anything() {
-        const PEAK: f32 = 70.0;
+        const PEAK: f32 = 50.0;
         let screens: [[f32; 3]; 5] = [[255.0, 255.0, 255.0], [255.0, 255.0, 0.0], [0.0, 255.0, 0.0], [255.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         for strength in [0.0, 1.0, 25.0, 60.0, 100.0, 150.0] {
             let a = glass_opacity(strength);

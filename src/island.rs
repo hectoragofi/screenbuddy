@@ -76,6 +76,16 @@ struct Inbox {
     state: Option<BuddyState>,
     agents: Option<Vec<AgentRow>>,
     visible: Option<bool>,
+    attach: Option<Option<Attach>>,
+}
+
+/// A surface hanging from the island as part of it (the palette): the pill
+/// widens to `width` on `mon` and flattens its bottom edge to join it.
+#[derive(Clone, Copy, Debug)]
+pub struct Attach {
+    /// Logical px.
+    pub width: f32,
+    pub mon: MonitorInfo,
 }
 
 const WM_WAKE: u32 = WM_APP + 7;
@@ -113,6 +123,32 @@ impl IslandHandle {
     /// cards can hang from it. Empty while hidden.
     pub fn anchor(&self) -> RECT {
         *self.shared.anchor.lock().unwrap()
+    }
+}
+
+/// Merges the island with the surface below it (`Some`) or lets go (`None`).
+/// While attached the island stays shown whatever else would hide it (the
+/// setting, full-screen apps, auto-hide), doesn't peek or dim, and stays on
+/// `mon`. No-op if the island isn't running.
+pub fn attach(a: Option<Attach>) {
+    if let Some(h) = HANDLE.get() {
+        h.shared.inbox.lock().unwrap().attach = Some(a);
+        h.wake();
+    }
+}
+
+/// Where the island's body sits (physical px) once attached at `width` on `mon`.
+pub fn header_rect(mon: &MonitorInfo, width: f32) -> RECT {
+    let s = mon.scale;
+    let (bw, bh) = ((width * s).ceil() as i32, (PILL_H * s).ceil() as i32);
+    let m = mon.rect;
+    let x = m.x + (m.w - bw) / 2;
+    let y = m.y + (TOP_GAP * s).round() as i32;
+    RECT {
+        left: x,
+        top: y,
+        right: x + bw,
+        bottom: y + bh,
     }
 }
 
@@ -266,6 +302,10 @@ struct View {
     label_since: Instant,
     hover: Option<Hit>,
     peek: bool,
+    /// Width (logical) while a surface hangs from the island.
+    attached: Option<f32>,
+    /// 0 = round pill, 1 = flat bottom edge joined to the attached surface.
+    flat: Spring,
 }
 
 impl View {
@@ -282,6 +322,8 @@ impl View {
             label_since: now,
             hover: None,
             peek: false,
+            attached: None,
+            flat: Spring::new(0.0).with(520.0, 46.0),
         };
         v.layout(now);
         v.w.snap(v.w.target);
@@ -382,6 +424,15 @@ impl View {
             self.label = label;
             self.label_since = now;
         }
+        if let Some(w) = self.attached {
+            self.peek = false;
+            self.w.set(w);
+            self.h.set(PILL_H);
+            self.reveal.set(0.0);
+            self.flat.set(1.0);
+            return;
+        }
+        self.flat.set(0.0);
         let peek = self.peek;
         self.w.set(if peek { PEEK_W } else { self.rest_w(now) });
         self.h.set(if peek { self.rows_h() } else { PILL_H });
@@ -390,7 +441,13 @@ impl View {
 
     fn tick(&mut self, dt: f32) -> bool {
         let mut moving = false;
-        for s in [&mut self.w, &mut self.h, &mut self.reveal, &mut self.alpha] {
+        for s in [
+            &mut self.w,
+            &mut self.h,
+            &mut self.reveal,
+            &mut self.alpha,
+            &mut self.flat,
+        ] {
             moving |= s.tick(dt);
         }
         self.buddy.tick(dt);
@@ -432,6 +489,11 @@ impl View {
         r.min(self.h.value / 2.0)
     }
 
+    /// Bottom corner radius: the top one, flattening as the island attaches.
+    fn bottom_radius(&self) -> f32 {
+        self.radius() * (1.0 - self.flat.value.clamp(0.0, 1.0))
+    }
+
     /// Body size in physical px.
     fn body_size(&self, s: f32) -> (u32, u32) {
         (
@@ -445,8 +507,15 @@ impl View {
         let mut pm = Pixmap::new(bw, bh)?;
         let (w, h) = (bw as f32, bh as f32);
         let r = self.radius() * s;
-        ui::fill_rounded(&mut pm, 0.0, 0.0, w, h, r, tokens::INK);
-        ui::stroke_rounded(&mut pm, 0.0, 0.0, w, h, r, 1.0, tokens::LINE);
+        let rb = self.bottom_radius() * s;
+        let flat = self.flat.value.clamp(0.0, 1.0);
+        fill_path(&mut pm, body_path(0.0, 0.0, w, h, r, rb), tokens::INK);
+        let inner = body_path(0.5, 0.5, w - 1.0, h - 1.0, (r - 0.5).max(0.0), (rb - 0.5).max(0.0));
+        stroke_path(&mut pm, inner, tokens::LINE);
+        if flat > 0.0 {
+            // The bottom edge is the seam with the attached surface: no hairline.
+            ui::fill_rect(&mut pm, 1.0, h - 2.0, w - 2.0, 2.0, tokens::INK.fade(flat));
+        }
 
         // ---- header: face · label ······ readout
         let mid = PILL_H * s / 2.0;
@@ -471,7 +540,7 @@ impl View {
         );
         let reveal = self.reveal.value.clamp(0.0, 1.0);
         let (label, lcolor, la) = if label.is_empty() {
-            ("screenbuddy".to_string(), tokens::MUTE, reveal)
+            ("screenbuddy".to_string(), tokens::MUTE, reveal.max(flat))
         } else {
             (label, lcolor, lab_in * content.max(reveal))
         };
@@ -571,7 +640,7 @@ impl View {
         // Clip everything to the body shape.
         if let (Some(mut mask), Some(path)) = (
             tiny_skia::Mask::new(bw, bh),
-            ui::rounded_rect_path(0.0, 0.0, w, h, r),
+            body_path(0.0, 0.0, w, h, r, rb),
         ) {
             mask.fill_path(
                 &path,
@@ -664,6 +733,51 @@ impl View {
             s,
         );
         Some(pm)
+    }
+}
+
+/// A rounded rect with separate top (`rt`) and bottom (`rb`) corner radii.
+fn body_path(x: f32, y: f32, w: f32, h: f32, rt: f32, rb: f32) -> Option<tiny_skia::Path> {
+    let lim = (w / 2.0).min(h / 2.0).max(0.0);
+    let (rt, rb) = (rt.clamp(0.0, lim), rb.clamp(0.0, lim));
+    let (x1, y1) = (x + w, y + h);
+    let (kt, kb) = (0.552_284_8 * rt, 0.552_284_8 * rb);
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x + rt, y);
+    pb.line_to(x1 - rt, y);
+    pb.cubic_to(x1 - rt + kt, y, x1, y + rt - kt, x1, y + rt);
+    pb.line_to(x1, y1 - rb);
+    pb.cubic_to(x1, y1 - rb + kb, x1 - rb + kb, y1, x1 - rb, y1);
+    pb.line_to(x + rb, y1);
+    pb.cubic_to(x + rb - kb, y1, x, y1 - rb + kb, x, y1 - rb);
+    pb.line_to(x, y + rt);
+    pb.cubic_to(x, y + rt - kt, x + rt - kt, y, x + rt, y);
+    pb.close();
+    pb.finish()
+}
+
+fn paint_of(c: Rgba) -> tiny_skia::Paint<'static> {
+    let mut p = tiny_skia::Paint::default();
+    p.set_color(c.skia());
+    p.anti_alias = true;
+    p
+}
+
+fn fill_path(pm: &mut Pixmap, path: Option<tiny_skia::Path>, c: Rgba) {
+    if let Some(p) = path {
+        let id = tiny_skia::Transform::identity();
+        pm.fill_path(&p, &paint_of(c), tiny_skia::FillRule::Winding, id, None);
+    }
+}
+
+fn stroke_path(pm: &mut Pixmap, path: Option<tiny_skia::Path>, c: Rgba) {
+    if let Some(p) = path {
+        let st = tiny_skia::Stroke {
+            width: 1.0,
+            ..Default::default()
+        };
+        let id = tiny_skia::Transform::identity();
+        pm.stroke_path(&p, &paint_of(c), &st, id, None);
     }
 }
 
@@ -917,6 +1031,18 @@ impl Island {
             self.enabled = on;
             self.dirty = true;
         }
+        if let Some(a) = inbox.attach {
+            if let Some(a) = a {
+                if a.mon.rect != self.mon.rect || a.mon.scale != self.mon.scale {
+                    self.mon = a.mon;
+                    self.fullscreen = false;
+                }
+                self.no_peek = true;
+            }
+            self.view.attached = a.map(|a| a.width);
+            self.activity = now;
+            self.dirty = true;
+        }
         if let Some(rows) = inbox.agents {
             if rows != self.view.agents {
                 self.view.set_agents(rows, now);
@@ -934,7 +1060,9 @@ impl Island {
                     || !matches!(self.view.buddy.state(), BuddyState::Listening(_))
                 {
                     self.activity = now;
-                    self.follow_cursor();
+                    if self.view.attached.is_none() {
+                        self.follow_cursor();
+                    }
                 }
                 self.view.set_state(s, now);
                 self.dirty = true;
@@ -969,7 +1097,7 @@ impl Island {
                 fg,
             )
         });
-        if fg {
+        if fg && self.view.attached.is_none() {
             self.follow_cursor();
             let full = fullscreen_on(&self.mon);
             if full != self.fullscreen {
@@ -1024,12 +1152,18 @@ impl Island {
         // ---- targets
         let state = self.view.buddy.state();
         let resting = matches!(state, BuddyState::Idle | BuddyState::Working(_));
+        let attached = self.view.attached.is_some();
         let awake = !resting
+            || attached
             || hovered
             || self.view.peek
             || now.saturating_duration_since(self.activity) < DIM_AFTER;
         self.view.buddy.set_awake(awake);
         self.view.alpha.set(if awake { 1.0 } else { DIM_ALPHA });
+        if attached {
+            // Count the palette as activity, so closing it doesn't tuck at once.
+            self.activity = now;
+        }
         if self.tucked && cursor_on_top_edge() {
             self.activity = now;
             self.follow_cursor();
@@ -1040,13 +1174,15 @@ impl Island {
             .agents
             .iter()
             .any(|a| a.kind == AgentStatus::Asking);
-        self.tucked = AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed)
+        self.tucked = !attached
+            && AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed)
             && resting
             && !hovered
             && !self.view.peek
             && !needs_you
             && now.saturating_duration_since(self.activity) >= HIDE_AFTER;
-        let hide = !self.enabled || (self.fullscreen && resting) || self.tucked;
+        // Attached, the island is the palette's header: nothing hides it.
+        let hide = !attached && (!self.enabled || (self.fullscreen && resting) || self.tucked);
         self.shown.set(if hide { 0.0 } else { 1.0 });
         self.view.layout(now);
 
@@ -1114,6 +1250,7 @@ impl Island {
             || !self.view.h.settled()
             || !self.view.reveal.settled()
             || !self.view.alpha.settled()
+            || !self.view.flat.settled()
             || !self.shown.settled()
         {
             return Motion::Fast;
@@ -1191,9 +1328,69 @@ mod tests {
     fn settle(v: &mut View, now: Instant) {
         v.layout(now);
         v.label_since = now - Duration::from_secs(1); // label already faded in
-        for s in [&mut v.w, &mut v.h, &mut v.reveal, &mut v.alpha] {
+        for s in [&mut v.w, &mut v.h, &mut v.reveal, &mut v.alpha, &mut v.flat] {
             s.snap(s.target);
         }
+    }
+
+    /// The attached island over a stand-in for the palette below it (same
+    /// geometry and tokens as the palette's attached surface), to judge the
+    /// seam: one object, header on top, input row and answer below.
+    fn composite_attached(v: &mut View, s: f32, now: Instant, below_h: f32) -> Pixmap {
+        let body = v.render_body(s, now).unwrap();
+        let (bw, bh) = (body.width() as f32, body.height() as f32);
+        let pad = (40.0 * s) as u32;
+        let ph = (below_h * s).ceil();
+        let mut pm =
+            Pixmap::new(body.width() + 2 * pad, (bh + ph) as u32 + 2 * pad).unwrap();
+        let (a, b) = (Rgba::rgb(0xECEAE5), Rgba::rgb(0xD6DAE2));
+        for y in 0..pm.height() {
+            let k = y as f32 / pm.height() as f32;
+            let pw = pm.width() as f32;
+            ui::fill_rect(&mut pm, 0.0, y as f32, pw, 1.0, a.mix(b, k));
+        }
+        let (ox, oy) = (pad as f32, pad as f32);
+        // The palette's shadow covers the whole object.
+        ui::shadow(&mut pm, ox, oy, bw, bh + ph, 22.0 * s, s);
+        let pp = tiny_skia::PixmapPaint::default();
+        let id = tiny_skia::Transform::identity();
+        pm.draw_pixmap(pad as i32, pad as i32, body.as_ref(), &pp, id, None);
+        // Palette surface: flat top under the header, round bottom.
+        let top = oy + bh;
+        fill_path(&mut pm, body_path(ox, top, bw, ph, 0.0, 22.0 * s), tokens::INK);
+        // Its hairline runs down the sides and round the bottom only.
+        stroke_path(
+            &mut pm,
+            body_path(ox + 0.5, top - 30.0, bw - 1.0, ph + 29.5, 0.0, 21.5 * s),
+            tokens::LINE,
+        );
+        ui::fill_rect(&mut pm, ox + 1.0, top - 31.0, bw - 2.0, 31.0, tokens::INK);
+        // Input row: screen chip, placeholder, send button.
+        let row = 52.0 * s;
+        let mid = top + row / 2.0;
+        let chip_h = 34.0 * s;
+        ui::fill_rounded(&mut pm, ox + 9.0 * s, mid - chip_h / 2.0, 92.0 * s, chip_h, tokens::RADIUS_CHIP * s, tokens::INK_2);
+        let ls = TextStyle::label(s).color(tokens::PAPER);
+        let base = (mid + ui::cap_height(&ls) / 2.0).round();
+        ui::draw_text_baseline(&mut pm, "screen", ox + 40.0 * s, base, &ls);
+        ui::fill_rounded(&mut pm, ox + 15.0 * s, mid - 11.0 * s, 22.0 * s, 22.0 * s, 5.0 * s, Rgba::rgb(0x3A3F48));
+        let hs = TextStyle::body(s).size(14.0 * s).color(tokens::MUTE);
+        let base = (mid + ui::cap_height(&hs) / 2.0).round();
+        ui::draw_text_baseline(&mut pm, "Ask about your screen", ox + 112.0 * s, base, &hs);
+        ui::fill_circle(&mut pm, ox + bw - 26.0 * s, mid, 15.0 * s, tokens::INK_2);
+        if below_h > 60.0 {
+            ui::fill_rect(&mut pm, ox + 18.0 * s, top + row, bw - 36.0 * s, 1.0, tokens::LINE);
+            let bs = TextStyle::body(s).color(tokens::PAPER);
+            let mut y = top + row + 28.0 * s;
+            for line in [
+                "The chart shows revenue per quarter; Q3",
+                "dips because the EU launch slipped.",
+            ] {
+                ui::draw_text_baseline(&mut pm, line, ox + 18.0 * s, y, &bs);
+                y += 20.0 * s;
+            }
+        }
+        pm
     }
 
     fn rows() -> Vec<AgentRow> {
@@ -1341,6 +1538,26 @@ mod tests {
         v.peek = true;
         settle(&mut v, now);
         shots.push(("peek-empty".into(), composite(&mut v, s, now, true)));
+
+        // Attached to the palette: the island is its header.
+        let mut v = View::new(t0);
+        v.set_agents(rows(), t0);
+        v.attached = Some(560.0);
+        settle(&mut v, now);
+        assert_eq!(v.w.value, 560.0);
+        assert_eq!(v.bottom_radius(), 0.0);
+        shots.push(("attached".into(), composite_attached(&mut v, s, now, 52.0)));
+        v.set_state(BuddyState::Thinking, now);
+        let later = now + Duration::from_secs_f32(4.3);
+        settle(&mut v, later);
+        shots.push((
+            "attached-answering".into(),
+            composite_attached(&mut v, s, later, 140.0),
+        ));
+        // Mid-morph: widening, corners half flat.
+        v.w.snap(300.0);
+        v.flat.snap(0.5);
+        shots.push(("attached-mid".into(), composite(&mut v, s, later, true)));
 
         if let Some(dir) = dir {
             let _ = std::fs::create_dir_all(&dir);

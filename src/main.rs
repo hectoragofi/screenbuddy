@@ -178,6 +178,7 @@ impl App {
         } else {
             None
         };
+        start.region = region;
         start.backdrop = surface::Backdrop::new(&shot, self.cfg.appearance.blur);
         // Encoding takes about as long as making the window, so do both at once.
         let encoding = std::thread::spawn(move || capture::encode(&shot, area));
