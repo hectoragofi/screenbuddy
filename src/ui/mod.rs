@@ -50,7 +50,7 @@ static GEIST: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf")
 static GEIST_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Medium.ttf");
 static DOTO: &[u8] = include_bytes!("../../assets/fonts/Doto-Bold-Round.ttf");
 
-fn font(face: Face) -> &'static fontdue::Font {
+pub(crate) fn font(face: Face) -> &'static fontdue::Font {
     static FONTS: OnceLock<[fontdue::Font; 3]> = OnceLock::new();
     let fonts = FONTS.get_or_init(|| {
         let load = |b: &'static [u8]| {

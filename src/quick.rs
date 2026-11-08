@@ -34,7 +34,6 @@ static STATUS: Mutex<Option<StatusSink>> = Mutex::new(None);
 static TX: OnceLock<Sender<Msg>> = OnceLock::new();
 
 /// Receives every buddy-state change (called on the quick-ask thread; keep it short).
-#[allow(dead_code)] // wired by the Apeiron / island / cards slices
 pub fn set_status_sink(f: impl Fn(Status) + Send + Sync + 'static) {
     *STATUS.lock().unwrap() = Some(Box::new(f));
 }
@@ -312,7 +311,18 @@ impl Quick {
                     caption::send(Cmd::Append(d));
                 }
                 Ok(llm::Ev::Status(_)) => {}
-                Ok(llm::Ev::Spawned(_)) => {}
+                Ok(llm::Ev::Spawned(id)) => {
+                    // The router handed the work off; say so on the caption.
+                    let name = crate::agents::get(&id).map(|a| a.name).unwrap_or(id);
+                    let sep = if t.answer.trim().is_empty() { "" } else { "\n\n" };
+                    let note = format!("{sep}Handed to agent \u{2039}{name}\u{203a}");
+                    if !t.streaming {
+                        t.streaming = true;
+                        status(Status::Streaming);
+                    }
+                    t.answer.push_str(&note);
+                    caption::send(Cmd::Append(note));
+                }
                 Ok(llm::Ev::Draw(input, reply)) => {
                     let color = config::hex_rgb(&self.cfg.drawing.color).unwrap_or([10, 132, 255]);
                     let r = overlay::parse_draw(&input, &t.cap, color).map(|call| {

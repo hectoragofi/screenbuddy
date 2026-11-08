@@ -228,7 +228,6 @@ pub fn configure(hold: bool, hold_ms: u32, double_tap: bool) {
 
 /// While true, Alt gestures don't start, and one in progress is cancelled
 /// (Apeiron calls this while a drag/pan gesture runs).
-#[allow(dead_code)] // wired by the Apeiron / island / cards slices
 pub fn set_suppressed(on: bool) {
     SUPPRESSED.store(on, Ordering::Relaxed);
     let t = THREAD.load(Ordering::Relaxed);

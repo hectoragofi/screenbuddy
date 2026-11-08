@@ -186,11 +186,9 @@ pub fn follow_up(id: &str, text: &str) -> bool {
 pub fn answer(id: &str, question: u64, answer: Answer) -> bool {
     rt().answer(id, question, answer)
 }
-#[allow(dead_code)]
 pub fn subscribe() -> Receiver<(AgentId, AgentEvent)> {
     rt().subscribe()
 }
-#[allow(dead_code)]
 pub fn list() -> Vec<Agent> {
     rt().list()
 }

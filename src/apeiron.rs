@@ -125,7 +125,6 @@ pub fn stage_open() -> bool {
 
 /// Apeiron is in the middle of a mouse gesture (free-drag, pan); Alt-hold
 /// voice should stand down while this is true.
-#[allow(dead_code)] // used by the input + agents slices
 pub fn gesture_active() -> bool {
     client().is_some_and(|c| c.read(|l| l.gesture))
 }

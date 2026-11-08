@@ -85,6 +85,8 @@ pub struct Start {
     pub selection: Option<context::PendingSelection>,
     /// Open on this saved conversation (a clicked quick-ask caption).
     pub open_chat: Option<std::path::PathBuf>,
+    /// Open showing this background agent (an island row was clicked).
+    pub open_agent: Option<crate::agents::AgentId>,
 }
 
 /// A user-facing error: a short sentence, an optional action, and the raw detail.
@@ -191,6 +193,7 @@ pub struct Palette {
     /// Start recording on the first frame / once the model is downloaded.
     voice_pending: bool,
     open_on_start: Option<std::path::PathBuf>,
+    agent_on_start: Option<crate::agents::AgentId>,
     /// egui time (s) at which to hand cold pages back to the OS; see `trim_when_idle`.
     trim_at: f64,
     /// The user dragged the palette; its spot is saved on close.
@@ -466,6 +469,7 @@ impl Palette {
             voice_dl: None,
             voice_pending: start.voice,
             open_on_start: start.open_chat,
+            agent_on_start: start.open_agent,
             trim_at: TRIM_AFTER_OPEN,
             moved: false,
             mention: None,
@@ -811,6 +815,10 @@ impl Palette {
         if !self.cfg.history || self.exchanges.is_empty() {
             return;
         }
+        // Only agents opened from the island: nothing of this chat to keep.
+        if self.exchanges.iter().all(|x| x.answer.is_empty() && x.error.is_none() && !x.agents.is_empty()) {
+            return;
+        }
         let dir = self
             .history_dir
             .get_or_insert_with(|| config::history_dir().join(crate::util::file_stamp()))
@@ -842,6 +850,25 @@ impl Palette {
     }
 
     /// Shows a saved chat and lets the next question continue it.
+    /// Shows a background agent as an exchange: its brief, then its live line.
+    /// Minimal until the cards slice adds real agent views.
+    fn show_agent(&mut self, id: crate::agents::AgentId) {
+        let Some(a) = crate::agents::get(&id) else {
+            self.notice = Some("Couldn't find that agent.".into());
+            return;
+        };
+        if self.exchanges.iter().any(|x| x.agents.contains(&id)) {
+            return;
+        }
+        self.exchanges.push(Exchange {
+            question: a.brief,
+            answer: String::new(),
+            error: None,
+            attached: Vec::new(),
+            agents: vec![id],
+        });
+    }
+
     fn open_chat(&mut self, ctx: &egui::Context, dir: std::path::PathBuf) {
         if self.busy() {
             return;
@@ -1260,6 +1287,9 @@ impl Palette {
     fn handle_app_events(&mut self, ctx: &egui::Context) {
         if let Some(dir) = self.open_on_start.take() {
             self.open_chat(ctx, dir);
+        }
+        if let Some(id) = self.agent_on_start.take() {
+            self.show_agent(id);
         }
         let mut requeue = Vec::new();
         while let Some(ev) = win::pop() {

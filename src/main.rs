@@ -25,9 +25,10 @@ mod tray;
 mod ui;
 mod uia;
 mod util;
-mod voice;
 mod vision;
+mod voice;
 mod win;
+mod wire;
 
 use win::AppEvent;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -130,6 +131,7 @@ impl App {
     /// `grab`: pick up text selected in the foreground app (hotkey presses only).
     fn ask(&mut self, region: bool, grab: bool, mut start: palette::Start) -> palette::Outcome {
         self.reload();
+        wire::mark_seen(); // the palette shows agents' lines
         // Start the Claude CLI now, in parallel with capture + window creation.
         llm::warm_on_hotkey(&self.cfg);
         let mode = self.cfg.context.selection.as_str();
@@ -202,6 +204,7 @@ fn run() -> anyhow::Result<()> {
         config::log(e);
     }
     apeiron::start();
+    wire::start();
     config::log("started");
     win::trim_memory();
 
@@ -218,11 +221,12 @@ fn run() -> anyhow::Result<()> {
             let outcome = match ev {
                 AppEvent::Hotkey(win::HK_ASK) => app.ask(false, true, Default::default()),
                 AppEvent::TrayClick | AppEvent::IslandClick => app.ask(false, false, Default::default()),
-                // Agent cards (wave 2) take this over; for now there is nothing to open.
-                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => {
-                    config::log(&format!("island: open agent {id}"));
-                    palette::Outcome::Closed
-                }
+                // Agent cards (wave 2) take this over; for now the palette shows its line.
+                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => app.ask(
+                    false,
+                    false,
+                    palette::Start { open_agent: Some(id), ..Default::default() },
+                ),
                 AppEvent::Hotkey(win::HK_REGION) => app.ask(true, true, Default::default()),
                 AppEvent::Hotkey(win::HK_VOICE) => app.ask(
                     false,

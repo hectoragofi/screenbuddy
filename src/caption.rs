@@ -7,16 +7,16 @@
 //! A raw layered window on its own thread, rendered with tiny-skia (see
 //! overlay.rs for the same technique). No timers run while nothing moves.
 //!
-//! Visual constants mirror the design tokens (docs/CLICKY_PLAN.md §1) until
-//! `ui::tokens` lands; switch them over then.
+//! Colours, sizes and the Geist Mono face come from `ui::tokens` / `ui`.
 
 use crate::capture::{MonitorInfo, Rect};
 use crate::overlay::{DrawCall, Overlay};
+use crate::ui::tokens;
 use crate::util::wide;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Instant;
 use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Transform};
 use windows::Win32::Foundation::*;
@@ -28,24 +28,28 @@ use windows::core::PCWSTR;
 
 // ---------------------------------------------------------------- tokens
 
-pub const INK: [u8; 3] = [0x0E, 0x0E, 0x0E];
-pub const INK_2: [u8; 3] = [0x1A, 0x1A, 0x19];
-pub const PAPER: [u8; 3] = [0xF2, 0xF0, 0xEB];
-pub const MUTE: [u8; 3] = [0x8A, 0x87, 0x80];
+const fn rgb3(c: crate::ui::Rgba) -> [u8; 3] {
+    [c.r, c.g, c.b]
+}
+
+pub const INK: [u8; 3] = rgb3(tokens::INK);
+pub const INK_2: [u8; 3] = rgb3(tokens::INK_2);
+pub const PAPER: [u8; 3] = rgb3(tokens::PAPER);
+pub const MUTE: [u8; 3] = rgb3(tokens::MUTE);
 /// LINE = white at 8%.
-pub const LINE_ALPHA: f32 = 0.08;
-pub const SIGNAL: [u8; 3] = [0xFF, 0x5A, 0x1F];
-pub const OK: [u8; 3] = [0x3D, 0xDC, 0x84];
-pub const ERR: [u8; 3] = [0xFF, 0x3B, 0x30];
+pub const LINE_ALPHA: f32 = tokens::LINE.a as f32 / 255.0;
+pub const SIGNAL: [u8; 3] = rgb3(tokens::SIGNAL);
+pub const OK: [u8; 3] = rgb3(tokens::OK);
+pub const ERR: [u8; 3] = rgb3(tokens::ERR);
 
 /// Logical px.
 const MAX_W: f32 = 380.0;
 const MIN_W: f32 = 196.0;
 const PAD: f32 = 14.0;
 const RADIUS: f32 = 16.0;
-const BODY_PX: f32 = 12.5;
-const LABEL_PX: f32 = 10.5;
-const LABEL_TRACK: f32 = 0.06;
+const BODY_PX: f32 = tokens::BODY_PX;
+const LABEL_PX: f32 = tokens::LABEL_PX;
+const LABEL_TRACK: f32 = tokens::LABEL_TRACKING;
 const LINE_H: f32 = BODY_PX * 1.5;
 const SHADOW_BLUR: f32 = 24.0;
 const SHADOW_Y: f32 = 8.0;
@@ -106,37 +110,13 @@ impl Default for View {
     }
 }
 
-fn load_font(names: &[&str]) -> Option<fontdue::Font> {
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    names.iter().find_map(|name| {
-        let bytes = std::fs::read(format!(r"{windir}\Fonts\{name}")).ok()?;
-        fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()
-    })
-}
-
-/// (regular, bold). A mono face for the Geist Mono look until it's bundled.
-fn fonts() -> &'static (Option<fontdue::Font>, Option<fontdue::Font>) {
-    static F: OnceLock<(Option<fontdue::Font>, Option<fontdue::Font>)> = OnceLock::new();
-    F.get_or_init(|| {
-        (
-            load_font(&[
-                "consola.ttf",
-                "CascadiaMono.ttf",
-                "segoeui.ttf",
-                "arial.ttf",
-            ]),
-            load_font(&["consolab.ttf", "segoeuib.ttf", "arialbd.ttf"]),
-        )
-    })
-}
-
+/// Geist Mono (embedded by `ui`); Medium stands in for bold.
 fn face(bold: bool) -> Option<&'static fontdue::Font> {
-    let (r, b) = fonts();
-    if bold {
-        b.as_ref().or(r.as_ref())
+    Some(crate::ui::font(if bold {
+        crate::ui::Face::MonoMedium
     } else {
-        r.as_ref()
-    }
+        crate::ui::Face::Mono
+    }))
 }
 
 type Glyph = (fontdue::Metrics, Vec<u8>);
