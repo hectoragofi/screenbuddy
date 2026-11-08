@@ -25,6 +25,7 @@ pub struct Config {
     pub voice: VoiceCfg,
     pub island: IslandCfg,
     pub input: InputCfg,
+    pub agents: AgentsCfg,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -77,6 +78,23 @@ pub struct InputCfg {
 impl Default for InputCfg {
     fn default() -> Self {
         Self { alt_hold: true, alt_hold_ms: 600, alt_double_tap: true }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct AgentsCfg {
+    /// Let the assistant hand multi-step work to background agents.
+    pub enabled: bool,
+    /// Agents act without asking, even to delete, send or pay.
+    pub always_approve: bool,
+    /// Claude CLI model for agents; empty = same as claude_cli.model.
+    pub model: String,
+}
+
+impl Default for AgentsCfg {
+    fn default() -> Self {
+        Self { enabled: true, always_approve: false, model: String::new() }
     }
 }
 
@@ -217,6 +235,7 @@ impl Default for Config {
             voice: VoiceCfg::default(),
             island: IslandCfg::default(),
             input: InputCfg::default(),
+            agents: AgentsCfg::default(),
         }
     }
 }

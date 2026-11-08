@@ -312,6 +312,7 @@ impl Quick {
                     caption::send(Cmd::Append(d));
                 }
                 Ok(llm::Ev::Status(_)) => {}
+                Ok(llm::Ev::Spawned(_)) => {}
                 Ok(llm::Ev::Draw(input, reply)) => {
                     let color = config::hex_rgb(&self.cfg.drawing.color).unwrap_or([10, 132, 255]);
                     let r = overlay::parse_draw(&input, &t.cap, color).map(|call| {
