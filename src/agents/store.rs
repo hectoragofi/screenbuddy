@@ -35,6 +35,8 @@ pub struct Agent {
     /// The question or approval waiting on the user, if any.
     pub ask: Option<Question>,
     pub provider: String,
+    /// Hidden from the history list unless searching.
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -102,7 +104,8 @@ pub fn matches(a: &Agent, terms: &[String]) -> bool {
     if terms.is_empty() {
         return true;
     }
-    let mut hay = format!("{}\n{}\n{}\n{}", a.name, a.brief, a.result, a.steps.join("\n"));
+    let files: Vec<String> = a.files.iter().map(|f| f.display().to_string()).collect();
+    let mut hay = format!("{}\n{}\n{}\n{}\n{}", a.name, a.brief, a.result, a.steps.join("\n"), files.join("\n"));
     for t in &a.turns {
         hay.push('\n');
         hay.push_str(&t.prompt);
@@ -111,6 +114,16 @@ pub fn matches(a: &Agent, terms: &[String]) -> bool {
     }
     let hay = hay.to_lowercase();
     terms.iter().all(|t| hay.contains(t.as_str()))
+}
+
+/// What the history list shows: everything matching `query`, or, with no
+/// query, everything not archived. Order is kept.
+pub fn browse(all: Vec<Agent>, query: &str) -> Vec<Agent> {
+    let terms = crate::history::terms(query);
+    if terms.is_empty() {
+        return all.into_iter().filter(|a| !a.archived).collect();
+    }
+    all.into_iter().filter(|a| matches(a, &terms)).collect()
 }
 
 /// Files under `dir` written at or after `since` (our own bookkeeping and

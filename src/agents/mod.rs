@@ -47,7 +47,7 @@
 
 mod api;
 mod cli;
-mod store;
+pub(crate) mod store;
 
 pub use store::Agent;
 #[allow(unused_imports)]
@@ -185,6 +185,13 @@ pub fn follow_up(id: &str, text: &str) -> bool {
 }
 pub fn answer(id: &str, question: u64, answer: Answer) -> bool {
     rt().answer(id, question, answer)
+}
+pub fn archive(id: &str, archived: bool) -> bool {
+    rt().archive(id, archived)
+}
+/// Removes a finished agent and its folder.
+pub fn delete(id: &str) -> bool {
+    rt().delete(id)
 }
 pub fn subscribe() -> Receiver<(AgentId, AgentEvent)> {
     rt().subscribe()
@@ -351,6 +358,26 @@ impl Runtime {
         let mut v: Vec<Agent> = self.slots.lock().unwrap().values().map(|s| s.rec.clone()).collect();
         v.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id)));
         v
+    }
+
+    pub(crate) fn archive(&self, id: &str, archived: bool) -> bool {
+        self.ensure_loaded();
+        self.update(id, |r| r.archived = archived).is_some()
+    }
+
+    /// Removes a finished agent and its folder. Active agents are refused.
+    pub(crate) fn delete(&self, id: &str) -> bool {
+        self.ensure_loaded();
+        // Ids are generated folder names; never follow a path out of the root.
+        if id.is_empty() || id.contains(['/', '\\']) ||id.contains("..") {
+            return false;
+        }
+        let mut slots = self.slots.lock().unwrap();
+        if slots.get(id).is_none_or(|s| s.rec.status.is_active() || s.ctl.busy.load(Ordering::SeqCst)) {
+            return false;
+        }
+        slots.remove(id);
+        std::fs::remove_dir_all(self.root.join(id)).is_ok()
     }
 
     pub(crate) fn search(&self, q: &str) -> Vec<Agent> {
