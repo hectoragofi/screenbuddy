@@ -23,6 +23,20 @@ pub struct Config {
     pub agent_desktop: AgentDesktopCfg,
     pub context: ContextCfg,
     pub voice: VoiceCfg,
+    pub island: IslandCfg,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct IslandCfg {
+    /// The pill with the buddy's face at the top of the screen.
+    pub enabled: bool,
+}
+
+impl Default for IslandCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -183,6 +197,7 @@ impl Default for Config {
             agent_desktop: AgentDesktopCfg::default(),
             context: ContextCfg::default(),
             voice: VoiceCfg::default(),
+            island: IslandCfg::default(),
         }
     }
 }

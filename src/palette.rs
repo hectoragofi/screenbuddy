@@ -520,6 +520,7 @@ impl Palette {
         self.rx = Some(rx);
         self.cancel = Arc::new(AtomicBool::new(false));
         self.status = "sending…".into();
+        crate::island::buddy(crate::island::BuddyState::Thinking);
         llm::spawn(
             llm::Turn {
                 cfg: self.cfg.clone(),
@@ -551,6 +552,7 @@ impl Palette {
     /// conversation back via Done.
     fn stop_turn(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        crate::island::buddy(crate::island::BuddyState::Idle);
         if let Some(x) = self.exchanges.last_mut() {
             x.error = Some(friendly("cancelled"));
         }
@@ -740,6 +742,9 @@ impl Palette {
             match ev {
                 Ev::Delta(t) => {
                     if let Some(x) = self.exchanges.last_mut() {
+                        if x.answer.is_empty() {
+                            crate::island::buddy(crate::island::BuddyState::Streaming);
+                        }
                         x.answer.push_str(&t);
                     }
                 }
@@ -765,11 +770,15 @@ impl Palette {
                     }
                 }
                 Ev::Error(e) => {
+                    crate::island::buddy(crate::island::BuddyState::Error);
                     if let Some(x) = self.exchanges.last_mut() {
                         x.error = Some(friendly(&e));
                     }
                 }
                 Ev::Done(conv) => {
+                    if self.exchanges.last().is_some_and(|x| x.error.is_none()) {
+                        crate::island::buddy(crate::island::BuddyState::Done);
+                    }
                     self.trim_at = 0.0; // the answer's working memory is now cold
                     self.conv = Some(conv);
                     self.status.clear();
@@ -1245,7 +1254,9 @@ impl Palette {
                     }
                 }
                 // Pressing the hotkey again (or clicking the tray) toggles the palette off.
-                AppEvent::Hotkey(_) | AppEvent::TrayClick => self.close(ctx),
+                AppEvent::Hotkey(_) | AppEvent::TrayClick | AppEvent::IslandClick => self.close(ctx),
+                // Agent rows are the app's business once the palette is gone.
+                ev @ AppEvent::Island(_) => requeue.push(ev),
                 // More files from Explorer join the current question.
                 AppEvent::OpenFile(p) => {
                     self.chips.push(context::file_chip(&p));
@@ -2221,6 +2232,9 @@ impl eframe::App for Palette {
 impl Drop for Palette {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        if self.rx.is_some() {
+            crate::island::buddy(crate::island::BuddyState::Idle); // closed mid-answer
+        }
     }
 }
 
