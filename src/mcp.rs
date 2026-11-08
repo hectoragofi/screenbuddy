@@ -71,6 +71,9 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
             let (text, is_error) = match p["name"].as_str() {
                 _ if agent_tool.is_some() => agent_tool.unwrap_or_default(),
                 Some("draw") if crate::agents::is_agent_mcp() => return Err((-32602, "unknown tool draw".into())),
+                Some("window_screenshot") if crate::agents::is_agent_mcp() => {
+                    return Ok(crate::agents::desk::mcp_screenshot(&p["arguments"]));
+                }
                 Some("draw") => validate(&p["arguments"]),
                 Some("desktop") => desktop(&p["arguments"]),
                 Some(n) if crate::vision::is_tool(n) => return Ok(crate::vision::mcp_call(n, &p["arguments"])),
@@ -104,7 +107,12 @@ fn desktop(input: &Value) -> (String, bool) {
     }
     let cfg = crate::config::load().0;
     let session = std::env::var("SCREENBUDDY_DESKTOP_SESSION").unwrap_or_else(|_| crate::desktop::new_session_id());
+    let t0 = crate::agents::desk::now_ms();
     let out = crate::desktop::exec(&exe, &args, &intent, &crate::desktop::Ctx::from_config(&cfg, session));
+    if crate::agents::is_agent_mcp() && !crate::desktop::is_read_only(&args) {
+        // The parent moves windows the agent opened onto its desk.
+        let _ = crate::agents::cli_notify(&json!({"kind": "desk", "args": args, "out": out, "t0": t0}));
+    }
     let ok = serde_json::from_str::<Value>(&out)
         .ok()
         .and_then(|v| v["ok"].as_bool())

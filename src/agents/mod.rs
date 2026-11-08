@@ -19,7 +19,14 @@
 //! agents::search(q: &str) -> Vec<Agent>   // all terms must match name, brief, steps or results
 //! agents::get(id: &str) -> Option<Agent>
 //! agents::dir(id: &str) -> PathBuf        // %APPDATA%\screenbuddy\agents\<id>\ (its cwd + agent.json)
+//! agents::desk::show(id: &str) -> bool    // fly Apeiron to the agent's desk / focus its window
+//! agents::desk::back() -> bool            // camera back to where it was
 //! ```
+//!
+//! Desk (`desk.rs`): with Apeiron's canvas on, apps an agent launches are moved
+//! to its own canvas region and tracked in `Agent::desk`; `AgentEvent::Desk`
+//! reports it. Drive (`drive.rs`): on request (and the user's yes) an agent may
+//! use the real mouse and keyboard; any real input pauses it. `AgentEvent::Drive`.
 //!
 //! Events, per agent, in order:
 //!
@@ -47,6 +54,8 @@
 
 mod api;
 mod cli;
+pub mod desk;
+pub mod drive;
 mod store;
 
 pub use store::Agent;
@@ -132,6 +141,10 @@ pub enum AgentEvent {
     Status(Status),
     /// The question with this id was answered, timed out or dropped.
     Answered(u64),
+    /// The agent's canvas desk changed (region reserved, window placed).
+    Desk(desk::DeskEvent),
+    /// Drive mode changed (requested, started, paused by the user, ended).
+    Drive(drive::DriveEvent),
 }
 
 /// Options for `spawn_with`.
@@ -455,6 +468,7 @@ impl Runtime {
             } else {
                 self.backend.run(&job, &sink)
             };
+            drive::end(&sink);
             self.drop_asks(&id, &ctl);
             if ctl.stop.load(Ordering::SeqCst) {
                 let quick = ctl.started.lock().unwrap().is_some_and(|s| s.elapsed() < GRACE);
@@ -554,6 +568,7 @@ impl Runtime {
         }
         ctl.stop.store(false, Ordering::SeqCst);
         ctl.approved.store(false, Ordering::SeqCst);
+        drive::forget(id);
         let Some(rec) = self.update(id, |r| {
             r.plan.clear();
             r.steps.clear();
@@ -715,6 +730,16 @@ impl Sink {
         ok
     }
 
+    /// A desktop action finished (`t0_ms` = when it began): grows the desk.
+    pub fn desk_action(&self, args: &[String], out: &str, t0_ms: u64) {
+        desk::after_action(self, args, out, t0_ms);
+    }
+
+    /// The agent's desk windows, for `window_screenshot`.
+    pub fn desk_windows(&self) -> Vec<(isize, String)> {
+        self.rt.get(&self.id).map(|a| desk::windows_of(&a)).unwrap_or_default()
+    }
+
     /// `ask_user`: returns the text handed back to the model.
     pub fn questions(&self, qs: Vec<String>) -> String {
         let qs: Vec<String> = qs
@@ -746,6 +771,12 @@ pub(crate) fn agent_prompt(cfg: &Config, desktop: bool) -> String {
     );
     if desktop {
         p.push_str("\n\nTo read or operate the user's apps use the `desktop` tool. Prefer the accessibility tree: `list-apps`, `snapshot --app <name> -i --compact`, `find`, `get`; take a screenshot only when the tree doesn't show what you need. Act on refs from the latest snapshot and snapshot again to confirm it worked. Keep each step's `intent` short and concrete, like 'Click Save in Notepad'.");
+    }
+    if desktop {
+        p.push_str("\n\nApps you launch may open on your own desk, an area of the user's canvas out of their view, so you don't disturb them; they stay there when you finish. Use `window_screenshot` to see a window there.");
+    }
+    if drive::enabled(cfg) {
+        p.push_str("\n\nNever move the user's real mouse or type on their keyboard unless they explicitly asked to watch you do it ('show me', 'do it while I watch'); then use the `drive` tool, which asks them first and pauses you if they touch anything. Call it with action `stop` when you're done driving.");
     }
     if !cfg.extra_instructions.trim().is_empty() {
         p.push_str("\n\n");
@@ -834,7 +865,16 @@ pub fn mcp_tools(desktop: bool) -> Vec<Value> {
             json!({"name": "desktop", "description": crate::desktop::DESC, "inputSchema": crate::desktop::schema()}),
         );
     }
+    v.push(json!({"name": "window_screenshot", "description": desk::SHOT_DESC, "inputSchema": desk::shot_schema()}));
+    if drive::enabled(&crate::config::load().0) {
+        v.push(json!({"name": "drive", "description": drive::DESC, "inputSchema": drive::schema()}));
+    }
     v
+}
+
+/// Inside `screenbuddy --mcp`: tells the parent agent something (one line in, one out).
+pub fn cli_notify(req: &Value) -> Option<String> {
+    cli::ask_parent_line(req)
 }
 
 /// Agent-role MCP tools handled here (desktop stays in mcp.rs). None = not ours.
@@ -856,6 +896,16 @@ pub fn mcp_call(name: &str, args: &Value) -> Option<(String, bool)> {
                 None => ("error: screenbuddy is not reachable".into(), true),
             })
         }
+        "drive" if is_agent_mcp() => Some(match cli::ask_parent_line(&json!({"kind": "drive", "input": args})) {
+            Some(line) => {
+                let v: Value = serde_json::from_str(&line).unwrap_or_default();
+                (
+                    v["text"].as_str().unwrap_or("error: no reply").to_string(),
+                    v["is_error"].as_bool().unwrap_or(true),
+                )
+            }
+            None => ("error: screenbuddy is not reachable".into(), true),
+        }),
         "spawn_agent" if !is_agent_mcp() => Some(("ok".into(), false)),
         _ => None,
     }
@@ -970,6 +1020,11 @@ fn run_headless(rt: &Arc<Runtime>, rx: Receiver<(AgentId, AgentEvent)>, brief: &
                 code = 2;
             }
             AgentEvent::Done => println!("[done]"),
+            AgentEvent::Desk(desk::DeskEvent::Region(r)) => {
+                println!("[desk] region {} at {:.0},{:.0} {:.0}x{:.0}", desk::region_name(&id), r[0], r[1], r[2], r[3])
+            }
+            AgentEvent::Desk(desk::DeskEvent::Placed { hwnd, title }) => println!("[desk] placed {hwnd:#x} \"{title}\""),
+            AgentEvent::Drive(d) => println!("[drive] {d:?}"),
         }
         let _ = std::io::stdout().flush();
     }

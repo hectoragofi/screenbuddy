@@ -90,11 +90,14 @@ pub struct AgentsCfg {
     pub always_approve: bool,
     /// Claude CLI model for agents; empty = same as claude_cli.model.
     pub model: String,
+    /// "ask": an agent may ask to use the real mouse and keyboard while the
+    /// user watches; "never": agents only work in the background.
+    pub drive: String,
 }
 
 impl Default for AgentsCfg {
     fn default() -> Self {
-        Self { enabled: true, always_approve: false, model: String::new() }
+        Self { enabled: true, always_approve: false, model: String::new(), drive: "ask".into() }
     }
 }
 

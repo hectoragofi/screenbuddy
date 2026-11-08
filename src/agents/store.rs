@@ -35,6 +35,10 @@ pub struct Agent {
     /// The question or approval waiting on the user, if any.
     pub ask: Option<Question>,
     pub provider: String,
+    /// Windows on the agent's desk (hwnds, in arrival order).
+    pub desk: Vec<isize>,
+    /// Its Apeiron canvas region `[x, y, w, h]`, once reserved.
+    pub region: Option<[f64; 4]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
