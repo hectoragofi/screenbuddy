@@ -1,11 +1,13 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod buddy;
 mod capture;
 mod config;
 mod context;
 mod desktop;
 mod diagram;
 mod history;
+mod island;
 mod llm;
 mod math;
 mod mcp;
@@ -15,6 +17,7 @@ mod palette;
 mod settings;
 mod surface;
 mod tray;
+mod ui;
 mod uia;
 mod util;
 mod voice;
@@ -75,6 +78,7 @@ struct App {
     /// Registered push-to-talk hotkey (None = needs registering).
     voice_hk: Option<String>,
     tray: tray::Tray,
+    island: Option<island::IslandHandle>,
 }
 
 impl App {
@@ -93,6 +97,11 @@ impl App {
             self.voice_hk = Some(voice);
         }
         self.cfg = cfg;
+        match (&self.island, self.cfg.island.enabled) {
+            (None, true) => self.island = Some(island::start()),
+            (Some(h), on) => h.set_visible(on),
+            (None, false) => {}
+        }
         self.cfg_error = if errs.is_empty() {
             None
         } else {
@@ -167,6 +176,7 @@ fn run() -> anyhow::Result<()> {
             Some(errs.join("\n"))
         },
         tray,
+        island: None,
     };
     app.reload(); // registers the push-to-talk hotkey
     if let Some(e) = &app.cfg_error {
@@ -187,7 +197,12 @@ fn run() -> anyhow::Result<()> {
         while let Some(ev) = win::pop() {
             let outcome = match ev {
                 AppEvent::Hotkey(win::HK_ASK) => app.ask(false, true, Default::default()),
-                AppEvent::TrayClick => app.ask(false, false, Default::default()),
+                AppEvent::TrayClick | AppEvent::IslandClick => app.ask(false, false, Default::default()),
+                // Agent cards (wave 2) take this over; for now there is nothing to open.
+                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => {
+                    config::log(&format!("island: open agent {id}"));
+                    palette::Outcome::Closed
+                }
                 AppEvent::Hotkey(win::HK_REGION) => app.ask(true, true, Default::default()),
                 AppEvent::Hotkey(win::HK_VOICE) => app.ask(
                     false,

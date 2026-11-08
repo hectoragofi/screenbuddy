@@ -499,6 +499,11 @@ impl Settings {
                 toggle(ui, &mut self.cfg.appearance.dismiss_on_blur, accent);
             });
         });
+        group(ui, "Island", |ui| {
+            row(ui, "Show the island", Some("The buddy's pill at the top of the screen. Hover to see agents, click to ask."), |ui| {
+                toggle(ui, &mut self.cfg.island.enabled, accent);
+            });
+        });
         hint(ui, "Changes apply the next time you open the palette.");
     }
 

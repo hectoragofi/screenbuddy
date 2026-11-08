@@ -23,6 +23,9 @@ pub enum AppEvent {
     Menu(String),
     /// A file sent from Explorer's "Ask screenbuddy" menu.
     OpenFile(std::path::PathBuf),
+    /// The island's pill (or its "Ask…" row) was clicked: open the palette.
+    IslandClick,
+    Island(crate::island::IslandEvent),
 }
 
 static QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());
