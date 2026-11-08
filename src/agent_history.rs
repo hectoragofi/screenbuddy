@@ -30,20 +30,28 @@ pub fn mono_medium_family() -> FontFamily {
 }
 
 fn body(text: impl Into<String>) -> RichText {
-    RichText::new(text).font(FontId::new(tokens::BODY_PX, mono_family())).color(col(tokens::PAPER))
+    RichText::new(text)
+        .font(FontId::new(tokens::BODY_PX, mono_family()))
+        .color(col(tokens::PAPER))
 }
 
 fn strong(text: impl Into<String>) -> RichText {
-    RichText::new(text).font(FontId::new(tokens::BODY_PX, mono_medium_family())).color(col(tokens::PAPER))
+    RichText::new(text)
+        .font(FontId::new(tokens::BODY_PX, mono_medium_family()))
+        .color(col(tokens::PAPER))
 }
 
 /// 10.5 px ALL CAPS mono label.
 pub fn label(text: &str) -> RichText {
-    RichText::new(text.to_uppercase()).font(FontId::new(tokens::LABEL_PX, mono_medium_family())).color(col(tokens::MUTE))
+    RichText::new(text.to_uppercase())
+        .font(FontId::new(tokens::LABEL_PX, mono_medium_family()))
+        .color(col(tokens::MUTE))
 }
 
 fn dim(text: impl Into<String>) -> RichText {
-    RichText::new(text).font(FontId::new(tokens::BODY_PX, mono_family())).color(col(tokens::MUTE))
+    RichText::new(text)
+        .font(FontId::new(tokens::BODY_PX, mono_family()))
+        .color(col(tokens::MUTE))
 }
 
 /// Status dot colour: working = the accent, done = OK, failed = ERR,
@@ -86,7 +94,8 @@ pub fn one_liner(a: &Agent) -> String {
     };
     let flat = pick.split_whitespace().collect::<Vec<_>>().join(" ");
     // Strip the most common markdown noise so the line reads as text.
-    flat.trim_start_matches(['#', '*', '>', '-', ' ']).replace("**", "")
+    flat.trim_start_matches(['#', '*', '>', '-', ' '])
+        .replace("**", "")
 }
 
 fn status_word(a: &Agent) -> &'static str {
@@ -137,7 +146,13 @@ impl View {
 
     /// Draws the list, or the detail page. `keys` = (up, down, enter) from the
     /// palette's key handling; `md` renders the result.
-    pub fn show(&mut self, ui: &mut egui::Ui, query: &str, keys: (bool, bool, bool), md: &mut egui_commonmark::CommonMarkCache) {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        query: &str,
+        keys: (bool, bool, bool),
+        md: &mut egui_commonmark::CommonMarkCache,
+    ) {
         self.refresh(query);
         if self.rows.iter().any(|a| a.status.is_active()) || self.detail.is_some() {
             ui.ctx().request_repaint_after(REFRESH);
@@ -159,7 +174,11 @@ impl View {
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         if self.rows.is_empty() {
-            let msg = if self.query.trim().is_empty() { "No agents yet." } else { "No agents match." };
+            let msg = if self.query.trim().is_empty() {
+                "No agents yet."
+            } else {
+                "No agents match."
+            };
             ui.label(dim(msg));
             return;
         }
@@ -173,36 +192,62 @@ impl View {
         for (i, a) in self.rows.iter().enumerate() {
             let (rect, resp) = {
                 let w = ui.available_width();
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
                 (rect, resp)
             };
             let sel = i == selected;
             if sel || resp.hovered() {
-                ui.painter().rect_filled(rect, tokens::RADIUS_CHIP, Color32::from_white_alpha(if sel { 16 } else { 9 }));
+                ui.painter().rect_filled(
+                    rect,
+                    tokens::RADIUS_CHIP,
+                    Color32::from_white_alpha(if sel { 16 } else { 9 }),
+                );
             }
             if sel {
-                let bar = egui::Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 9.0), egui::vec2(2.0, ROW_H - 18.0));
+                let bar = egui::Rect::from_min_size(
+                    rect.left_top() + egui::vec2(0.0, 9.0),
+                    egui::vec2(2.0, ROW_H - 18.0),
+                );
                 ui.painter().rect_filled(bar, 1.0, col(tokens::SIGNAL));
             }
             if sel && (up || down) {
                 resp.scroll_to_me(None);
             }
-            ui.painter().circle_filled(rect.left_top() + egui::vec2(16.0, 17.0), 3.5, dot_color(a));
+            ui.painter()
+                .circle_filled(rect.left_top() + egui::vec2(16.0, 17.0), 3.5, dot_color(a));
 
-            let top = egui::Rect::from_min_size(rect.left_top() + egui::vec2(30.0, 5.0), egui::vec2(rect.width() - 40.0, 24.0));
-            let mut row = ui.new_child(egui::UiBuilder::new().max_rect(top).layout(egui::Layout::right_to_left(egui::Align::Center)));
-            if a.archived && row.add(egui::Button::new(label("Unarchive")).small()).clicked() {
+            let top = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(30.0, 5.0),
+                egui::vec2(rect.width() - 40.0, 24.0),
+            );
+            let mut row = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(top)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            );
+            if a.archived
+                && row
+                    .add(egui::Button::new(label("Unarchive")).small())
+                    .clicked()
+            {
                 unarchive = Some(a.id.clone());
             }
             if a.archived {
                 row.label(label("Archived").color(col(tokens::ASK)));
             }
-            row.label(label(&relative(now, a.ended.or(a.started).unwrap_or(a.created))));
+            row.label(label(&relative(
+                now,
+                a.ended.or(a.started).unwrap_or(a.created),
+            )));
             row.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(egui::Label::new(strong(&a.name)).truncate());
             });
 
-            let line = egui::Rect::from_min_size(rect.left_top() + egui::vec2(30.0, 27.0), egui::vec2(rect.width() - 40.0, 16.0));
+            let line = egui::Rect::from_min_size(
+                rect.left_top() + egui::vec2(30.0, 27.0),
+                egui::vec2(rect.width() - 40.0, 16.0),
+            );
             let mut sub = ui.new_child(egui::UiBuilder::new().max_rect(line));
             sub.add(egui::Label::new(dim(one_liner(a)).size(11.5)).truncate());
 
@@ -225,7 +270,13 @@ impl View {
         }
     }
 
-    fn detail_page(&mut self, ui: &mut egui::Ui, id: &str, enter: bool, md: &mut egui_commonmark::CommonMarkCache) {
+    fn detail_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &str,
+        enter: bool,
+        md: &mut egui_commonmark::CommonMarkCache,
+    ) {
         let Some(a) = agents::get(id) else {
             // Deleted underneath us.
             self.back();
@@ -234,7 +285,10 @@ impl View {
         let active = a.status.is_active();
         let mut go_back = false;
         ui.horizontal(|ui| {
-            if ui.add(egui::Button::new(label("\u{2039} Back")).frame(false)).clicked() {
+            if ui
+                .add(egui::Button::new(label("\u{2039} Back")).frame(false))
+                .clicked()
+            {
                 go_back = true;
             }
             ui.label(dim("\u{b7}"));
@@ -273,13 +327,20 @@ impl View {
         }
         if !a.result.trim().is_empty() {
             section(ui, "Result");
-            egui_commonmark::CommonMarkViewer::new().show(ui, md, &crate::math::normalize(&a.result));
+            egui_commonmark::CommonMarkViewer::new().show(
+                ui,
+                md,
+                &crate::math::normalize(&a.result),
+            );
         }
         if !a.files.is_empty() {
             section(ui, "Files");
             ui.horizontal_wrapped(|ui| {
                 for f in &a.files {
-                    let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let name = f
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     let chip = egui::Button::new(body(name).size(11.5))
                         .fill(Color32::from_white_alpha(12))
                         .corner_radius(tokens::RADIUS_CHIP);
@@ -287,7 +348,10 @@ impl View {
                     if r.clicked() {
                         crate::win::shell_open(f);
                     }
-                    if ui.add(egui::Button::new(label("Reveal")).frame(false)).clicked() {
+                    if ui
+                        .add(egui::Button::new(label("Reveal")).frame(false))
+                        .clicked()
+                    {
                         reveal(f);
                     }
                 }
@@ -321,7 +385,10 @@ impl View {
             } else if ui.button(label("Retry")).clicked() {
                 agents::retry(id);
             }
-            if ui.button(label(if a.archived { "Unarchive" } else { "Archive" })).clicked() {
+            if ui
+                .button(label(if a.archived { "Unarchive" } else { "Archive" }))
+                .clicked()
+            {
                 agents::archive(id, !a.archived);
                 self.loaded = None;
             }
@@ -355,7 +422,9 @@ fn section(ui: &mut egui::Ui, name: &str) {
 
 /// Opens Explorer with the file selected.
 fn reveal(path: &std::path::Path) {
-    let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", path.display())).spawn();
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
 }
 
 #[cfg(test)]
@@ -373,7 +442,10 @@ mod tests {
 
     #[test]
     fn one_liner_prefers_result_then_error_then_step() {
-        let mut a = Agent { brief: "do it".into(), ..Default::default() };
+        let mut a = Agent {
+            brief: "do it".into(),
+            ..Default::default()
+        };
         assert_eq!(one_liner(&a), "do it");
         a.steps = vec!["reading".into()];
         assert_eq!(one_liner(&a), "reading");
