@@ -860,7 +860,10 @@ impl Job {
         unsafe {
             let job = Job(CreateJobObjectW(None, windows::core::PCWSTR::null()).ok()?);
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // BREAKAWAY_OK: agent-desktop is spawned with CREATE_BREAKAWAY_FROM_JOB
+            // so apps the model launches (Chrome, Notepad...) outlive the turn.
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             SetInformationJobObject(
                 job.0,
                 JobObjectExtendedLimitInformation,

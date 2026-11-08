@@ -204,6 +204,34 @@ const PEEK_DELAY: Duration = Duration::from_millis(120);
 const UNPEEK_DELAY: Duration = Duration::from_millis(220);
 /// Dim to DIM_ALPHA after this long with nothing happening.
 const DIM_AFTER: Duration = Duration::from_secs(10);
+/// With auto-hide on, tuck away after this long with nothing happening.
+const HIDE_AFTER: Duration = Duration::from_secs(4);
+/// While tucked away, how often the cursor is checked for the top-edge reveal.
+const EDGE_POLL: Duration = Duration::from_millis(120);
+/// Half-width (logical px) of the top-edge zone that brings the island back.
+const EDGE_HALF_W: f32 = 160.0;
+
+static AUTO_HIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Hide the island when idle (from config `[island] auto_hide`).
+pub fn set_auto_hide(on: bool) {
+    AUTO_HIDE.store(on, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = handle() {
+        h.wake();
+    }
+}
+
+/// True when the cursor sits on the top edge of its monitor, near the centre.
+fn cursor_on_top_edge() -> bool {
+    let mut p = POINT::default();
+    if unsafe { GetCursorPos(&mut p) }.is_err() {
+        return false;
+    }
+    let m = ui::monitor_under_cursor();
+    let r = m.rect;
+    let cx = r.x + r.w / 2;
+    p.y <= r.y + 1 && ((p.x - cx).abs() as f32) <= EDGE_HALF_W * m.scale
+}
 const DIM_ALPHA: f32 = 0.36;
 /// Shadow-layer margins around the body.
 const SHADOW_SIDE: f32 = 28.0;
@@ -800,6 +828,8 @@ struct Island {
     shadow_alpha: f32,
     /// A click opened the palette: no peeking again until the cursor leaves.
     no_peek: bool,
+    /// Auto-hidden because nothing is happening (polls for the top-edge reveal).
+    tucked: bool,
 }
 
 fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
@@ -822,6 +852,7 @@ fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
         shadow_key: None,
         shadow_alpha: -1.0,
         no_peek: false,
+        tucked: false,
     };
     isl.shown.set(1.0);
     unsafe {
@@ -999,7 +1030,23 @@ impl Island {
             || now.saturating_duration_since(self.activity) < DIM_AFTER;
         self.view.buddy.set_awake(awake);
         self.view.alpha.set(if awake { 1.0 } else { DIM_ALPHA });
-        let hide = !self.enabled || (self.fullscreen && resting);
+        if self.tucked && cursor_on_top_edge() {
+            self.activity = now;
+            self.follow_cursor();
+            self.dirty = true;
+        }
+        let needs_you = self
+            .view
+            .agents
+            .iter()
+            .any(|a| a.kind == AgentStatus::Asking);
+        self.tucked = AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed)
+            && resting
+            && !hovered
+            && !self.view.peek
+            && !needs_you
+            && now.saturating_duration_since(self.activity) >= HIDE_AFTER;
+        let hide = !self.enabled || (self.fullscreen && resting) || self.tucked;
         self.shown.set(if hide { 0.0 } else { 1.0 });
         self.view.layout(now);
 
@@ -1072,7 +1119,11 @@ impl Island {
             return Motion::Fast;
         }
         if !self.body.visible() {
-            return Motion::Still(None);
+            return if self.tucked && self.enabled {
+                Motion::Still(Some(now + EDGE_POLL))
+            } else {
+                Motion::Still(None)
+            };
         }
         let mut m = self.view.buddy.motion(now);
         // Wake for the pending peek / unpeek, the dim, and the Done/Error fallback.
@@ -1096,6 +1147,9 @@ impl Island {
             && !hovered
         {
             at.push(self.activity + DIM_AFTER);
+            if AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed) {
+                at.push(self.activity + HIDE_AFTER);
+            }
         }
         match self.view.buddy.state() {
             BuddyState::Done => {

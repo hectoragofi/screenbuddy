@@ -477,6 +477,7 @@ impl Runtime {
             });
             self.emit(&id, AgentEvent::Status(Status::Running));
             let cfg = (self.config)();
+            let cfg = cfg.overridden(&cfg.agents.provider, &cfg.agents.model, &cfg.agents.effort);
             let job = TurnJob {
                 id: id.clone(),
                 cwd: self.root.join(&id),
