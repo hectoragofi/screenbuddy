@@ -406,7 +406,7 @@ impl Settings {
                     });
                     sep(ui);
                     row(ui, "Model", None, |ui| {
-                        combo_text(ui, "cli_model", &mut self.cfg.claude_cli.model, &[("", "Default"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]);
+                        combo_text(ui, "cli_model", &mut self.cfg.claude_cli.model, &[("", "Default"), ("claude-opus-5-5", "Opus 5.5"), ("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-haiku-5-5", "Haiku 5.5"), ("claude-fable-5-1", "Fable 5.1")]);
                     });
                     sep(ui);
                     row(ui, "Stay ready after closing", Some("Answers start instantly; ~100 MB while waiting"), |ui| {
@@ -473,6 +473,30 @@ impl Settings {
                 });
             }
         }
+        group(ui, "Per task", |ui| {
+            let main = self.cfg.provider.clone();
+            row(ui, "Agents · provider", Some("Background work handed off by the buddy"), |ui| {
+                combo_text(ui, "ag_provider", &mut self.cfg.agents.provider, PROVIDERS);
+            });
+            sep(ui);
+            let p = effective(&self.cfg.agents.provider, &main);
+            row(ui, "Agents · model", Some("Pick one or type any model id"), |ui| {
+                model_pick(ui, "ag_model", &p, &mut self.cfg.agents.model);
+            });
+            sep(ui);
+            row(ui, "Agents · effort", Some("Anthropic API only"), |ui| {
+                combo_text(ui, "ag_effort", &mut self.cfg.agents.effort, &[("", "Same as answers"), ("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "X-High"), ("max", "Max")]);
+            });
+            sep(ui);
+            row(ui, "Voice · provider", Some("Hold-Alt answers beside the cursor"), |ui| {
+                combo_text(ui, "qa_provider", &mut self.cfg.input.provider, PROVIDERS);
+            });
+            sep(ui);
+            let p = effective(&self.cfg.input.provider, &main);
+            row(ui, "Voice · model", Some("A faster model keeps voice snappy"), |ui| {
+                model_pick(ui, "qa_model", &p, &mut self.cfg.input.model);
+            });
+        });
     }
 
     fn appearance(&mut self, ui: &mut egui::Ui, accent: Color32) {
@@ -519,6 +543,9 @@ impl Settings {
         group(ui, "Island", |ui| {
             row(ui, "Show the island", Some("The buddy's pill at the top of the screen. Hover to see agents, click to ask."), |ui| {
                 toggle(ui, &mut self.cfg.island.enabled, accent);
+            });
+            row(ui, "Hide when idle", Some("Tucks away when nothing is happening. Touch the top edge near the centre to bring it back."), |ui| {
+                toggle(ui, &mut self.cfg.island.auto_hide, accent);
             });
         });
         hint(ui, "Changes apply the next time you open the palette.");
@@ -816,6 +843,38 @@ fn segmented(ui: &mut egui::Ui, value: &mut String, options: &[(&str, &str)], ac
 }
 
 /// Dropdown of presets that also allows any custom value already set.
+const PROVIDERS: &[(&str, &str)] = &[
+    ("", "Same as answers"),
+    ("claude-cli", "Claude subscription"),
+    ("anthropic", "Anthropic API"),
+    ("openai", "OpenAI-compatible"),
+];
+
+fn effective(choice: &str, main: &str) -> String {
+    if choice.trim().is_empty() { main.to_string() } else { choice.to_string() }
+}
+
+/// Preset models for the provider, plus a free-text field for any model id.
+fn model_pick(ui: &mut egui::Ui, id: &str, provider: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        if provider != "openai" {
+            combo_text(
+                ui,
+                id,
+                value,
+                &[
+                    ("", "Provider default"),
+                    ("claude-opus-5-5", "Opus 5.5"),
+                    ("claude-sonnet-5-5", "Sonnet 5.5"),
+                    ("claude-haiku-5-5", "Haiku 5.5"),
+                    ("claude-fable-5-1", "Fable 5.1"),
+                ],
+            );
+        }
+        ui.add(egui::TextEdit::singleline(value).hint_text("custom model id").desired_width(160.0));
+    });
+}
+
 fn combo_text(ui: &mut egui::Ui, id: &str, value: &mut String, options: &[(&str, &str)]) {
     let shown = options.iter().find(|o| o.0 == value.as_str()).map(|o| o.1.to_string()).unwrap_or_else(|| value.clone());
     egui::ComboBox::from_id_salt(id).selected_text(shown).width(220.0).show_ui(ui, |ui| {

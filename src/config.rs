@@ -48,11 +48,15 @@ impl Default for WalkCfg {
 pub struct IslandCfg {
     /// The pill with the buddy's face at the top of the screen.
     pub enabled: bool,
+    /// Tuck the island away when nothing is happening; it comes back while
+    /// listening or answering, when an agent needs you, or when the cursor
+    /// touches the top edge of the screen near the centre.
+    pub auto_hide: bool,
 }
 
 impl Default for IslandCfg {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, auto_hide: true }
     }
 }
 
@@ -88,11 +92,21 @@ pub struct InputCfg {
     pub alt_hold_ms: u32,
     /// Double-tap Alt to open the palette.
     pub alt_double_tap: bool,
+    /// Provider for voice (hold-Alt) answers; empty = same as answers.
+    pub provider: String,
+    /// Model for voice answers; empty = the chosen provider's model.
+    pub model: String,
 }
 
 impl Default for InputCfg {
     fn default() -> Self {
-        Self { alt_hold: true, alt_hold_ms: 600, alt_double_tap: true }
+        Self {
+            alt_hold: true,
+            alt_hold_ms: 600,
+            alt_double_tap: true,
+            provider: String::new(),
+            model: String::new(),
+        }
     }
 }
 
@@ -103,8 +117,13 @@ pub struct AgentsCfg {
     pub enabled: bool,
     /// Agents act without asking, even to delete, send or pay.
     pub always_approve: bool,
-    /// Claude CLI model for agents; empty = same as claude_cli.model.
+    /// Provider for agents ("claude-cli" | "anthropic" | "openai"); empty =
+    /// the same provider as answers.
+    pub provider: String,
+    /// Model for agents; empty = the chosen provider's model.
     pub model: String,
+    /// Anthropic API effort for agents; empty = same as answers.
+    pub effort: String,
     /// "ask": an agent may ask to use the real mouse and keyboard while the
     /// user watches; "never": agents only work in the background.
     pub drive: String,
@@ -112,7 +131,14 @@ pub struct AgentsCfg {
 
 impl Default for AgentsCfg {
     fn default() -> Self {
-        Self { enabled: true, always_approve: false, model: String::new(), drive: "ask".into() }
+        Self {
+            enabled: true,
+            always_approve: false,
+            provider: String::new(),
+            model: String::new(),
+            effort: String::new(),
+            drive: "ask".into(),
+        }
     }
 }
 
@@ -330,6 +356,26 @@ impl Default for ClaudeCliCfg {
 }
 
 impl Config {
+    /// A copy with a per-task provider/model/effort applied (empty = keep).
+    pub fn overridden(&self, provider: &str, model: &str, effort: &str) -> Config {
+        let mut c = self.clone();
+        if !provider.trim().is_empty() {
+            c.provider = provider.trim().to_string();
+        }
+        let m = model.trim();
+        if !m.is_empty() {
+            match c.provider.as_str() {
+                "claude-cli" => c.claude_cli.model = m.to_string(),
+                "openai" => c.openai.model = m.to_string(),
+                _ => c.anthropic.model = m.to_string(),
+            }
+        }
+        if !effort.trim().is_empty() {
+            c.anthropic.effort = effort.trim().to_string();
+        }
+        c
+    }
+
     /// The agent-desktop binary, if enabled and installed.
     pub fn desktop_exe(&self) -> Option<std::path::PathBuf> {
         if self.agent_desktop.enabled {

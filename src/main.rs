@@ -127,6 +127,7 @@ impl App {
         }
         quick::configure(&cfg);
         self.cfg = cfg;
+        island::set_auto_hide(self.cfg.island.auto_hide);
         match (&self.island, self.cfg.island.enabled) {
             (None, true) => self.island = Some(island::start()),
             (Some(h), on) => h.set_visible(on),
