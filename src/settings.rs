@@ -325,6 +325,19 @@ impl Settings {
                 combo_text(ui, "voice_lang", &mut self.cfg.voice.language, voice::LANGUAGES);
             });
         });
+        group(ui, "Alt key", |ui| {
+            row(ui, "Hold Alt to ask", Some("Hold Alt alone, speak, let go; the answer appears beside the cursor"), |ui| {
+                toggle(ui, &mut self.cfg.input.alt_hold, accent);
+            });
+            sep(ui);
+            row(ui, "Hold for", Some("How long Alt is held before listening starts"), |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.input.alt_hold_ms, 300..=1500).suffix(" ms").step_by(50.0));
+            });
+            sep(ui);
+            row(ui, "Double-tap Alt", Some("Opens the palette to type a question"), |ui| {
+                toggle(ui, &mut self.cfg.input.alt_double_tap, accent);
+            });
+        });
         if let Some(slot) = self.recording.filter(|&s| s == 2) {
             if let Some(combo) = capture_hotkey(ui) {
                 if let Ok(s) = combo {
@@ -499,6 +512,11 @@ impl Settings {
                 toggle(ui, &mut self.cfg.appearance.dismiss_on_blur, accent);
             });
         });
+        group(ui, "Island", |ui| {
+            row(ui, "Show the island", Some("The buddy's pill at the top of the screen. Hover to see agents, click to ask."), |ui| {
+                toggle(ui, &mut self.cfg.island.enabled, accent);
+            });
+        });
         hint(ui, "Changes apply the next time you open the palette.");
     }
 
@@ -576,12 +594,21 @@ impl Settings {
             segmented(ui, &mut self.cfg.agent_desktop.approval, &[("ask", "Ask every time"), ("once", "Ask once per chat"), ("never", "Never ask")], accent);
             ui.add_space(2.0);
             let note = match self.cfg.agent_desktop.approval.as_str() {
-                "ask" => "You approve each click or keystroke.",
+                "ask" => "You approve each action that deletes, sends, posts or pays.",
                 "never" => "Acts right away. Reading apps never asks.",
-                _ => "Approve the first action; the rest of that conversation runs on its own.",
+                _ => "Approve the first delete, send or payment; the rest of that conversation runs on its own.",
             };
             ui.label(RichText::new(note).color(TEXT_3).size(12.5));
             ui.add_space(4.0);
+        });
+        group(ui, "Background agents", |ui| {
+            row(ui, "Hand off multi-step work", Some("The assistant can start an agent that works while you carry on"), |ui| {
+                toggle(ui, &mut self.cfg.agents.enabled, accent);
+            });
+            sep(ui);
+            row(ui, "Always approve agent actions", Some("Agents delete, send or pay without asking"), |ui| {
+                toggle(ui, &mut self.cfg.agents.always_approve, accent);
+            });
         });
         group(ui, "Agent cursor", |ui| {
             row(ui, "Show cursor while acting", Some("A separate pointer, so you can see what it's doing"), |ui| {

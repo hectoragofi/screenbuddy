@@ -66,6 +66,8 @@ struct Exchange {
     error: Option<Friendly>,
     /// Labels of the context chips sent with this question.
     attached: Vec<String>,
+    /// Background agents the answer spawned (live state comes from `agents`).
+    agents: Vec<crate::agents::AgentId>,
 }
 
 /// How the palette should open.
@@ -81,6 +83,10 @@ pub struct Start {
     pub backdrop: Option<Arc<crate::surface::Backdrop>>,
     /// Selected text still being read; becomes a chip before the palette shows.
     pub selection: Option<context::PendingSelection>,
+    /// Open on this saved conversation (a clicked quick-ask caption).
+    pub open_chat: Option<std::path::PathBuf>,
+    /// Open showing this background agent (an island row was clicked).
+    pub open_agent: Option<crate::agents::AgentId>,
 }
 
 /// A user-facing error: a short sentence, an optional action, and the raw detail.
@@ -186,6 +192,8 @@ pub struct Palette {
     voice_dl: Option<Arc<std::sync::Mutex<voice::Download>>>,
     /// Start recording on the first frame / once the model is downloaded.
     voice_pending: bool,
+    open_on_start: Option<std::path::PathBuf>,
+    agent_on_start: Option<crate::agents::AgentId>,
     /// egui time (s) at which to hand cold pages back to the OS; see `trim_when_idle`.
     trim_at: f64,
     /// The user dragged the palette; its spot is saved on close.
@@ -203,6 +211,8 @@ pub struct Palette {
     /// Recent mic levels for the recording waveform, oldest first.
     wave: Vec<f32>,
     wave_t: f64,
+    /// Typed answers to agents' questions, by agent id.
+    agent_drafts: std::collections::HashMap<String, String>,
 }
 
 /// A context tab's motion. It outlives its chip by the time it takes to sink.
@@ -458,6 +468,8 @@ impl Palette {
             transcribing: None,
             voice_dl: None,
             voice_pending: start.voice,
+            open_on_start: start.open_chat,
+            agent_on_start: start.open_agent,
             trim_at: TRIM_AFTER_OPEN,
             moved: false,
             mention: None,
@@ -467,6 +479,7 @@ impl Palette {
             cursor_end: false,
             wave: Vec::new(),
             wave_t: 0.0,
+            agent_drafts: Default::default(),
         }
     }
 
@@ -515,11 +528,13 @@ impl Palette {
             answer: String::new(),
             error: None,
             attached,
+            agents: Vec::new(),
         });
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.cancel = Arc::new(AtomicBool::new(false));
         self.status = "sending…".into();
+        crate::island::buddy(crate::island::BuddyState::Thinking);
         llm::spawn(
             llm::Turn {
                 cfg: self.cfg.clone(),
@@ -551,6 +566,7 @@ impl Palette {
     /// conversation back via Done.
     fn stop_turn(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        crate::island::buddy(crate::island::BuddyState::Idle);
         if let Some(x) = self.exchanges.last_mut() {
             x.error = Some(friendly("cancelled"));
         }
@@ -740,6 +756,9 @@ impl Palette {
             match ev {
                 Ev::Delta(t) => {
                     if let Some(x) = self.exchanges.last_mut() {
+                        if x.answer.is_empty() {
+                            crate::island::buddy(crate::island::BuddyState::Streaming);
+                        }
                         x.answer.push_str(&t);
                     }
                 }
@@ -765,11 +784,20 @@ impl Palette {
                     }
                 }
                 Ev::Error(e) => {
+                    crate::island::buddy(crate::island::BuddyState::Error);
                     if let Some(x) = self.exchanges.last_mut() {
                         x.error = Some(friendly(&e));
                     }
                 }
+                Ev::Spawned(id) => {
+                    if let Some(x) = self.exchanges.last_mut() {
+                        x.agents.push(id);
+                    }
+                }
                 Ev::Done(conv) => {
+                    if self.exchanges.last().is_some_and(|x| x.error.is_none()) {
+                        crate::island::buddy(crate::island::BuddyState::Done);
+                    }
                     self.trim_at = 0.0; // the answer's working memory is now cold
                     self.conv = Some(conv);
                     self.status.clear();
@@ -785,6 +813,10 @@ impl Palette {
 
     fn save_history(&mut self) {
         if !self.cfg.history || self.exchanges.is_empty() {
+            return;
+        }
+        // Only agents opened from the island: nothing of this chat to keep.
+        if self.exchanges.iter().all(|x| x.answer.is_empty() && x.error.is_none() && !x.agents.is_empty()) {
             return;
         }
         let dir = self
@@ -818,6 +850,25 @@ impl Palette {
     }
 
     /// Shows a saved chat and lets the next question continue it.
+    /// Shows a background agent as an exchange: its brief, then its live line.
+    /// Minimal until the cards slice adds real agent views.
+    fn show_agent(&mut self, id: crate::agents::AgentId) {
+        let Some(a) = crate::agents::get(&id) else {
+            self.notice = Some("Couldn't find that agent.".into());
+            return;
+        };
+        if self.exchanges.iter().any(|x| x.agents.contains(&id)) {
+            return;
+        }
+        self.exchanges.push(Exchange {
+            question: a.brief,
+            answer: String::new(),
+            error: None,
+            attached: Vec::new(),
+            agents: vec![id],
+        });
+    }
+
     fn open_chat(&mut self, ctx: &egui::Context, dir: std::path::PathBuf) {
         if self.busy() {
             return;
@@ -835,6 +886,7 @@ impl Palette {
                 answer: x.answer.clone(),
                 error: x.error.as_deref().map(friendly),
                 attached: x.attached.clone(),
+                agents: Vec::new(),
             })
             .collect();
         self.resume = Some(chat.preamble());
@@ -1233,6 +1285,12 @@ impl Palette {
     }
 
     fn handle_app_events(&mut self, ctx: &egui::Context) {
+        if let Some(dir) = self.open_on_start.take() {
+            self.open_chat(ctx, dir);
+        }
+        if let Some(id) = self.agent_on_start.take() {
+            self.show_agent(id);
+        }
         let mut requeue = Vec::new();
         while let Some(ev) = win::pop() {
             match ev {
@@ -1245,7 +1303,13 @@ impl Palette {
                     }
                 }
                 // Pressing the hotkey again (or clicking the tray) toggles the palette off.
-                AppEvent::Hotkey(_) | AppEvent::TrayClick => self.close(ctx),
+                AppEvent::Hotkey(_)
+                | AppEvent::TrayClick
+                | AppEvent::IslandClick
+                | AppEvent::AltDoubleTap => self.close(ctx),
+                // Agent rows are the app's business once the palette is gone.
+                ev @ AppEvent::Island(_) => requeue.push(ev),
+                AppEvent::OpenChat(dir) => self.open_chat(ctx, dir),
                 // More files from Explorer join the current question.
                 AppEvent::OpenFile(p) => {
                     self.chips.push(context::file_chip(&p));
@@ -1816,6 +1880,9 @@ impl Palette {
                             }
                         }
                     }
+                    for id in &x.agents {
+                        agent_line(ui, id, &mut self.agent_drafts, accent);
+                    }
                     let watching = self.status == "watching…";
                     if last && busy && (x.answer.is_empty() || watching) && self.pending.is_none() {
                         // Soft pulsing status instead of a spinner.
@@ -2221,6 +2288,9 @@ impl eframe::App for Palette {
 impl Drop for Palette {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        if self.rx.is_some() {
+            crate::island::buddy(crate::island::BuddyState::Idle); // closed mid-answer
+        }
     }
 }
 
@@ -2229,6 +2299,95 @@ impl Drop for Palette {
 fn on_screen([x, y]: [i32; 2]) -> bool {
     let r = capture::monitor_at(x, y).rect;
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+/// One spawned agent inside the conversation: its live status, any question
+/// or approval it is waiting on, and its result. Cards replace this later.
+fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMap<String, String>, accent: Color32) {
+    use crate::agents::{Answer, AskKind, Status};
+    let Some(a) = crate::agents::get(id) else { return };
+    if a.status.is_active() {
+        // No event wakes egui from the agent threads; poll gently while it works.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    }
+    ui.add_space(6.0);
+    let name = format!("\u{2039}{}\u{203a}", a.name);
+    ui.horizontal_wrapped(|ui| {
+        let (dot, text) = match a.status {
+            Status::Pending => (TEXT_2, format!("Spawned agent {name} \u{2014} starting\u{2026}")),
+            Status::Running => {
+                let step = a.steps.last().map(|s| format!(" \u{b7} {s}")).unwrap_or_default();
+                (accent, format!("Spawned agent {name} \u{2014} working\u{2026}{step}"))
+            }
+            Status::Done => (Color32::from_rgb(61, 220, 132), format!("Agent {name} is done")),
+            Status::Failed => (ERROR, format!("Agent {name} failed: {}", a.error.as_deref().unwrap_or("something went wrong"))),
+            Status::Stopped => (TEXT_2, format!("Agent {name} stopped{}", if a.counted { "" } else { " (didn't count)" })),
+        };
+        ui.label(RichText::new("\u{25cf}").color(dot).size(11.0));
+        ui.label(RichText::new(text).color(TEXT_2).size(13.5));
+        match a.status {
+            Status::Pending => {
+                if ui.link(RichText::new("Cancel").size(13.0)).clicked() {
+                    crate::agents::cancel(id);
+                }
+            }
+            Status::Running => {
+                if ui.link(RichText::new("Stop").size(13.0)).clicked() {
+                    crate::agents::stop(id);
+                }
+            }
+            Status::Failed | Status::Stopped => {
+                if ui.link(RichText::new("Retry").size(13.0)).clicked() {
+                    crate::agents::retry(id);
+                }
+            }
+            Status::Done => {}
+        }
+    });
+    if let Some(q) = &a.ask {
+        match q.kind {
+            AskKind::Approval => {
+                ui.label(RichText::new(format!("Allow it to {}?", lowercase_first(&q.text))).size(14.0));
+                ui.label(RichText::new(&q.detail).monospace().color(TEXT_2).size(12.0));
+                ui.horizontal(|ui| {
+                    if ui.button("Allow").clicked() {
+                        crate::agents::answer(id, q.id, Answer::Allow);
+                    }
+                    if ui.button("Don't Allow").clicked() {
+                        crate::agents::answer(id, q.id, Answer::Deny);
+                    }
+                });
+            }
+            AskKind::Questions => {
+                for line in &q.questions {
+                    ui.label(RichText::new(line).size(14.0));
+                }
+                let draft = drafts.entry(id.to_string()).or_default();
+                let mut send = false;
+                ui.horizontal(|ui| {
+                    let r = ui.add(egui::TextEdit::singleline(draft).hint_text("Answer\u{2026}").desired_width(ui.available_width() - 70.0));
+                    send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    send |= ui.button("Send").clicked();
+                });
+                if send && !draft.trim().is_empty() {
+                    crate::agents::answer(id, q.id, Answer::Text(std::mem::take(draft)));
+                }
+            }
+        }
+    }
+    if a.status == Status::Done && !a.result.is_empty() {
+        ui.label(RichText::new(&a.result).color(TEXT).size(14.0));
+    }
+    if !a.status.is_active() && !a.files.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for f in &a.files {
+                let label = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                if ui.link(RichText::new(label).size(13.0)).on_hover_text(f.display().to_string()).clicked() {
+                    win::shell_open(f);
+                }
+            }
+        });
+    }
 }
 
 fn lowercase_first(s: &str) -> String {

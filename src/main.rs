@@ -1,25 +1,34 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod agents;
+mod apeiron;
+mod buddy;
+mod caption;
 mod capture;
 mod config;
 mod context;
 mod desktop;
 mod diagram;
 mod history;
+mod island;
+mod keys;
 mod llm;
 mod math;
 mod mcp;
 mod mention;
 mod overlay;
 mod palette;
+mod quick;
 mod settings;
 mod surface;
 mod tray;
+mod ui;
 mod uia;
 mod util;
-mod voice;
 mod vision;
+mod voice;
 mod win;
+mod wire;
 
 use win::AppEvent;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -40,6 +49,18 @@ fn main() {
         .position(|a| a == "--open-file")
         .and_then(|i| std::env::args().nth(i + 1))
         .map(std::path::PathBuf::from);
+    if let Some(i) = std::env::args().position(|a| a == "--agent") {
+        // Headless debug mode: run one background agent, print its events.
+        let brief = std::env::args().nth(i + 1).unwrap_or_default();
+        let provider = std::env::args()
+            .position(|a| a == "--provider")
+            .and_then(|i| std::env::args().nth(i + 1));
+        let follow = std::env::args()
+            .position(|a| a == "--follow")
+            .and_then(|i| std::env::args().nth(i + 1));
+        let yes = std::env::args().any(|a| a == "--yes");
+        std::process::exit(agents::headless(&brief, follow, yes, provider));
+    }
     if let Some(i) = std::env::args().position(|a| a == "--ask") {
         // Headless debug mode: capture, ask, print the stream to stdout.
         let q = std::env::args()
@@ -75,6 +96,7 @@ struct App {
     /// Registered push-to-talk hotkey (None = needs registering).
     voice_hk: Option<String>,
     tray: tray::Tray,
+    island: Option<island::IslandHandle>,
 }
 
 impl App {
@@ -92,7 +114,13 @@ impl App {
             errs.extend(win::register_voice_hotkey(&voice));
             self.voice_hk = Some(voice);
         }
+        quick::configure(&cfg);
         self.cfg = cfg;
+        match (&self.island, self.cfg.island.enabled) {
+            (None, true) => self.island = Some(island::start()),
+            (Some(h), on) => h.set_visible(on),
+            (None, false) => {}
+        }
         self.cfg_error = if errs.is_empty() {
             None
         } else {
@@ -103,6 +131,7 @@ impl App {
     /// `grab`: pick up text selected in the foreground app (hotkey presses only).
     fn ask(&mut self, region: bool, grab: bool, mut start: palette::Start) -> palette::Outcome {
         self.reload();
+        wire::mark_seen(); // the palette shows agents' lines
         // Start the Claude CLI now, in parallel with capture + window creation.
         llm::warm_on_hotkey(&self.cfg);
         let mode = self.cfg.context.selection.as_str();
@@ -167,11 +196,15 @@ fn run() -> anyhow::Result<()> {
             Some(errs.join("\n"))
         },
         tray,
+        island: None,
     };
     app.reload(); // registers the push-to-talk hotkey
+    quick::start(&app.cfg);
     if let Some(e) = &app.cfg_error {
         config::log(e);
     }
+    apeiron::start();
+    wire::start();
     config::log("started");
     win::trim_memory();
 
@@ -187,7 +220,13 @@ fn run() -> anyhow::Result<()> {
         while let Some(ev) = win::pop() {
             let outcome = match ev {
                 AppEvent::Hotkey(win::HK_ASK) => app.ask(false, true, Default::default()),
-                AppEvent::TrayClick => app.ask(false, false, Default::default()),
+                AppEvent::TrayClick | AppEvent::IslandClick => app.ask(false, false, Default::default()),
+                // Agent cards (wave 2) take this over; for now the palette shows its line.
+                AppEvent::Island(island::IslandEvent::OpenAgent(id)) => app.ask(
+                    false,
+                    false,
+                    palette::Start { open_agent: Some(id), ..Default::default() },
+                ),
                 AppEvent::Hotkey(win::HK_REGION) => app.ask(true, true, Default::default()),
                 AppEvent::Hotkey(win::HK_VOICE) => app.ask(
                     false,
@@ -199,6 +238,12 @@ fn run() -> anyhow::Result<()> {
                     false,
                     false,
                     palette::Start { chips: vec![context::file_chip(&p)], ..Default::default() },
+                ),
+                AppEvent::AltDoubleTap => app.ask(false, true, Default::default()),
+                AppEvent::OpenChat(dir) => app.ask(
+                    false,
+                    false,
+                    palette::Start { open_chat: Some(dir), ..Default::default() },
                 ),
                 AppEvent::Menu(id) => match id.as_str() {
                     tray::ASK => app.ask(false, false, Default::default()),
@@ -314,6 +359,7 @@ fn headless(q: &str) -> i32 {
                 );
                 code = 2;
             }
+            llm::Ev::Spawned(id) => println!("\n[spawned agent {id}]"),
             llm::Ev::Done(_) => break,
         }
         let _ = std::io::stdout().flush();

@@ -23,6 +23,13 @@ pub enum AppEvent {
     Menu(String),
     /// A file sent from Explorer's "Ask screenbuddy" menu.
     OpenFile(std::path::PathBuf),
+    /// The island's pill (or its "Ask…" row) was clicked: open the palette.
+    IslandClick,
+    Island(crate::island::IslandEvent),
+    /// Alt tapped twice: open the palette.
+    AltDoubleTap,
+    /// Continue a saved conversation (a quick-ask caption was clicked).
+    OpenChat(std::path::PathBuf),
 }
 
 static QUEUE: Mutex<VecDeque<AppEvent>> = Mutex::new(VecDeque::new());
@@ -47,9 +54,21 @@ pub fn pop() -> Option<AppEvent> {
     QUEUE.lock().unwrap().pop_front()
 }
 
+/// Repaints the open palette, if any (from any thread).
+pub fn request_repaint() {
+    if let Some(ctx) = CTX.lock().unwrap().as_ref() {
+        ctx.request_repaint();
+    }
+}
+
 /// Registers the egui context of the open palette so events repaint it.
 pub fn set_ctx(ctx: Option<egui::Context>) {
     *CTX.lock().unwrap() = ctx;
+}
+
+/// True while the palette or Settings is open.
+pub fn ui_open() -> bool {
+    CTX.lock().unwrap().is_some()
 }
 
 unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {

@@ -25,8 +25,15 @@ pub const DRAW_PROMPT: &str = "You can also point at things on their screen with
 
 pub const DRAW_DESC: &str = "Point at something on the user's screen. Use only when the user needs to locate a UI element and words alone would leave them searching; never for decoration or emphasis. Coordinates are screenshot pixels, origin top-left. Kinds: box (x,y,w,h outline around the target; the default choice), circle (x,y center, r), highlight (x,y,w,h translucent fill for a text span or region), arrow (x,y tail -> x2,y2 head on a small target), text (a label at x,y), diagram (a Mermaid diagram drawn on a dark card with its top-left at x,y; put the source in `mermaid`, optional w caps the card width; place it in empty space beside what it explains, not over it). One shape is usually right.";
 
-fn anthropic_tools(draw: bool, desktop: bool) -> Value {
+fn anthropic_tools(draw: bool, desktop: bool, agents: bool) -> Value {
     let mut tools = Vec::new();
+    if agents {
+        tools.push(json!({
+            "name": "spawn_agent",
+            "description": crate::agents::SPAWN_DESC,
+            "input_schema": crate::agents::spawn_schema()
+        }));
+    }
     if draw {
         tools.push(json!({
             "name": "draw",
@@ -87,6 +94,8 @@ pub enum Ev {
     Approve(String, String, Sender<bool>),
     Error(String),
     Done(Conversation),
+    /// The brain handed work to a background agent (see `agents`).
+    Spawned(crate::agents::AgentId),
 }
 
 /// Provider-specific conversation history, handed to the worker per turn
@@ -207,7 +216,7 @@ impl Out {
             Ok(v) => v,
             Err(e) => return (format!("error: {e}"), true),
         };
-        if !crate::desktop::is_read_only(&args) {
+        if crate::desktop::needs_approval(&args, &intent) {
             if !self.approve(&intent, &args.join(" ")) {
                 return (
                     "The user declined this action. Stop and tell them briefly.".into(),
@@ -234,7 +243,20 @@ impl Out {
                 Err(e) => (e, true),
             },
             ("desktop", Some(exe)) => self.desktop(&input, exe),
+            ("spawn_agent", _) => self.spawn_agent(&input),
             _ => ("error: unknown tool".into(), true),
+        }
+    }
+
+    /// `spawn_agent` from the brain: starts the agent and tells the UI.
+    fn spawn_agent(&self, input: &Value) -> (String, bool) {
+        let shot = LAST_SHOT.lock().unwrap().clone();
+        match crate::agents::spawn_from_tool(input, shot) {
+            Ok((id, text)) => {
+                self.send(Ev::Spawned(id));
+                (text, false)
+            }
+            Err(e) => (e, true),
         }
     }
 
@@ -249,7 +271,13 @@ impl Out {
     }
 }
 
+/// The latest screenshot sent to the brain, for agents spawned with needs_screen.
+static LAST_SHOT: std::sync::Mutex<Option<Arc<Vec<u8>>>> = std::sync::Mutex::new(None);
+
 pub fn spawn(turn: Turn, out: Out) {
+    if let Some(img) = &turn.image {
+        *LAST_SHOT.lock().unwrap() = Some(img.jpeg.clone());
+    }
     std::thread::spawn(move || {
         let mut conv = turn.conv.clone();
         if conv.desktop_session.is_empty() {
@@ -323,6 +351,10 @@ fn system_prompt(cfg: &Config) -> String {
     if cfg.vision.web_search && cfg.provider != "openai" {
         p.push_str("\n\n");
         p.push_str(WEB_PROMPT);
+    }
+    if crate::agents::router_enabled(cfg) && (cfg.provider != "openai" || cfg.openai.tools) {
+        p.push_str("\n\n");
+        p.push_str(crate::agents::ROUTER_PROMPT);
     }
     if !cfg.extra_instructions.trim().is_empty() {
         p.push_str("\n\n");
@@ -448,7 +480,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
             "messages": conv.anthropic,
             "stream": true,
             "output_config": {"effort": cfg.effort},
-            "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some()), &turn.cfg),
+            "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some(), crate::agents::router_enabled(&turn.cfg)), &turn.cfg),
         });
         if turn.cfg.vision.web_search {
             if let Some(t) = body["tools"].as_array_mut() {
@@ -672,6 +704,9 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             if exe.is_some() {
                 tools.push(json!({"type": "function", "function": {"name": "desktop", "description": crate::desktop::DESC, "parameters": crate::desktop::schema()}}));
             }
+            if crate::agents::router_enabled(&turn.cfg) {
+                tools.push(json!({"type": "function", "function": {"name": "spawn_agent", "description": crate::agents::SPAWN_DESC, "parameters": crate::agents::spawn_schema()}}));
+            }
             tools.extend(crate::vision::openai_tools(&turn.cfg));
             if !tools.is_empty() {
                 body["tools"] = json!(tools);
@@ -798,13 +833,13 @@ pub struct CliProc {
 
 /// A kill-on-close job object holding the CLI and everything it starts (Node,
 /// the `--mcp` server), so dropping a `CliProc` never leaves orphans behind.
-struct Job(windows::Win32::Foundation::HANDLE);
+pub(crate) struct Job(windows::Win32::Foundation::HANDLE);
 
 // The handle is only used to close the job.
 unsafe impl Send for Job {}
 
 impl Job {
-    fn wrap(child: &std::process::Child) -> Option<Job> {
+    pub(crate) fn wrap(child: &std::process::Child) -> Option<Job> {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::System::JobObjects::*;
         unsafe {
@@ -1032,6 +1067,9 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
     if desktop {
         allowed_list.push("mcp__screenbuddy__desktop");
     }
+    if crate::agents::router_enabled(full_cfg) {
+        allowed_list.push("mcp__screenbuddy__spawn_agent");
+    }
     allowed_list.extend(crate::vision::cli_allowed(full_cfg));
     let web = full_cfg.vision.web_search;
     if web {
@@ -1233,6 +1271,11 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
                         {
                             let _ = out.draw(b["input"].clone());
                             out.status("thinking…");
+                        }
+                        Some("tool_use")
+                            if b["name"].as_str().is_some_and(|n| n.ends_with("spawn_agent")) =>
+                        {
+                            let _ = out.spawn_agent(&b["input"]);
                         }
                         // Partial streaming unavailable: fall back to the full message text.
                         Some("text") if !streamed_this_msg => {
