@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod agents;
 mod capture;
 mod config;
 mod context;
@@ -40,6 +41,18 @@ fn main() {
         .position(|a| a == "--open-file")
         .and_then(|i| std::env::args().nth(i + 1))
         .map(std::path::PathBuf::from);
+    if let Some(i) = std::env::args().position(|a| a == "--agent") {
+        // Headless debug mode: run one background agent, print its events.
+        let brief = std::env::args().nth(i + 1).unwrap_or_default();
+        let provider = std::env::args()
+            .position(|a| a == "--provider")
+            .and_then(|i| std::env::args().nth(i + 1));
+        let follow = std::env::args()
+            .position(|a| a == "--follow")
+            .and_then(|i| std::env::args().nth(i + 1));
+        let yes = std::env::args().any(|a| a == "--yes");
+        std::process::exit(agents::headless(&brief, follow, yes, provider));
+    }
     if let Some(i) = std::env::args().position(|a| a == "--ask") {
         // Headless debug mode: capture, ask, print the stream to stdout.
         let q = std::env::args()
@@ -314,6 +327,7 @@ fn headless(q: &str) -> i32 {
                 );
                 code = 2;
             }
+            llm::Ev::Spawned(id) => println!("\n[spawned agent {id}]"),
             llm::Ev::Done(_) => break,
         }
         let _ = std::io::stdout().flush();

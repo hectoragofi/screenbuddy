@@ -23,6 +23,7 @@ pub struct Config {
     pub agent_desktop: AgentDesktopCfg,
     pub context: ContextCfg,
     pub voice: VoiceCfg,
+    pub agents: AgentsCfg,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -46,6 +47,23 @@ pub struct VoiceCfg {
     pub auto_send: bool,
     /// "" = detect, or en | de | fr | es | it | nl | pl.
     pub language: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct AgentsCfg {
+    /// Let the assistant hand multi-step work to background agents.
+    pub enabled: bool,
+    /// Agents act without asking, even to delete, send or pay.
+    pub always_approve: bool,
+    /// Claude CLI model for agents; empty = same as claude_cli.model.
+    pub model: String,
+}
+
+impl Default for AgentsCfg {
+    fn default() -> Self {
+        Self { enabled: true, always_approve: false, model: String::new() }
+    }
 }
 
 impl Default for ContextCfg {
@@ -183,6 +201,7 @@ impl Default for Config {
             agent_desktop: AgentDesktopCfg::default(),
             context: ContextCfg::default(),
             voice: VoiceCfg::default(),
+            agents: AgentsCfg::default(),
         }
     }
 }

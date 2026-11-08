@@ -576,12 +576,21 @@ impl Settings {
             segmented(ui, &mut self.cfg.agent_desktop.approval, &[("ask", "Ask every time"), ("once", "Ask once per chat"), ("never", "Never ask")], accent);
             ui.add_space(2.0);
             let note = match self.cfg.agent_desktop.approval.as_str() {
-                "ask" => "You approve each click or keystroke.",
+                "ask" => "You approve each action that deletes, sends, posts or pays.",
                 "never" => "Acts right away. Reading apps never asks.",
-                _ => "Approve the first action; the rest of that conversation runs on its own.",
+                _ => "Approve the first delete, send or payment; the rest of that conversation runs on its own.",
             };
             ui.label(RichText::new(note).color(TEXT_3).size(12.5));
             ui.add_space(4.0);
+        });
+        group(ui, "Background agents", |ui| {
+            row(ui, "Hand off multi-step work", Some("The assistant can start an agent that works while you carry on"), |ui| {
+                toggle(ui, &mut self.cfg.agents.enabled, accent);
+            });
+            sep(ui);
+            row(ui, "Always approve agent actions", Some("Agents delete, send or pay without asking"), |ui| {
+                toggle(ui, &mut self.cfg.agents.always_approve, accent);
+            });
         });
         group(ui, "Agent cursor", |ui| {
             row(ui, "Show cursor while acting", Some("A separate pointer, so you can see what it's doing"), |ui| {

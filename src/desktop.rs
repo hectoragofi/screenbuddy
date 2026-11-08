@@ -1,6 +1,8 @@
 //! agent-desktop integration (https://github.com/vercel-labs/agent-desktop):
 //! lets the model read app UIs through the accessibility tree and act on them.
-//! Read-only commands run freely; anything that changes state needs approval.
+//! Actions run right away; only destructive, outbound or money actions (delete,
+//! close without saving, send, post, submit, pay, buy) wait for the user's yes.
+//! See [`needs_approval`].
 
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -11,7 +13,7 @@ Pass CLI arguments as an array, e.g. [\"list-apps\"], [\"snapshot\",\"--app\",\"
 [\"click\",\"@s8f3k2p9:e8\"], [\"type\",\"@s8f3k2p9:e3\",\"hello\"], [\"press\",\"ctrl+s\"], [\"launch\",\"Notepad\"]. \
 Every command returns a JSON envelope {ok, data|error}. Refs look like @<snapshot>:e<n> and belong to the snapshot \
 that produced them; after the UI changes (STALE_REF), snapshot again. Run `<command> --help` if unsure of flags, or [\"skills\",\"get\",\"desktop\"] for the full guide. \
-Actions are shown to the user for approval first; if one is denied, stop and tell the user briefly.";
+Actions that delete, send, post, submit or pay are shown to the user for approval first; if one is denied, stop and tell the user briefly.";
 
 pub fn schema() -> Value {
     json!({
@@ -69,6 +71,132 @@ pub fn is_read_only(args: &[String]) -> bool {
         return true;
     }
     READ_ONLY.contains(&cmd.as_str()) && !args.iter().any(|a| a == "--headed")
+}
+
+/// Words that mark an action as destructive, outbound or about money.
+const RISKY: &[&str] = &[
+    // destructive
+    "delete", "deletes", "deleted", "deleting", "remove", "removes", "removing", "erase", "erasing",
+    "trash", "discard", "discarding", "wipe", "purge", "uninstall", "uninstalling", "overwrite",
+    "overwriting", "close", "closes", "closing", "quit", "exit", "kill", "terminate", "shutdown",
+    "restart", "reboot", "logout", "unsubscribe", "cancel", "cancelling", "reset", "revoke", "block",
+    // outbound
+    "send", "sends", "sending", "post", "posts", "posting", "publish", "publishing", "submit",
+    "submits", "submitting", "reply", "replies", "replying", "respond", "forward", "forwarding",
+    "tweet", "share", "sharing", "upload", "uploading", "invite", "comment", "push", "deploy",
+    "merge", "accept", "decline", "rsvp", "sign", "approve", "confirm", "confirming",
+    // money
+    "pay", "pays", "paying", "payment", "purchase", "purchasing", "buy", "buying", "checkout",
+    "order", "ordering", "transfer", "donate", "subscribe", "subscription", "book", "booking",
+    "reserve", "reservation", "bid", "refund", "wire", "tip",
+];
+
+const RISKY_PHRASES: &[&str] = &[
+    "don't save", "dont save", "do not save", "without saving", "sign out", "log out", "end task",
+    "check out", "empty the", "empty recycle",
+];
+
+/// Keys that commonly send, submit, delete or close.
+const RISKY_KEYS: &[&str] = &[
+    "return", "enter", "ctrl+return", "ctrl+enter", "cmd+return", "cmd+enter", "shift+return",
+    "delete", "del", "shift+delete", "shift+del", "alt+f4", "ctrl+w", "ctrl+shift+w", "ctrl+q",
+    "cmd+q", "cmd+w", "ctrl+f4",
+];
+
+/// Intent words that make pressing Enter clearly local (a search box, a path).
+const SAFE_ENTER: &[&str] = &[
+    "search", "find", "open", "navigate", "go", "url", "address", "filter", "line", "rename", "path",
+    "folder", "launch", "run",
+];
+
+/// Commands that can't lose data or reach anyone even without a clear intent.
+const BENIGN: &[&str] = &[
+    "focus", "scroll", "scroll-to", "expand", "collapse", "hover", "mouse-move", "focus-window",
+    "minimize", "maximize", "restore", "resize-window", "move-window", "launch", "clipboard-set",
+    "cursor-overlay", "session", "open-system-surface",
+];
+
+fn words(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(|w| w.trim_matches('\''))
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn risky_text(s: &str) -> bool {
+    let lower = s.to_lowercase().replace('\u{2019}', "'");
+    words(&lower).iter().any(|w| RISKY.contains(&w.as_str()))
+        || RISKY_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// The approval policy: true when this action must wait for the user's yes.
+///
+/// Reading never asks. An action asks when it is destructive (delete, close
+/// without saving, quit), outbound (send, post, submit, reply, share, upload) or
+/// about money (pay, buy, order, book), judged from the step's intent plus the
+/// command line, keys like Enter / Delete / Alt+F4, and typed text that ends in
+/// a newline. When the model gave no intent of its own, anything beyond plainly
+/// harmless commands (focus, scroll, launch...) asks too: when unsure, ask.
+pub fn needs_approval(args: &[String], intent: &str) -> bool {
+    if is_read_only(args) {
+        return false;
+    }
+    let Some(cmd_i) = args.iter().position(|a| !a.starts_with('-')) else {
+        return false;
+    };
+    let cmd = args[cmd_i].to_lowercase();
+    if matches!(cmd.as_str(), "close-app" | "dismiss-all-notifications" | "clipboard-clear") {
+        return true;
+    }
+    let positional: Vec<(usize, &String)> = args
+        .iter()
+        .enumerate()
+        .skip(cmd_i + 1)
+        .filter(|(_, a)| !a.starts_with('-'))
+        .collect();
+    // The typed text is content, not the action: typing "I'll send it" is fine.
+    let payload = if matches!(cmd.as_str(), "type" | "set-value" | "clipboard-set") {
+        positional.last().map(|p| p.0)
+    } else {
+        None
+    };
+    if let Some(i) = payload
+        && cmd == "type"
+        && (args[i].ends_with('\n') || args[i].ends_with('\r'))
+    {
+        return true; // a trailing newline usually sends
+    }
+    let described = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != payload)
+        .map(|(_, a)| a.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if risky_text(intent) || risky_text(&described) {
+        return true;
+    }
+    let no_intent = intent.trim().is_empty() || intent.trim() == args.join(" ");
+    if matches!(cmd.as_str(), "press" | "key-down") {
+        let key = positional
+            .first()
+            .map(|p| p.1.to_lowercase().replace(' ', ""))
+            .unwrap_or_default();
+        if RISKY_KEYS.contains(&key.as_str()) {
+            let local = key.contains("return") || key.contains("enter");
+            let safe = local && words(intent).iter().any(|w| SAFE_ENTER.contains(&w.as_str()));
+            return !safe || no_intent;
+        }
+    }
+    if cmd == "batch" {
+        let lower = described.to_lowercase();
+        if lower.contains("close-app") || RISKY_KEYS.iter().any(|k| lower.contains(&format!("\"{k}\""))) {
+            return true;
+        }
+    }
+    no_intent && !BENIGN.contains(&cmd.as_str())
 }
 
 /// Finds the native agent-desktop binary: configured path, PATH, or the
@@ -257,6 +385,31 @@ mod tests {
         assert!(!is_read_only(&v(&["batch", "x"])));
         assert!(is_read_only(&v(&["clipboard-get"])));
         assert!(!is_read_only(&v(&["clipboard-set", "x"])));
+    }
+    #[test]
+    fn approval_policy() {
+        let ask = |a: &[&str], i: &str| needs_approval(&v(a), i);
+        // reading and everyday actions run right away
+        assert!(!ask(&["snapshot", "--app", "Slack"], "Read Slack"));
+        assert!(!ask(&["click", "@s1:e2"], "Open the Downloads folder"));
+        assert!(!ask(&["type", "@s1:e3", "I'll send it tomorrow"], "Type the note into Notepad"));
+        assert!(!ask(&["launch", "Notepad"], "launch Notepad"));
+        assert!(!ask(&["press", "ctrl+s"], "Save the document"));
+        assert!(!ask(&["press", "return"], "Run the search"));
+        assert!(!ask(&["scroll", "@s1:e2", "--direction", "down"], ""));
+        // destructive / outbound / money
+        assert!(ask(&["click", "@s1:e9"], "Click Send in Outlook"));
+        assert!(ask(&["click", "@s1:e9"], "Delete the selected files"));
+        assert!(ask(&["click", "@s1:e9"], "Click \u{201c}Don\u{2019}t Save\u{201d}"));
+        assert!(ask(&["click", "@s1:e9"], "Place the order"));
+        assert!(ask(&["click", "@s1:e9"], "Pay with the saved card"));
+        assert!(ask(&["close-app", "Word"], "Leave Word"));
+        assert!(ask(&["press", "alt+f4"], "Leave the app"));
+        assert!(ask(&["press", "Return"], "Press Enter in the chat box"));
+        assert!(ask(&["type", "@s1:e3", "see you soon\n"], "Type the reply text"));
+        // no intent of its own: unsure, so ask
+        assert!(ask(&["click", "@s1:e2"], "click @s1:e2"));
+        assert!(ask(&["press", "return"], ""));
     }
     #[test]
     fn versions() {

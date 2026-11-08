@@ -43,6 +43,9 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {
+            if crate::agents::is_agent_mcp() {
+                return Ok(json!({"tools": crate::agents::mcp_tools(desktop_exe().is_some())}));
+            }
             let mut tools = vec![json!({
                 "name": "draw",
                 "description": crate::llm::DRAW_DESC,
@@ -56,11 +59,18 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
                 }));
             }
             tools.extend(crate::vision::mcp_tools());
+            if crate::agents::router_enabled(&crate::config::load().0) {
+                tools.push(crate::agents::mcp_spawn_tool());
+            }
             Ok(json!({"tools": tools}))
         }
         "tools/call" => {
             let p = &req["params"];
+            let name = p["name"].as_str().unwrap_or("");
+            let agent_tool = crate::agents::mcp_call(name, &p["arguments"]);
             let (text, is_error) = match p["name"].as_str() {
+                _ if agent_tool.is_some() => agent_tool.unwrap_or_default(),
+                Some("draw") if crate::agents::is_agent_mcp() => return Err((-32602, "unknown tool draw".into())),
                 Some("draw") => validate(&p["arguments"]),
                 Some("desktop") => desktop(&p["arguments"]),
                 Some(n) if crate::vision::is_tool(n) => return Ok(crate::vision::mcp_call(n, &p["arguments"])),
@@ -86,7 +96,7 @@ fn desktop(input: &Value) -> (String, bool) {
         Ok(v) => v,
         Err(e) => return (format!("error: {e}"), true),
     };
-    if !crate::desktop::is_read_only(&args) && !ask_parent(&intent, &args.join(" ")) {
+    if crate::desktop::needs_approval(&args, &intent) && !ask_parent(&intent, &args.join(" ")) {
         return (
             "The user declined this action. Stop and tell them briefly.".into(),
             true,
