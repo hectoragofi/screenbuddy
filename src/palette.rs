@@ -24,16 +24,21 @@ const PILL_RADIUS: f32 = 26.0;
 const MAX_H: f32 = 480.0;
 /// Padding of the answer inside the surface.
 const PAD: f32 = 18.0;
-/// Transparent margin, so the surface's edge isn't cut off.
-const SIDE: f32 = 4.0;
-const BOTTOM: f32 = 4.0;
+/// Transparent margin, so the surface's edge and its shadow aren't cut off.
+const SIDE: f32 = 24.0;
+const BOTTOM: f32 = 36.0;
 const TOP: f32 = 12.0;
 const TAB_H: f32 = 30.0;
 /// A tab's shape reaches this far past its chip.
 const TAB_LIP: f32 = 4.0;
 /// The pill's top edge, in window coordinates.
 const PILL_TOP: f32 = TOP + TAB_H + TAB_LIP * 2.0;
-const WINDOW_H: f32 = PILL_TOP + MAX_H + BOTTOM;
+/// Attached to the island, the tabs sit in a row inside the surface, above the
+/// pill, instead of rising out of it.
+const TAB_ROW: f32 = TAB_H + TAB_LIP * 2.0;
+const WINDOW_H: f32 = PILL_TOP + TAB_ROW + MAX_H + BOTTOM;
+/// Bottom corners while attached: the island's peek-panel radius.
+const ATTACHED_RADIUS: f32 = 22.0;
 /// Most tabs shown; the rest are summed up in a last one.
 const MAX_TABS: usize = 4;
 /// Where the tabs start, measured from the pill's left edge.
@@ -54,6 +59,25 @@ const TEXT_2: Color32 = crate::surface::TEXT_2;
 const SURFACE: Color32 = crate::surface::SURFACE;
 const HAIRLINE: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
 const ERROR: Color32 = Color32::from_rgb(255, 128, 118);
+// Design tokens (src/ui/tokens.rs) as egui colours.
+const SIGNAL: Color32 = Color32::from_rgb(0xFF, 0x5A, 0x1F);
+const INK_2: Color32 = Color32::from_rgb(0x1A, 0x1A, 0x19);
+/// Raised chip on INK, hovered.
+const INK_3: Color32 = Color32::from_rgb(0x26, 0x26, 0x24);
+
+/// Whether this palette opens as part of the island.
+fn attaches(cfg: &Config, start: &Start) -> bool {
+    cfg.appearance.attach && !start.region && crate::island::handle().is_some()
+}
+
+/// Geist Mono, the island's face, in egui.
+fn geist(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("geist".into()))
+}
+
+fn geist_medium(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("geist-medium".into()))
+}
 
 pub enum Outcome {
     Closed,
@@ -87,6 +111,8 @@ pub struct Start {
     pub open_chat: Option<std::path::PathBuf>,
     /// Open showing this background agent (an island row was clicked).
     pub open_agent: Option<crate::agents::AgentId>,
+    /// Region asks keep their own placement instead of hanging from the island.
+    pub region: bool,
 }
 
 /// A user-facing error: a short sentence, an optional action, and the raw detail.
@@ -215,6 +241,14 @@ pub struct Palette {
     wave_t: f64,
     /// Typed answers to agents' questions, by agent id.
     agent_drafts: std::collections::HashMap<String, String>,
+    /// Laid out as part of the island: tabs inside, top edge under the pill.
+    inset: bool,
+    /// The island is merged with the surface right now (it lets go on a dodge).
+    attached: bool,
+    /// 0..1: the surface dropping out of the island (springy) and back in.
+    drop: crate::ui::tokens::Spring,
+    /// Retracting into the island; the window closes once it's in.
+    closing: bool,
 }
 
 /// A context tab's motion. It outlives its chip by the time it takes to sink.
@@ -252,7 +286,7 @@ pub fn run_with(
     start: Start,
 ) -> Outcome {
     let outcome = Arc::new(std::sync::Mutex::new(Outcome::Closed));
-    let accent = accent_of(&cfg);
+    let accent = if attaches(&cfg, &start) { SIGNAL } else { accent_of(&cfg) };
     let text_size = cfg.appearance.text_size.clamp(11.0, 22.0);
     let width = cfg.appearance.width.clamp(480.0, 1100.0);
     let out2 = outcome.clone();
@@ -274,6 +308,7 @@ pub fn run_with(
         Box::new(move |cc| {
             let cap = cap().map_err(|e| format!("Screenshot encoding failed: {e}"))?;
             setup_style(&cc.egui_ctx, accent, text_size);
+            island_type(&cc.egui_ctx, text_size);
             win::set_ctx(Some(cc.egui_ctx.clone()));
             Ok(Box::new(Palette::new(cfg, cap, notice, out2, start)))
         }),
@@ -365,6 +400,34 @@ pub fn setup_style(ctx: &egui::Context, accent: Color32, text_size: f32) {
     });
 }
 
+/// The palette speaks the island's type: Geist Mono throughout (Segoe stays as
+/// the glyph fallback), a step smaller since mono runs wide.
+fn island_type(ctx: &egui::Context, text_size: f32) {
+    ctx.global_style_mut(|s| {
+        s.text_styles = [
+            (TextStyle::Heading, geist(text_size - 0.5)),
+            (TextStyle::Body, geist(text_size - 1.5)),
+            (TextStyle::Button, geist(13.0)),
+            (TextStyle::Small, geist(12.0)),
+            (TextStyle::Monospace, geist(12.5)),
+        ]
+        .into();
+    });
+    ctx.global_style_mut(|s| {
+        s.visuals.widgets.inactive.weak_bg_fill = INK_2;
+        s.visuals.widgets.inactive.bg_fill = INK_2;
+        s.visuals.widgets.hovered.weak_bg_fill = INK_3;
+        s.visuals.widgets.hovered.bg_fill = INK_3;
+        s.visuals.widgets.active.weak_bg_fill = INK_3;
+        for w in [&mut s.visuals.widgets.inactive, &mut s.visuals.widgets.hovered, &mut s.visuals.widgets.active] {
+            w.corner_radius = egui::CornerRadius::same(8);
+            w.bg_stroke = egui::Stroke::new(1.0, Color32::from_white_alpha(20));
+        }
+        s.visuals.extreme_bg_color = INK_2;
+        s.visuals.code_bg_color = INK_2;
+    });
+}
+
 /// Windows 11 chrome: rounded corners and the system shadow.
 pub fn apply_chrome(hwnd: HWND) {
     use windows::Win32::Graphics::Dwm::*;
@@ -433,8 +496,12 @@ impl Palette {
         let jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
         let conv = Conversation::default();
         llm::prewarm(&cfg, &conv);
-        let accent = accent_of(&cfg);
+        let inset = attaches(&cfg, &start);
+        let accent = if inset { SIGNAL } else { accent_of(&cfg) };
         let width = cfg.appearance.width.clamp(480.0, 1100.0);
+        let reduce = crate::surface::reduced_motion();
+        let drop = crate::ui::tokens::Spring::new(if inset && !reduce { 0.0 } else { 1.0 })
+            .with(420.0, 30.0);
         Self {
             cfg,
             cap,
@@ -453,9 +520,10 @@ impl Palette {
             lead: crate::surface::Smooth::new(PILL_H),
             body_h: 0.0,
             renderer: None,
-            backdrop: start.backdrop,
+            // Part of the island, the surface is the island's matte INK.
+            backdrop: if inset { None } else { start.backdrop },
             selection: start.selection,
-            reduce: crate::surface::reduced_motion(),
+            reduce,
             scale: 1.0,
             last_time: 0.0,
             tabs: Vec::new(),
@@ -496,6 +564,10 @@ impl Palette {
             wave: Vec::new(),
             wave_t: 0.0,
             agent_drafts: Default::default(),
+            inset,
+            attached: false,
+            drop,
+            closing: false,
         }
     }
 
@@ -702,7 +774,7 @@ impl Palette {
 
     /// Moves the palette out of the way if it covers the annotations: tries the
     /// four corners of the work area and picks the least-overlapping one.
-    fn dodge(&self, drawn: Option<capture::Rect>) {
+    fn dodge(&mut self, drawn: Option<capture::Rect>) {
         let (Some(h), Some(d)) = (self.hwnd, drawn) else {
             return;
         };
@@ -740,6 +812,8 @@ impl Palette {
             .min_by_key(|c| c.0)
             .unwrap();
         if best.0 < overlap(cur, d) {
+            // Moving away from the island: it can't stay merged.
+            self.detach();
             unsafe {
                 let _ = SetWindowPos(
                     h,
@@ -1099,7 +1173,16 @@ impl Palette {
                     work.y + (work.h as f32 * 0.2) as i32,
                 ),
             };
-            let (x, y) = (x - (SIDE * s) as i32, y - (PILL_TOP * s) as i32);
+            let (x, y) = if self.inset {
+                // Hang from the island: the surface's top edge is the pill's bottom.
+                let mon = self.cap.monitor;
+                let head = crate::island::header_rect(&mon, self.width);
+                crate::island::attach(Some(crate::island::Attach { width: self.width, mon }));
+                self.attached = true;
+                (head.left - (SIDE * s).round() as i32, head.bottom - (PILL_TOP * s).round() as i32)
+            } else {
+                (x - (SIDE * s) as i32, y - (PILL_TOP * s) as i32)
+            };
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE);
             let _ = SetForegroundWindow(hwnd);
         }
@@ -1107,6 +1190,46 @@ impl Palette {
     }
 
     fn close(&mut self, ctx: &egui::Context) {
+        if self.closing {
+            return;
+        }
+        if self.attached && !self.reduce && self.frames > 1 {
+            // Retract into the island first; `ui` closes the window once it's in.
+            self.closing = true;
+            self.detach();
+            self.drop.stiffness = 640.0;
+            self.drop.damping = 52.0;
+            self.drop.set(0.0);
+            self.finish_close(ctx, false);
+            ctx.request_repaint();
+            return;
+        }
+        self.finish_close(ctx, true);
+    }
+
+    /// Lets go of the island (it shrinks back to its pill).
+    fn detach(&mut self) {
+        if std::mem::take(&mut self.attached) {
+            crate::island::attach(None);
+        }
+    }
+
+    /// Everything closing does; `now` also closes the window.
+    fn finish_close(&mut self, ctx: &egui::Context, now: bool) {
+        if !now {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.rec = None;
+            self.save_history();
+            if self.quit {
+                *self.outcome.lock().unwrap() = Outcome::Quit;
+            }
+            return;
+        }
+        self.detach();
+        if self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         self.cancel.store(true, Ordering::Relaxed);
         self.rec = None; // discards the recording
         self.save_history();
@@ -1146,6 +1269,9 @@ impl Palette {
         let Some(h) = self.hwnd else {
             return;
         };
+        if self.inset {
+            return; // hangs from the top of the monitor; MAX_H always fits
+        }
         let s = self.ppp();
         let (wx, wy) = self.window_pos();
         let top = wy + (PILL_TOP * s) as i32;
@@ -1389,6 +1515,9 @@ impl Palette {
     }
 
     fn start_drag(&mut self, ctx: &egui::Context) {
+        if self.inset {
+            return; // part of the island; Settings → "Part of the island" off to float it
+        }
         self.moved = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
@@ -1400,7 +1529,7 @@ impl Palette {
         let busy = self.busy();
         let agent = self.pending.is_some();
         let label = if agent { "Agent" } else { "Screen" };
-        let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(13.0), TEXT);
+        let galley = ui.painter().layout_no_wrap(label.to_string(), geist(12.5), TEXT);
         let pic = 24.0;
         let size = egui::vec2(7.0 + pic + 7.0 + galley.size().x + 12.0, CHIP_H);
         let idle = !busy && !agent;
@@ -1409,8 +1538,8 @@ impl Palette {
         if resp.drag_started() {
             self.start_drag(ui.ctx());
         }
-        let fill = if resp.hovered() && idle { 40 } else { 28 };
-        ui.painter().rect_filled(rect, CHIP_H / 2.0, Color32::from_white_alpha(fill));
+        let fill = if resp.hovered() && idle { INK_3 } else { INK_2 };
+        ui.painter().rect_filled(rect, CHIP_H / 2.0, fill);
         let spot = egui::Rect::from_center_size(
             egui::pos2(rect.left() + 7.0 + pic / 2.0, rect.center().y),
             egui::vec2(pic, pic),
@@ -1703,12 +1832,12 @@ impl Palette {
 
     /// The context tabs, rising out of the top of the pill. Adds their shapes to
     /// `blobs`; true while any are moving.
-    fn tabs_ui(&mut self, ui: &mut egui::Ui, pill: egui::Rect, now: f64, dt: f32, blobs: &mut Vec<crate::surface::Blob>) -> bool {
+    fn tabs_ui(&mut self, ui: &mut egui::Ui, pill: egui::Rect, now: f64, dt: f32, blobs: &mut Vec<crate::surface::Blob>, clip: Option<egui::Rect>) -> bool {
         self.reconcile_tabs(now, pill.left());
         if self.tabs.is_empty() {
             return false;
         }
-        let font = FontId::proportional(12.0);
+        let font = geist(12.0);
         let room = pill.width() - TAB_INDENT * 2.0;
         let label_of = |key: &str| -> String {
             if key.chars().count() > 28 {
@@ -1762,9 +1891,10 @@ impl Palette {
             let (rise, text) = self.tab_state(&t, now);
             moving |= !t.x.settled() || rise < 1.0 || text < 1.0 || t.gone.is_some() || now < t.born;
             let top = pill.top() - TAB_LIP - TAB_H;
-            let shift = (1.0 - rise) * (TAB_H + TAB_LIP);
+            // Inside the surface the row itself opens (the pill moves down), so the tab doesn't rise.
+            let shift = if clip.is_some() { 0.0 } else { (1.0 - rise) * (TAB_H + TAB_LIP) };
             let chip = egui::Rect::from_min_size(egui::pos2(t.x.value, top + shift), egui::vec2(t.width, TAB_H));
-            if t.gone.is_none() || !std::mem::replace(&mut sinking, true) {
+            if clip.is_none() && (t.gone.is_none() || !std::mem::replace(&mut sinking, true)) {
                 blobs.push(crate::surface::Blob {
                     rect: egui::Rect::from_min_max(
                         chip.min - egui::vec2(TAB_LIP, TAB_LIP),
@@ -1777,6 +1907,9 @@ impl Palette {
             if text > 0.0 {
                 let chip_index = t.chip;
                 ui.scope(|ui| {
+                    if let Some(c) = clip {
+                        ui.set_clip_rect(c);
+                    }
                     ui.set_opacity(text);
                     ui.painter().rect_filled(chip, TAB_H / 2.0, Color32::from_white_alpha(20));
                     let g = ui.painter().layout_no_wrap(label_of(&t.key), font.clone(), TEXT);
@@ -1818,16 +1951,17 @@ impl Palette {
             let w = g.size().x + 22.0;
             let top = pill.top() - TAB_LIP - TAB_H;
             let chip = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(w, TAB_H));
-            blobs.push(crate::surface::Blob {
+            if clip.is_none() { blobs.push(crate::surface::Blob {
                 rect: egui::Rect::from_min_max(
                     chip.min - egui::vec2(TAB_LIP, TAB_LIP),
                     egui::pos2(chip.right() + TAB_LIP, pill.top() + PILL_RADIUS),
                 ),
                 radius: 19.0,
                 merge: 20.0,
-            });
-            ui.painter().rect_filled(chip, TAB_H / 2.0, Color32::from_white_alpha(20));
-            ui.painter().galley(
+            }); }
+            let p = ui.painter().with_clip_rect(clip.unwrap_or(ui.clip_rect()));
+            p.rect_filled(chip, TAB_H / 2.0, Color32::from_white_alpha(20));
+            p.galley(
                 egui::pos2(chip.left() + 11.0, chip.center().y - g.size().y / 2.0),
                 g,
                 TEXT,
@@ -1947,7 +2081,7 @@ impl Palette {
                         }
                     }
                     for id in &x.agents {
-                        agent_line(ui, id, &mut self.agent_drafts, accent);
+                        agent_line(ui, id, &mut self.agent_drafts);
                     }
                     let watching = self.status == "watching…";
                     if last && busy && (x.answer.is_empty() || watching) && self.pending.is_none() {
@@ -2114,7 +2248,17 @@ impl Palette {
     }
 
     /// Everything that makes up the surface this frame, in window points.
-    fn main_blobs(&self, pill: egui::Rect) -> Vec<crate::surface::Blob> {
+    fn main_blobs(&self, pill: egui::Rect, surface: egui::Rect) -> Vec<crate::surface::Blob> {
+        if self.inset {
+            // One matte sheet. Hanging from the island its top runs on up under
+            // the pill (outside the window region), so only the bottom is round.
+            let lift = if self.attached || self.closing { 30.0 } else { 0.0 };
+            return vec![crate::surface::Blob {
+                rect: egui::Rect::from_min_max(surface.min - egui::vec2(0.0, lift), surface.max),
+                radius: ATTACHED_RADIUS,
+                merge: 0.0,
+            }];
+        }
         let mut blobs = vec![crate::surface::Blob {
             rect: egui::Rect::from_min_size(pill.min, egui::vec2(pill.width(), self.pour.value)),
             radius: PILL_RADIUS,
@@ -2162,10 +2306,20 @@ impl Palette {
         let Some(hwnd) = self.hwnd else { return };
         let s = self.ppp();
         let tabs_up = !self.tabs.is_empty() || !self.buds.is_empty();
-        let top = if tabs_up { 0.0 } else { PILL_TOP - TOP };
+        let top = if self.inset && self.buds.is_empty() {
+            PILL_TOP
+        } else if tabs_up {
+            0.0
+        } else {
+            PILL_TOP - TOP
+        };
         // Tooltips can be several lines long, so give them the whole window while
         // the pointer is over the surface. Moving off it closes the region again.
-        let h = self.pour.value.max(self.pour.target).max(self.lead.value);
+        let mut h = self.pour.value.max(self.pour.target).max(self.lead.value);
+        if self.inset {
+            // The tab row, and room for the drop's overshoot.
+            h = (h + TAB_ROW) * 1.06;
+        }
         let bottom = if hovering { WINDOW_H } else { (PILL_TOP + h + BOTTOM).min(WINDOW_H) };
         let want = ((top * s) as i32, (bottom * s).ceil() as i32);
         let grows = self.region.is_none_or(|r| want.0 < r.0 || want.1 > r.1);
@@ -2192,16 +2346,22 @@ impl eframe::App for Palette {
             self.first_frame(frame, &ctx);
         }
         self.frames += 1;
-        self.pump();
-        if self.rx.is_none() {
-            // The brain chose a walkthrough: get out of the way of the app.
-            if let Some(goal) = crate::walk::take_request() {
-                crate::walk::start(goal, &self.cfg);
-                self.close(&ctx);
+        if self.closing {
+            // Retracting: nothing typed or clicked counts any more, and app
+            // events wait for the main loop (a hotkey now reopens it after).
+            ctx.input_mut(|i| i.events.clear());
+        } else {
+            self.pump();
+            if self.rx.is_none() {
+                // The brain chose a walkthrough: get out of the way of the app.
+                if let Some(goal) = crate::walk::take_request() {
+                    crate::walk::start(goal, &self.cfg);
+                    self.close(&ctx);
+                }
             }
+            self.handle_app_events(&ctx);
+            self.dismiss_on_blur(&ctx);
         }
-        self.handle_app_events(&ctx);
-        self.dismiss_on_blur(&ctx);
         if self.voice_pending && self.frames == 2 {
             self.mic(&ctx, true);
         }
@@ -2251,7 +2411,9 @@ impl eframe::App for Palette {
                 self.stop_turn();
             } else {
                 self.close(&ctx);
-                return;
+                if !self.closing {
+                    return;
+                }
             }
         }
         let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
@@ -2261,12 +2423,45 @@ impl eframe::App for Palette {
         let now = ctx.input(|i| i.time);
         let dt = ((now - self.last_time) as f32).clamp(0.0, 0.05);
         self.last_time = now;
+        // Part of the island, the tab row opens inside the surface above the pill.
+        let head = if self.inset {
+            self.reconcile_tabs(now, full.min.x + SIDE);
+            let rise = self.tabs.iter().map(|t| self.tab_state(t, now).0).fold(0.0, f32::max);
+            rise * TAB_ROW
+        } else {
+            0.0
+        };
         let pill = egui::Rect::from_min_size(
-            full.min + egui::vec2(SIDE, PILL_TOP),
+            full.min + egui::vec2(SIDE, PILL_TOP + head),
             egui::vec2(self.width, PILL_H),
         );
         let mut moving = self.pour_surface(dt);
-        let surface = egui::Rect::from_min_size(pill.min, egui::vec2(pill.width(), self.pour.value));
+        moving |= self.drop.tick(dt);
+        if self.closing && self.drop.value <= 0.03 {
+            self.finish_close(&ctx, true);
+            return;
+        }
+        let surface = if self.inset {
+            // Hanging from the island, the surface is exactly as wide as the island
+            // is right now (it widens to the palette as it opens), and drops down.
+            let (mut x0, mut w) = (pill.left(), pill.width());
+            if self.attached || self.closing {
+                let a = crate::island::handle().map(|h| h.anchor()).unwrap_or_default();
+                if a.right > a.left {
+                    let (wx, _) = self.window_pos();
+                    let ppp = self.ppp();
+                    x0 = full.min.x + (a.left - wx) as f32 / ppp;
+                    w = (a.right - a.left) as f32 / ppp;
+                    moving |= (w - self.width).abs() > 0.5;
+                }
+            }
+            let h = (head + self.pour.value) * self.drop.value.max(0.0);
+            egui::Rect::from_min_size(egui::pos2(x0, full.min.y + PILL_TOP), egui::vec2(w, h))
+        } else {
+            egui::Rect::from_min_size(pill.min, egui::vec2(pill.width(), self.pour.value))
+        };
+        // Content fades in once the surface has mostly dropped.
+        let reveal = if self.inset { ((self.drop.value - 0.35) / 0.55).clamp(0.0, 1.0) } else { 1.0 };
 
         // Paint the surface first; its shapes are finished further down, through
         // a shared slot, once the tabs have said where they are this frame.
@@ -2277,16 +2472,19 @@ impl eframe::App for Palette {
         if drag.drag_started() {
             self.start_drag(&ctx);
         }
-        let mut blobs = self.main_blobs(pill);
-        moving |= self.tabs_ui(ui, pill, now, dt, &mut blobs);
+        let mut blobs = self.main_blobs(pill, surface);
+        let tab_clip = self.inset.then_some(surface);
+        moving |= self.tabs_ui(ui, pill, now, dt, &mut blobs, tab_clip);
         // The margin is part of the window, but isn't part of the palette.
         let clicked_away = ctx.input(|i| {
             i.pointer.any_pressed()
                 && i.pointer.interact_pos().is_some_and(|p| !blobs.iter().any(|b| b.rect.contains(p)))
         });
-        if clicked_away && self.may_dismiss() {
+        if clicked_away && self.may_dismiss() && !self.closing {
             self.close(&ctx);
-            return;
+            if !self.closing {
+                return;
+            }
         }
         self.bud_blobs(now, &mut blobs);
         blobs.truncate(crate::surface::MAX_BLOBS);
@@ -2297,7 +2495,13 @@ impl eframe::App for Palette {
 
         ui.scope_builder(
             egui::UiBuilder::new().max_rect(pill.shrink2(egui::vec2((PILL_H - CHIP_H) / 2.0, (PILL_H - CHIP_H) / 2.0))),
-            |ui| self.bar(ui, enter),
+            |ui| {
+                if self.inset {
+                    ui.set_clip_rect(surface);
+                    ui.set_opacity(reveal);
+                }
+                self.bar(ui, enter)
+            },
         );
 
         let has_body = self.has_body();
@@ -2307,9 +2511,18 @@ impl eframe::App for Palette {
                 egui::pos2(pill.left() + PAD, pill.bottom()),
                 egui::pos2(pill.right() - PAD, pill.top() + MAX_H),
             );
+            if self.inset {
+                // The island's peek-panel divider, between the pill and the answer.
+                let a = (shown * reveal * 255.0 * 0.08) as u8;
+                ui.painter().with_clip_rect(surface).hline(
+                    (surface.left() + 14.0)..=(surface.right() - 14.0),
+                    pill.bottom(),
+                    egui::Stroke::new(1.0, Color32::from_white_alpha(a)),
+                );
+            }
             ui.scope_builder(egui::UiBuilder::new().max_rect(room), |ui| {
                 ui.set_clip_rect(surface);
-                ui.set_opacity(shown);
+                ui.set_opacity(shown * reveal);
                 if self.browser.is_some() {
                     self.history_body(ui, keys);
                 } else if self.mention.is_some() {
@@ -2366,6 +2579,7 @@ impl eframe::App for Palette {
 
 impl Drop for Palette {
     fn drop(&mut self) {
+        self.detach(); // never leave the island merged with a palette that's gone
         self.cancel.store(true, Ordering::Relaxed);
         if self.rx.is_some() {
             crate::island::buddy(crate::island::BuddyState::Idle); // closed mid-answer
@@ -2382,7 +2596,7 @@ fn on_screen([x, y]: [i32; 2]) -> bool {
 
 /// One spawned agent inside the conversation: its live status, any question
 /// or approval it is waiting on, and its result. Cards replace this later.
-fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMap<String, String>, accent: Color32) {
+fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMap<String, String>) {
     use crate::agents::{Answer, AskKind, Status};
     let Some(a) = crate::agents::get(id) else { return };
     if a.status.is_active() {
@@ -2390,83 +2604,116 @@ fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMa
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     }
     ui.add_space(6.0);
-    let name = format!("\u{2039}{}\u{203a}", a.name);
-    ui.horizontal_wrapped(|ui| {
-        let (dot, text) = match a.status {
-            Status::Pending => (TEXT_2, format!("Spawned agent {name} \u{2014} starting\u{2026}")),
-            Status::Running => {
-                let step = a.steps.last().map(|s| format!(" \u{b7} {s}")).unwrap_or_default();
-                (accent, format!("Spawned agent {name} \u{2014} working\u{2026}{step}"))
-            }
-            Status::Done => (Color32::from_rgb(61, 220, 132), format!("Agent {name} is done")),
-            Status::Failed => (ERROR, format!("Agent {name} failed: {}", a.error.as_deref().unwrap_or("something went wrong"))),
-            Status::Stopped => (TEXT_2, format!("Agent {name} stopped{}", if a.counted { "" } else { " (didn't count)" })),
-        };
-        ui.label(RichText::new("\u{25cf}").color(dot).size(11.0));
-        ui.label(RichText::new(text).color(TEXT_2).size(13.5));
-        match a.status {
-            Status::Pending => {
-                if ui.link(RichText::new("Cancel").size(13.0)).clicked() {
-                    crate::agents::cancel(id);
+    // Drawn like an agent card: dot, name, an all-caps state on the right, the
+    // latest step underneath, on a raised INK chip.
+    let dot = crate::agent_history::dot_color(&a);
+    let state = match a.status {
+        _ if a.ask.is_some() => "needs you",
+        Status::Pending => "starting",
+        Status::Running => "working",
+        Status::Done => "done",
+        Status::Failed => "failed",
+        Status::Stopped => "stopped",
+    };
+    let detail = match a.status {
+        Status::Running | Status::Pending => a.steps.last().cloned(),
+        Status::Failed => Some(a.error.clone().unwrap_or_else(|| "Something went wrong".into())),
+        Status::Stopped if !a.counted => Some("Didn't count".into()),
+        _ => None,
+    };
+    let small = |t: &str| RichText::new(t).font(geist(12.0));
+    egui::Frame::new()
+        .fill(INK_2)
+        .corner_radius(12)
+        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(14)))
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+                if a.status == Status::Running {
+                    ui.painter().circle_filled(r.center(), 5.0, dot.gamma_multiply(0.16));
                 }
-            }
-            Status::Running => {
-                if ui.link(RichText::new("Stop").size(13.0)).clicked() {
-                    crate::agents::stop(id);
-                }
-            }
-            Status::Failed | Status::Stopped => {
-                if ui.link(RichText::new("Retry").size(13.0)).clicked() {
-                    crate::agents::retry(id);
-                }
-            }
-            Status::Done => {}
-        }
-    });
-    if let Some(q) = &a.ask {
-        match q.kind {
-            AskKind::Approval => {
-                ui.label(RichText::new(format!("Allow it to {}?", lowercase_first(&q.text))).size(14.0));
-                ui.label(RichText::new(&q.detail).monospace().color(TEXT_2).size(12.0));
-                ui.horizontal(|ui| {
-                    if ui.button("Allow").clicked() {
-                        crate::agents::answer(id, q.id, Answer::Allow);
+                ui.painter().circle_filled(r.center(), 2.6, dot);
+                ui.label(RichText::new(&a.name).font(geist_medium(13.0)).color(TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let action = match a.status {
+                        Status::Pending => Some("Cancel"),
+                        Status::Running => Some("Stop"),
+                        Status::Failed | Status::Stopped => Some("Retry"),
+                        Status::Done => None,
+                    };
+                    if let Some(act) = action {
+                        let b = egui::Button::new(crate::agent_history::label(act).color(TEXT)).frame(false);
+                        let r = ui.add(b);
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if r.clicked() {
+                            let _ = match a.status {
+                                Status::Pending => crate::agents::cancel(id),
+                                Status::Running => crate::agents::stop(id),
+                                _ => crate::agents::retry(id),
+                            };
+                        }
                     }
-                    if ui.button("Don't Allow").clicked() {
-                        crate::agents::answer(id, q.id, Answer::Deny);
+                    ui.label(crate::agent_history::label(state));
+                });
+            });
+            if let Some(d) = detail {
+                ui.label(small(&d).color(TEXT_2));
+            }
+            if let Some(q) = &a.ask {
+                ui.add_space(2.0);
+                match q.kind {
+                    AskKind::Approval => {
+                        ui.label(RichText::new(format!("Allow it to {}?", lowercase_first(&q.text))).font(geist(13.0)).color(TEXT));
+                        ui.label(small(&q.detail).color(TEXT_2));
+                        ui.horizontal(|ui| {
+                            let allow = egui::Button::new(small("Allow").color(SURFACE)).fill(Color32::WHITE).corner_radius(8);
+                            if ui.add(allow).clicked() {
+                                crate::agents::answer(id, q.id, Answer::Allow);
+                            }
+                            if ui.button(small("Don't Allow")).clicked() {
+                                crate::agents::answer(id, q.id, Answer::Deny);
+                            }
+                        });
+                    }
+                    AskKind::Questions => {
+                        for line in &q.questions {
+                            ui.label(RichText::new(line).font(geist(13.0)).color(TEXT));
+                        }
+                        let draft = drafts.entry(id.to_string()).or_default();
+                        let mut send = false;
+                        ui.horizontal(|ui| {
+                            let edit = egui::TextEdit::singleline(draft)
+                                .hint_text(small("Answer\u{2026}").color(TEXT_2))
+                                .font(geist(12.5))
+                                .desired_width(ui.available_width() - 70.0);
+                            let r = ui.add(edit);
+                            send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            send |= ui.button(small("Send")).clicked();
+                        });
+                        if send && !draft.trim().is_empty() {
+                            crate::agents::answer(id, q.id, Answer::Text(std::mem::take(draft)));
+                        }
+                    }
+                }
+            }
+            if a.status == Status::Done && !a.result.is_empty() {
+                ui.label(RichText::new(&a.result).font(geist(12.5)).color(TEXT));
+            }
+            if !a.status.is_active() && !a.files.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for f in &a.files {
+                        let label = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        if ui.link(small(&label)).on_hover_text(f.display().to_string()).clicked() {
+                            win::shell_open(f);
+                        }
                     }
                 });
-            }
-            AskKind::Questions => {
-                for line in &q.questions {
-                    ui.label(RichText::new(line).size(14.0));
-                }
-                let draft = drafts.entry(id.to_string()).or_default();
-                let mut send = false;
-                ui.horizontal(|ui| {
-                    let r = ui.add(egui::TextEdit::singleline(draft).hint_text("Answer\u{2026}").desired_width(ui.available_width() - 70.0));
-                    send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    send |= ui.button("Send").clicked();
-                });
-                if send && !draft.trim().is_empty() {
-                    crate::agents::answer(id, q.id, Answer::Text(std::mem::take(draft)));
-                }
-            }
-        }
-    }
-    if a.status == Status::Done && !a.result.is_empty() {
-        ui.label(RichText::new(&a.result).color(TEXT).size(14.0));
-    }
-    if !a.status.is_active() && !a.files.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            for f in &a.files {
-                let label = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                if ui.link(RichText::new(label).size(13.0)).on_hover_text(f.display().to_string()).clicked() {
-                    win::shell_open(f);
-                }
             }
         });
-    }
 }
 
 fn lowercase_first(s: &str) -> String {

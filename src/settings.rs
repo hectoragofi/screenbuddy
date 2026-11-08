@@ -482,7 +482,11 @@ impl Settings {
             ui.add_space(4.0);
         });
         group(ui, "Palette", |ui| {
-            row(ui, "Position", None, |ui| {
+            row(ui, "Part of the island", Some("Opens from the island at the top of the screen. Off: it floats and can be dragged"), |ui| {
+                toggle(ui, &mut self.cfg.appearance.attach, accent);
+            });
+            sep(ui);
+            row(ui, "Position", Some("Where it floats when it isn't part of the island"), |ui| {
                 segmented(
                     ui,
                     &mut self.cfg.appearance.position,
