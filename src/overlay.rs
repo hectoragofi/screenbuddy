@@ -45,6 +45,42 @@ pub struct Shape {
     pub diagram: Option<Arc<crate::diagram::Img>>,
     /// Not drawn yet: a droplet is still on its way here.
     pub hidden: bool,
+    /// The Apeiron window this was drawn on (None without Apeiron).
+    pub anchor: Option<Anchor>,
+    /// Not drawn while Apeiron's camera moves (see `Overlay::follow`).
+    pub away: bool,
+}
+
+/// The window a shape points at, so the shape can follow Apeiron's camera.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Anchor {
+    pub hwnd: isize,
+    /// The window's screen rect that the shape's coordinates belong to.
+    pub at: Rect,
+}
+
+/// The point that decides which window a shape belongs to.
+fn anchor_point(s: &Shape) -> (f32, f32) {
+    match s.kind {
+        Kind::Arrow => (s.x2, s.y2),
+        Kind::Box | Kind::Highlight => (s.x + s.w / 2.0, s.y + s.h / 2.0),
+        _ => (s.x, s.y),
+    }
+}
+
+/// Moves a shape drawn on a window at `from` to the same spot on it at `to`
+/// (a pan translates, a zoom also scales). Diagram cards only move.
+pub fn reproject(s: &mut Shape, from: Rect, to: Rect) {
+    let sx = to.w as f32 / from.w.max(1) as f32;
+    let sy = to.h as f32 / from.h.max(1) as f32;
+    let map = |x: f32, y: f32| (to.x as f32 + (x - from.x as f32) * sx, to.y as f32 + (y - from.y as f32) * sy);
+    (s.x, s.y) = map(s.x, s.y);
+    (s.x2, s.y2) = map(s.x2, s.y2);
+    if s.kind != Kind::Diagram {
+        s.w *= sx;
+        s.h *= sy;
+        s.r *= (sx + sy) / 2.0;
+    }
 }
 
 /// Inner padding of a diagram card, in points.
@@ -160,7 +196,7 @@ pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Resul
             sy = sy.min((m.y + m.h) as f32 - h - margin).max(m.y as f32);
             diagram = Some(img);
         }
-        shapes.push(Shape {
+        let mut shape = Shape {
             kind,
             x: sx,
             y: sy,
@@ -177,7 +213,14 @@ pub fn parse_draw(input: &Value, cap: &Capture, default_color: [u8; 3]) -> Resul
             color,
             diagram,
             hidden: false,
-        });
+            anchor: None,
+            away: false,
+        };
+        if shape.kind != Kind::Diagram {
+            let (ax, ay) = anchor_point(&shape);
+            shape.anchor = crate::apeiron::window_at(&cap.windows, ax, ay).map(|p| Anchor { hwnd: p.hwnd, at: p.rect });
+        }
+        shapes.push(shape);
     }
     Ok(DrawCall { clear, shapes })
 }
@@ -711,6 +754,9 @@ pub struct Overlay {
     flights: Vec<Flight>,
     /// The layer is on screen, so changes to it shouldn't fade it in again.
     shown: bool,
+    /// Apeiron layout generation last followed.
+    seen: u64,
+    waker: Option<u64>,
 }
 
 /// How long a droplet takes to reach a target, by distance in pixels.
@@ -847,6 +893,9 @@ impl Overlay {
             shapes: Vec::new(),
             flights: Vec::new(),
             shown: false,
+            seen: 0,
+            // Without Apeiron nothing is anchored, so nothing needs waking.
+            waker: crate::apeiron::connected().then(|| crate::apeiron::add_waker(crate::win::request_repaint)),
         })
     }
 
@@ -860,7 +909,9 @@ impl Overlay {
             self.flights.clear();
             self.shapes.clear();
         }
-        for mut shape in call.shapes {
+        let mut shapes = call.shapes;
+        bring_into_view(&mut shapes);
+        for mut shape in shapes {
             let flies = matches!(shape.kind, Kind::Arrow | Kind::Box | Kind::Highlight | Kind::Circle);
             if animate && flies && self.flights.len() < MAX_FLIGHTS {
                 shape.hidden = true;
@@ -877,6 +928,38 @@ impl Overlay {
             self.shapes.push(shape);
         }
         self.render(true);
+        self.seen = 0;
+        self.follow();
+    }
+
+    /// Keeps anchored shapes on their windows as Apeiron's camera moves: hidden
+    /// while it moves (or the overview is open), re-projected from the
+    /// window's new screen rect once it settles, dropped when the window left
+    /// the screen. A no-op without Apeiron or anchors.
+    fn follow(&mut self) {
+        if !self.shapes.iter().any(|s| s.anchor.is_some()) {
+            return;
+        }
+        let Some(l) = crate::apeiron::get() else {
+            // Apeiron went away: show what we have where it was.
+            if self.shapes.iter().any(|s| s.away) {
+                self.shapes.iter_mut().for_each(|s| s.away = false);
+                self.render(false);
+            }
+            return;
+        };
+        if l.generation == self.seen {
+            return;
+        }
+        self.seen = l.generation;
+        let (next, changed) = follow_shapes(std::mem::take(&mut self.shapes), &l, self.monitor);
+        self.shapes = next;
+        if changed {
+            // Flights index into `shapes` and would land in stale spots.
+            self.flights.clear();
+            self.shapes.iter_mut().for_each(|s| s.hidden = false);
+            self.render(false);
+        }
     }
 
     /// Sends waiting droplets from the palette, whose surface is `(x0, y0, x1,
@@ -903,6 +986,7 @@ impl Overlay {
 
     /// Advances the flights one frame. True while any are still going.
     pub fn tick(&mut self) -> bool {
+        self.follow();
         if self.flights.is_empty() {
             return false;
         }
@@ -969,12 +1053,15 @@ impl Overlay {
             return None;
         }
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for s in &self.shapes {
+        for s in self.shapes.iter().filter(|s| !s.away) {
             let b = bounds(s, self.scale, self.monitor);
             x0 = x0.min(b.0);
             y0 = y0.min(b.1);
             x1 = x1.max(b.2);
             y1 = y1.max(b.3);
+        }
+        if x0 > x1 {
+            return None;
         }
         Some(Rect {
             x: x0 as i32,
@@ -986,7 +1073,7 @@ impl Overlay {
 
     fn render(&mut self, fade: bool) {
         unsafe {
-            if self.shapes.iter().all(|s| s.hidden) {
+            if self.shapes.iter().all(|s| s.hidden || s.away) {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 self.shown = false;
                 return;
@@ -994,7 +1081,7 @@ impl Overlay {
         }
         let m = self.monitor;
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for s in self.shapes.iter().filter(|s| !s.hidden) {
+        for s in self.shapes.iter().filter(|s| !s.hidden && !s.away) {
             let b = bounds(s, self.scale, m);
             x0 = x0.min(b.0);
             y0 = y0.min(b.1);
@@ -1010,7 +1097,7 @@ impl Overlay {
             return;
         };
         let t = Transform::from_translate(-x0 as f32, -y0 as f32);
-        for s in self.shapes.iter().filter(|s| !s.hidden) {
+        for s in self.shapes.iter().filter(|s| !s.hidden && !s.away) {
             draw_shape(&mut pm, s, self.scale, m, t);
         }
         unsafe { present(self.hwnd, &pm, x0, y0, fade && !self.shown) };
@@ -1018,8 +1105,79 @@ impl Overlay {
     }
 }
 
+/// A draw aimed at a window that has since left the screen (panned away,
+/// hidden tab) flies Apeiron there first; then shapes drawn on windows that
+/// moved since the screenshot are moved along with them.
+fn bring_into_view(shapes: &mut [Shape]) {
+    if !shapes.iter().any(|s| s.anchor.is_some()) {
+        return;
+    }
+    let Some(mut live) = crate::apeiron::get() else { return };
+    let gone = shapes
+        .iter()
+        .filter_map(|s| s.anchor)
+        .find(|a| live.window(a.hwnd).is_some_and(|w| !w.visible()));
+    if let Some(a) = gone
+        && crate::apeiron::focus_window(a.hwnd).is_ok()
+        && let Some(l) = crate::apeiron::refresh()
+    {
+        live = l;
+    }
+    for s in shapes.iter_mut() {
+        let Some(a) = s.anchor else { continue };
+        if let Some(r) = live.window(a.hwnd).filter(|w| w.visible()).and_then(|w| w.screen_rect)
+            && r != a.at
+        {
+            reproject(s, a.at, r);
+            s.anchor = Some(Anchor { at: r, ..a });
+        }
+    }
+}
+
+/// One follow step over `shapes` for layout `l` (see `Overlay::follow`).
+/// Returns the shapes to keep and whether anything visibly changed.
+fn follow_shapes(shapes: Vec<Shape>, l: &crate::apeiron::Layout, monitor: Rect) -> (Vec<Shape>, bool) {
+    let hold = l.unsettled();
+    let mut changed = false;
+    let mut keep = Vec::with_capacity(shapes.len());
+    for mut s in shapes {
+        let Some(a) = s.anchor else {
+            keep.push(s);
+            continue;
+        };
+        if hold {
+            changed |= !s.away;
+            s.away = true;
+            keep.push(s);
+            continue;
+        }
+        let Some(r) = l.window(a.hwnd).filter(|w| w.visible()).and_then(|w| w.screen_rect) else {
+            changed = true; // the window closed or left the screen
+            continue;
+        };
+        if r != a.at {
+            reproject(&mut s, a.at, r);
+            s.anchor = Some(Anchor { at: r, ..a });
+            changed = true;
+        }
+        let (x, y) = anchor_point(&s);
+        let m = monitor;
+        if x < m.x as f32 || y < m.y as f32 || x >= (m.x + m.w) as f32 || y >= (m.y + m.h) as f32 {
+            changed = true; // on a window, but not on this overlay's monitor anymore
+            continue;
+        }
+        changed |= s.away;
+        s.away = false;
+        keep.push(s);
+    }
+    (keep, changed)
+}
+
 impl Drop for Overlay {
     fn drop(&mut self) {
+        if let Some(id) = self.waker.take() {
+            crate::apeiron::remove_waker(id);
+        }
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
@@ -1313,7 +1471,94 @@ mod tests {
                 scale: 1.0,
             },
             cursor: (0, 0),
+            windows: Vec::new(),
         }
+    }
+
+    fn win(hwnd: isize, rect: Rect, visible: bool) -> crate::apeiron::Window {
+        crate::apeiron::Window {
+            hwnd,
+            title: String::new(),
+            exe: String::new(),
+            canvas_rect: [0.0; 4],
+            screen_rect: visible.then_some(rect),
+            on_screen: visible,
+            tab_hidden: false,
+            away: false,
+        }
+    }
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn anchors_to_topmost_window_under_shape() {
+        let mut c = cap();
+        c.windows = vec![
+            crate::apeiron::Placed { hwnd: 7, rect: rect(2000, 100, 800, 600) },
+            crate::apeiron::Placed { hwnd: 8, rect: rect(1920, 0, 2560, 1440) },
+        ];
+        // Screenshot (100,100) = screen (2120, 200): on window 7.
+        let call = parse_draw(&json!({"shapes":[{"kind":"circle","x":100,"y":100},{"kind":"box","x":1000,"y":600,"w":40,"h":40}]}), &c, ACCENT).unwrap();
+        assert_eq!(call.shapes[0].anchor.unwrap().hwnd, 7);
+        assert_eq!(call.shapes[1].anchor.unwrap().hwnd, 8);
+        // Without Apeiron nothing is anchored.
+        let call = parse_draw(&json!({"shapes":[{"kind":"circle","x":100,"y":100}]}), &cap(), ACCENT).unwrap();
+        assert!(call.shapes[0].anchor.is_none());
+    }
+
+    #[test]
+    fn reprojects_pan_and_zoom() {
+        let c = cap();
+        let mut s = parse_draw(&json!({"shapes":[{"kind":"box","x":100,"y":50,"w":20,"h":10}]}), &c, ACCENT).unwrap().shapes.remove(0);
+        // Screen box (2120,100) 40x20 on a window at (2000,0) 800x600.
+        let from = rect(2000, 0, 800, 600);
+        // Panned 300 left at the same zoom.
+        let mut p = s.clone();
+        reproject(&mut p, from, rect(1700, 0, 800, 600));
+        assert_eq!((p.x, p.y, p.w, p.h), (1820.0, 100.0, 40.0, 20.0));
+        // Zoomed to half size around a new origin.
+        reproject(&mut s, from, rect(1000, 200, 400, 300));
+        assert_eq!((s.x, s.y, s.w, s.h), (1060.0, 250.0, 20.0, 10.0));
+        // And back: the round trip lands where it started.
+        reproject(&mut s, rect(1000, 200, 400, 300), from);
+        assert_eq!((s.x, s.y, s.w, s.h), (2120.0, 100.0, 40.0, 20.0));
+    }
+
+    #[test]
+    fn follows_camera() {
+        use crate::apeiron::Layout;
+        let m = rect(1920, 0, 2560, 1440);
+        let at = rect(2000, 0, 800, 600);
+        let mut a = parse_draw(&json!({"shapes":[{"kind":"circle","x":100,"y":100}]}), &cap(), ACCENT).unwrap().shapes.remove(0);
+        a.anchor = Some(Anchor { hwnd: 1, at });
+        let mut b = a.clone();
+        b.anchor = Some(Anchor { hwnd: 2, at });
+        let free = parse_draw(&json!({"shapes":[{"kind":"text","x":10,"y":10,"label":"hi"}]}), &cap(), ACCENT).unwrap().shapes.remove(0);
+        let shapes = vec![a, b, free];
+        // Camera moving: anchored shapes hide, the free one stays.
+        let mut l = Layout { moving: true, windows: vec![win(1, at, true), win(2, at, true)], ..Default::default() };
+        let (v, changed) = follow_shapes(shapes, &l, m);
+        assert!(changed);
+        assert_eq!(v.iter().map(|s| s.away).collect::<Vec<_>>(), [true, true, false]);
+        // Settled: window 1 moved right by 500, window 2 panned off-screen.
+        l.moving = false;
+        l.windows = vec![win(1, rect(2500, 0, 800, 600), true), win(2, at, false)];
+        let (v, changed) = follow_shapes(v, &l, m);
+        assert!(changed);
+        assert_eq!(v.len(), 2);
+        assert!(!v[0].away);
+        assert_eq!(v[0].x, 2120.0 + 500.0);
+        assert_eq!(v[0].anchor.unwrap().at.x, 2500);
+        // Nothing new: nothing changes.
+        let (v, changed) = follow_shapes(v, &l, m);
+        assert!(!changed && v.len() == 2);
+        // Window moved onto another monitor: dropped from this overlay.
+        l.windows = vec![win(1, rect(-1500, 0, 800, 600), true)];
+        let (v, _) = follow_shapes(v, &l, m);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].anchor.is_none());
     }
 
     #[test]
@@ -1367,6 +1612,8 @@ mod tests {
             label: Some(label.into()),
             color: ACCENT,
             diagram: None,
+            anchor: None,
+            away: false,
         };
         let shapes = [
             mk(Kind::Box, 40.0, 120.0, r"$f'(x) = \frac{3e^{3x}}{3x}$"),
