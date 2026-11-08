@@ -325,6 +325,19 @@ impl Settings {
                 combo_text(ui, "voice_lang", &mut self.cfg.voice.language, voice::LANGUAGES);
             });
         });
+        group(ui, "Alt key", |ui| {
+            row(ui, "Hold Alt to ask", Some("Hold Alt alone, speak, let go; the answer appears beside the cursor"), |ui| {
+                toggle(ui, &mut self.cfg.input.alt_hold, accent);
+            });
+            sep(ui);
+            row(ui, "Hold for", Some("How long Alt is held before listening starts"), |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.input.alt_hold_ms, 300..=1500).suffix(" ms").step_by(50.0));
+            });
+            sep(ui);
+            row(ui, "Double-tap Alt", Some("Opens the palette to type a question"), |ui| {
+                toggle(ui, &mut self.cfg.input.alt_double_tap, accent);
+            });
+        });
         if let Some(slot) = self.recording.filter(|&s| s == 2) {
             if let Some(combo) = capture_hotkey(ui) {
                 if let Ok(s) = combo {

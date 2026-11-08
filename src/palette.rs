@@ -81,6 +81,8 @@ pub struct Start {
     pub backdrop: Option<Arc<crate::surface::Backdrop>>,
     /// Selected text still being read; becomes a chip before the palette shows.
     pub selection: Option<context::PendingSelection>,
+    /// Open on this saved conversation (a clicked quick-ask caption).
+    pub open_chat: Option<std::path::PathBuf>,
 }
 
 /// A user-facing error: a short sentence, an optional action, and the raw detail.
@@ -186,6 +188,7 @@ pub struct Palette {
     voice_dl: Option<Arc<std::sync::Mutex<voice::Download>>>,
     /// Start recording on the first frame / once the model is downloaded.
     voice_pending: bool,
+    open_on_start: Option<std::path::PathBuf>,
     /// egui time (s) at which to hand cold pages back to the OS; see `trim_when_idle`.
     trim_at: f64,
     /// The user dragged the palette; its spot is saved on close.
@@ -458,6 +461,7 @@ impl Palette {
             transcribing: None,
             voice_dl: None,
             voice_pending: start.voice,
+            open_on_start: start.open_chat,
             trim_at: TRIM_AFTER_OPEN,
             moved: false,
             mention: None,
@@ -1233,6 +1237,9 @@ impl Palette {
     }
 
     fn handle_app_events(&mut self, ctx: &egui::Context) {
+        if let Some(dir) = self.open_on_start.take() {
+            self.open_chat(ctx, dir);
+        }
         let mut requeue = Vec::new();
         while let Some(ev) = win::pop() {
             match ev {
@@ -1245,7 +1252,8 @@ impl Palette {
                     }
                 }
                 // Pressing the hotkey again (or clicking the tray) toggles the palette off.
-                AppEvent::Hotkey(_) | AppEvent::TrayClick => self.close(ctx),
+                AppEvent::Hotkey(_) | AppEvent::TrayClick | AppEvent::AltDoubleTap => self.close(ctx),
+                AppEvent::OpenChat(dir) => self.open_chat(ctx, dir),
                 // More files from Explorer join the current question.
                 AppEvent::OpenFile(p) => {
                     self.chips.push(context::file_chip(&p));

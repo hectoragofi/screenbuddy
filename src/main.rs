@@ -1,17 +1,20 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod caption;
 mod capture;
 mod config;
 mod context;
 mod desktop;
 mod diagram;
 mod history;
+mod keys;
 mod llm;
 mod math;
 mod mcp;
 mod mention;
 mod overlay;
 mod palette;
+mod quick;
 mod settings;
 mod surface;
 mod tray;
@@ -92,6 +95,7 @@ impl App {
             errs.extend(win::register_voice_hotkey(&voice));
             self.voice_hk = Some(voice);
         }
+        quick::configure(&cfg);
         self.cfg = cfg;
         self.cfg_error = if errs.is_empty() {
             None
@@ -169,6 +173,7 @@ fn run() -> anyhow::Result<()> {
         tray,
     };
     app.reload(); // registers the push-to-talk hotkey
+    quick::start(&app.cfg);
     if let Some(e) = &app.cfg_error {
         config::log(e);
     }
@@ -199,6 +204,12 @@ fn run() -> anyhow::Result<()> {
                     false,
                     false,
                     palette::Start { chips: vec![context::file_chip(&p)], ..Default::default() },
+                ),
+                AppEvent::AltDoubleTap => app.ask(false, true, Default::default()),
+                AppEvent::OpenChat(dir) => app.ask(
+                    false,
+                    false,
+                    palette::Start { open_chat: Some(dir), ..Default::default() },
                 ),
                 AppEvent::Menu(id) => match id.as_str() {
                     tray::ASK => app.ask(false, false, Default::default()),
