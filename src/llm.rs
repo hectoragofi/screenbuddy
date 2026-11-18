@@ -1380,20 +1380,26 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
     // Actions requested through the MCP server are approved here, over a
     // loopback socket, so the user sees the same Allow / Don't Allow card.
     let mut env = serde_json::Map::new();
+    // Tokens for those sockets go in the CLI's environment, which the MCP
+    // server inherits; the `--mcp-config` JSON is on the command line.
+    let mut secrets: Vec<(&str, String)> = Vec::new();
     let desktop = full_cfg.desktop_exe().is_some();
     if desktop {
+        use crate::mcp::loopback;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let token = loopback::token().ok_or_else(|| anyhow::anyhow!("couldn't make an approval token"))?;
         env.insert(
             "SCREENBUDDY_DESKTOP_SESSION".into(),
             json!(crate::desktop::app_session()),
         );
         env.insert(
-            "SCREENBUDDY_APPROVAL_PORT".into(),
+            loopback::APPROVAL_PORT_ENV.into(),
             json!(listener.local_addr()?.port().to_string()),
         );
-        spawn_approval_server(listener, approver.clone(), done.clone());
+        secrets.push((loopback::APPROVAL_TOKEN_ENV, token.clone()));
+        spawn_approval_server(listener, approver.clone(), done.clone(), token);
     }
-    crate::vision::cli_env(&mut env);
+    secrets.extend(crate::vision::cli_env(&mut env));
     let mcp = json!({"mcpServers": {"screenbuddy": {"type": "stdio", "command": exe.to_string_lossy(), "args": ["--mcp"], "env": env}}}).to_string();
     let mut allowed_list = Vec::new();
     if full_cfg.drawing.enabled {
@@ -1444,6 +1450,10 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
         }
         if let Some(id) = resume {
             c.args(["--resume", id]);
+        }
+        c.envs(secrets.iter().map(|(k, v)| (k, v)));
+        if !secrets.is_empty() {
+            c.env_remove("CLAUDE_CODE_MCP_ALLOWLIST_ENV");
         }
         c.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1692,28 +1702,35 @@ fn cli_died(proc: &mut CliProc) -> anyhow::Error {
 
 /// Answers approval requests from `screenbuddy --mcp`: one JSON line
 /// {"intent","detail"} in, "allow" or "deny" out. Denies when no turn is active.
+/// The request line follows the token line (see `mcp::loopback`).
 fn spawn_approval_server(
     listener: std::net::TcpListener,
     approver: Arc<std::sync::Mutex<Option<Out>>>,
     done: Arc<AtomicBool>,
+    token: String,
 ) {
     let _ = listener.set_nonblocking(true);
     std::thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let mut line = String::new();
-                    let _ = BufReader::new(&stream).read_line(&mut line);
-                    let req: Value = serde_json::from_str(&line).unwrap_or_default();
-                    let out = approver.lock().unwrap().clone();
-                    let ok = out.is_some_and(|o| {
-                        o.approve(
-                            req["intent"].as_str().unwrap_or("perform an action"),
-                            req["detail"].as_str().unwrap_or(""),
-                        )
+                    // A slow or unauthenticated client must not stall the
+                    // accept loop, so each connection gets its own thread.
+                    let (approver, token) = (approver.clone(), token.clone());
+                    std::thread::spawn(move || {
+                        let Some(line) = crate::mcp::loopback::read_request(&stream, &token) else {
+                            return;
+                        };
+                        let req: Value = serde_json::from_str(&line).unwrap_or_default();
+                        let out = approver.lock().unwrap().clone();
+                        let ok = out.is_some_and(|o| {
+                            o.approve(
+                                req["intent"].as_str().unwrap_or("perform an action"),
+                                req["detail"].as_str().unwrap_or(""),
+                            )
+                        });
+                        let _ = stream.write_all(if ok { b"allow\n" } else { b"deny\n" });
                     });
-                    let _ = stream.write_all(if ok { b"allow\n" } else { b"deny\n" });
                 }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(40)),
             }
@@ -2019,5 +2036,32 @@ mod tests {
         settle(&turn, &mut conv, Vec::new());
         assert!(conv.anthropic.is_empty());
         assert!(conv.acted.is_empty());
+    }
+
+    #[test]
+    fn approval_server_requires_token() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let token = crate::mcp::loopback::token().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        spawn_approval_server(l, Default::default(), done.clone(), token.clone());
+        let ask = |msg: String| {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = s.write_all(msg.as_bytes());
+            let mut r = String::new();
+            let _ = BufReader::new(&s).read_line(&mut r);
+            r
+        };
+        let req = r#"{"intent":"click","detail":"x"}"#;
+        assert_eq!(ask(format!("{req}\n")), "");
+        assert_eq!(ask(format!("nope\n{req}\n")), "");
+        // Right token: served (no turn is active, so it is denied).
+        assert_eq!(ask(format!("{token}\n{req}\n")), "deny\n");
+        // A silent client doesn't block the next one.
+        let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert_eq!(ask(format!("{token}\n{req}\n")), "deny\n");
+        drop(idle);
+        done.store(true, Ordering::Relaxed);
     }
 }

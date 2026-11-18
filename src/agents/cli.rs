@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 /// Silence (while nothing waits on the user) after which a turn is dead.
 const STALL: Duration = Duration::from_secs(600);
 
-const APPROVAL_PORT_ENV: &str = "SCREENBUDDY_APPROVAL_PORT";
+use crate::mcp::loopback::{self, APPROVAL_PORT_ENV, APPROVAL_TOKEN_ENV};
 
 /// What one stream-json line means for the agent.
 #[derive(Debug, PartialEq)]
@@ -131,7 +131,8 @@ pub(crate) fn run(job: &TurnJob, sink: &Sink) -> Result<String, String> {
     let done = Arc::new(AtomicBool::new(false));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    serve(listener, sink.clone(), done.clone());
+    let token = loopback::token().ok_or("couldn't make an approval token")?;
+    serve(listener, sink.clone(), done.clone(), token.clone());
     let mut env = serde_json::Map::new();
     env.insert(super::ROLE_ENV.into(), json!("agent"));
     env.insert(APPROVAL_PORT_ENV.into(), json!(port.to_string()));
@@ -194,6 +195,10 @@ pub(crate) fn run(job: &TurnJob, sink: &Sink) -> Result<String, String> {
         if let Some(id) = &job.resume {
             c.args(["--resume", id]);
         }
+        // The MCP server inherits the token from the CLI's environment, so it
+        // stays off command lines; that needs the CLI's full-env inheritance.
+        c.env(APPROVAL_TOKEN_ENV, &token)
+            .env_remove("CLAUDE_CODE_MCP_ALLOWLIST_ENV");
         // `ask_user` may wait on the user for a long time.
         c.env("MCP_TOOL_TIMEOUT", "3600000")
             .current_dir(&job.cwd)
@@ -325,17 +330,19 @@ fn died(proc: &mut Child, err: &std::sync::Mutex<String>) -> String {
 /// `{"kind":"drive","input"}` -> `{"text","is_error"}`;
 /// `{"kind":"brain","name","input"}` -> `{"text","is_error"}` (recall / remember);
 /// `{"kind":"brain_updates"}` -> `{"text"}` (facts saved since it last looked).
-fn serve(listener: std::net::TcpListener, sink: Sink, done: Arc<AtomicBool>) {
+/// Every connection first sends the token (see `mcp::loopback`).
+fn serve(listener: std::net::TcpListener, sink: Sink, done: Arc<AtomicBool>, token: String) {
     let _ = listener.set_nonblocking(true);
     std::thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let sink = sink.clone();
+                    let token = token.clone();
                     std::thread::spawn(move || {
-                        let _ = stream.set_nonblocking(false);
-                        let mut line = String::new();
-                        let _ = BufReader::new(&stream).read_line(&mut line);
+                        let Some(line) = loopback::read_request(&stream, &token) else {
+                            return;
+                        };
                         let req: Value = serde_json::from_str(&line).unwrap_or_default();
                         let reply = if req["kind"] == "ask" {
                             json!({"answer": sink.questions(strs(&req["questions"]))}).to_string()
@@ -375,8 +382,7 @@ fn serve(listener: std::net::TcpListener, sink: Sink, done: Arc<AtomicBool>) {
 /// Inside `screenbuddy --mcp`: sends one request line to the parent agent and
 /// returns its reply line.
 pub(crate) fn ask_parent_line(req: &Value) -> Option<String> {
-    let port: u16 = std::env::var(APPROVAL_PORT_ENV).ok()?.parse().ok()?;
-    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    let mut s = loopback::connect(APPROVAL_PORT_ENV, APPROVAL_TOKEN_ENV)?;
     writeln!(s, "{req}").ok()?;
     let mut line = String::new();
     BufReader::new(&s).read_line(&mut line).ok()?;

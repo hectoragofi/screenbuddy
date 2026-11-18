@@ -7,6 +7,7 @@ use crate::llm::Image;
 use crate::util::wide;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -254,8 +255,10 @@ pub fn send_file_to_running(path: &Path) -> bool {
             if let Ok(h) = FindWindowExW(Some(HWND_MESSAGE), None, PCWSTR(cls.as_ptr()), PCWSTR::null()) {
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
                 let cds = COPYDATASTRUCT { dwData: COPYDATA_FILE, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
-                let r = SendMessageW(h, WM_COPYDATA, None, Some(LPARAM(&cds as *const _ as isize)));
-                return r.0 != 0;
+                // A hung instance must not hang Explorer's helper process too.
+                let mut r = 0usize;
+                let sent = SendMessageTimeoutW(h, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 5000, Some(&mut r));
+                return sent.0 != 0 && r != 0;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -283,24 +286,32 @@ pub unsafe fn path_from_copydata(lp: LPARAM) -> Option<PathBuf> {
 /// Tries UI Automation first; if the focused element has no text pattern
 /// and `copy_fallback` is on, simulates Ctrl+C and restores the clipboard.
 /// Runs on a helper thread with a timeout so a hung app can't stall us.
+/// Never presses Ctrl+C in a terminal, where it would interrupt the program.
 pub fn selected_text(copy_fallback: bool) -> PendingSelection {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(900);
+    let cancel = Arc::new(AtomicBool::new(false));
     let fg = unsafe { GetForegroundWindow() };
     if fg.is_invalid() || is_own_window(fg) {
-        return PendingSelection { job: None, deadline };
+        return PendingSelection { job: None, deadline, cancel };
     }
     let title = window_title(fg);
+    let copy_fallback = copy_fallback && !is_terminal(&window_class(fg));
+    let fg_raw = fg.0 as isize;
     let (tx, rx) = std::sync::mpsc::channel();
+    let stop = cancel.clone();
     std::thread::spawn(move || {
         let r = match uia_selection() {
             UiaResult::Text(t) => Some(t),
             UiaResult::NoSelection => None,
-            UiaResult::Unsupported if copy_fallback => clipboard::copy_selection(),
+            // Only into the window the hotkey was pressed in.
+            UiaResult::Unsupported if copy_fallback && unsafe { GetForegroundWindow() }.0 as isize == fg_raw => {
+                clipboard::copy_selection(&stop)
+            }
             UiaResult::Unsupported => None,
         };
         let _ = tx.send(r);
     });
-    PendingSelection { job: Some((rx, title)), deadline }
+    PendingSelection { job: Some((rx, title)), deadline, cancel }
 }
 
 /// A selection being read in the background, so the palette's window can be made
@@ -309,17 +320,47 @@ pub fn selected_text(copy_fallback: bool) -> PendingSelection {
 pub struct PendingSelection {
     job: Option<(std::sync::mpsc::Receiver<Option<String>>, String)>,
     deadline: std::time::Instant,
+    /// Set once nobody waits any more: the worker then must not press Ctrl+C
+    /// or touch the clipboard.
+    cancel: Arc<AtomicBool>,
 }
 
 impl PendingSelection {
     /// Waits for the result, up to what's left of the time limit.
-    pub fn wait(self) -> Option<Chip> {
-        let (rx, app) = self.job?;
+    pub fn wait(mut self) -> Option<Chip> {
+        let (rx, app) = self.job.take()?;
         let left = self.deadline.saturating_duration_since(std::time::Instant::now());
         let text = rx.recv_timeout(left).ok().flatten()?;
         let text = text.trim();
         (!text.is_empty()).then(|| Chip::selection(text, &app))
     }
+}
+
+impl Drop for PendingSelection {
+    fn drop(&mut self) {
+        // Timed out (or never collected); a finished worker doesn't care.
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Window classes of terminals, where a simulated Ctrl+C is an interrupt.
+const TERMINAL_CLASSES: [&str; 6] = [
+    "ConsoleWindowClass",            // conhost
+    "CASCADIA_HOSTING_WINDOW_CLASS", // Windows Terminal
+    "mintty",                        // Git Bash, Cygwin, MSYS2
+    "VirtualConsoleClass",           // ConEmu, Cmder
+    "PuTTY",
+    "KiTTY",
+];
+
+fn is_terminal(class: &str) -> bool {
+    TERMINAL_CLASSES.iter().any(|c| c.eq_ignore_ascii_case(class))
+}
+
+fn window_class(h: HWND) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { GetClassNameW(h, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
 fn is_own_window(h: HWND) -> bool {
@@ -365,12 +406,21 @@ fn uia_selection() -> UiaResult {
             Ok(if out.trim().is_empty() { UiaResult::NoSelection } else { UiaResult::Text(out) })
         })();
         CoUninitialize();
-        res.unwrap_or(UiaResult::Unsupported)
+        // A busy or vanished provider is not "no text pattern": don't fall
+        // back to Ctrl+C for it.
+        res.unwrap_or_else(|e| if uia_transient(e.code()) { UiaResult::NoSelection } else { UiaResult::Unsupported })
     }
+}
+
+fn uia_transient(code: windows::core::HRESULT) -> bool {
+    use windows::Win32::UI::Accessibility::{UIA_E_ELEMENTNOTAVAILABLE, UIA_E_TIMEOUT};
+    [UIA_E_ELEMENTNOTAVAILABLE, UIA_E_TIMEOUT].contains(&(code.0 as u32))
+        || [RPC_E_DISCONNECTED, RPC_E_SERVER_DIED, RPC_E_SERVERCALL_RETRYLATER, RPC_E_CALL_REJECTED, CO_E_OBJNOTCONNECTED].contains(&code)
 }
 
 pub(crate) mod clipboard {
     //! Ctrl+C fallback that puts the user's clipboard back afterwards.
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::Win32::Foundation::*;
     use windows::Win32::System::DataExchange::*;
     use windows::Win32::System::Memory::*;
@@ -528,7 +578,10 @@ pub(crate) mod clipboard {
         }
     }
 
-    pub fn copy_selection() -> Option<String> {
+    /// `cancel` is set when the caller stopped waiting: then nothing is sent
+    /// to (what may now be) another app, and a clipboard the user changed in
+    /// the meantime is left alone.
+    pub fn copy_selection(cancel: &AtomicBool) -> Option<String> {
         let saved = save()?;
         let seq = unsafe { GetClipboardSequenceNumber() };
         // Ctrl goes down first so lifting Alt doesn't open a menu bar; then the
@@ -540,6 +593,9 @@ pub(crate) mod clipboard {
             }
         }
         inputs.extend([key(VK_C, false), key(VK_C, true), key(VK_CONTROL, true)]);
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
         unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
         let mut changed = false;
         for _ in 0..30 {
@@ -554,7 +610,13 @@ pub(crate) mod clipboard {
         if !changed {
             return None;
         }
+        let copied = unsafe { GetClipboardSequenceNumber() };
         let text = read_text();
+        // Too late: the result is unused, and if the clipboard moved on since
+        // our copy, that's the user's newer copy, not ours to overwrite.
+        if cancel.load(Ordering::SeqCst) && unsafe { GetClipboardSequenceNumber() } != copied {
+            return None;
+        }
         restore(&saved);
         text
     }
@@ -608,6 +670,34 @@ mod tests {
         assert!(q.starts_with("[Text the user has selected in “Notepad”]"));
         assert!(q.contains("<selection>\nsome text\n</selection>") && q.ends_with("what is this?"));
         assert_eq!(compose(&[], "q"), "q");
+    }
+
+    #[test]
+    fn terminals_never_get_ctrl_c() {
+        for c in ["ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty", "VirtualConsoleClass", "PuTTY"] {
+            assert!(is_terminal(c), "{c}");
+        }
+        for c in ["Notepad", "Chrome_WidgetWin_1", ""] {
+            assert!(!is_terminal(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn transient_uia_errors_are_no_selection() {
+        use windows::Win32::UI::Accessibility::UIA_E_ELEMENTNOTAVAILABLE;
+        assert!(uia_transient(windows::core::HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32)));
+        assert!(uia_transient(RPC_E_DISCONNECTED));
+        assert!(!uia_transient(E_NOINTERFACE));
+    }
+
+    #[test]
+    fn cancelled_copy_sends_nothing() {
+        // Cancelled before the keystrokes: no Ctrl+C reaches any app, so the
+        // clipboard sequence doesn't move.
+        let seq = unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+        if clipboard::copy_selection(&AtomicBool::new(true)).is_none() {
+            assert_eq!(seq, unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() });
+        }
     }
 
     #[test]
