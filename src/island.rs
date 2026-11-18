@@ -77,6 +77,8 @@ struct Inbox {
     agents: Option<Vec<AgentRow>>,
     visible: Option<bool>,
     attach: Option<Option<Attach>>,
+    /// Blur strength (0 = solid), from `[appearance] blur`.
+    glass: Option<f32>,
 }
 
 /// A surface hanging from the island as part of it (the palette): the pill
@@ -116,6 +118,12 @@ impl IslandHandle {
     /// Shows or hides the island (the `[island] enabled` setting).
     pub fn set_visible(&self, on: bool) {
         self.shared.inbox.lock().unwrap().visible = Some(on);
+        self.wake();
+    }
+
+    /// Sets the glass strength (0 = solid ink).
+    pub fn set_glass(&self, strength: f32) {
+        self.shared.inbox.lock().unwrap().glass = Some(strength);
         self.wake();
     }
 
@@ -254,6 +262,13 @@ pub fn set_auto_hide(on: bool) {
     AUTO_HIDE.store(on, std::sync::atomic::Ordering::Relaxed);
     if let Some(h) = handle() {
         h.wake();
+    }
+}
+
+/// How much of the screen shows through the island (0 = solid).
+pub fn set_glass(strength: f32) {
+    if let Some(h) = handle() {
+        h.set_glass(strength);
     }
 }
 
@@ -503,13 +518,21 @@ impl View {
     }
 
     fn render_body(&mut self, s: f32, now: Instant) -> Option<Pixmap> {
+        self.render_body_glass(s, now, None)
+    }
+
+    fn render_body_glass(&mut self, s: f32, now: Instant, glass: Option<Glass<'_>>) -> Option<Pixmap> {
         let (bw, bh) = self.body_size(s);
         let mut pm = Pixmap::new(bw, bh)?;
         let (w, h) = (bw as f32, bh as f32);
         let r = self.radius() * s;
         let rb = self.bottom_radius() * s;
         let flat = self.flat.value.clamp(0.0, 1.0);
-        fill_path(&mut pm, body_path(0.0, 0.0, w, h, r, rb), tokens::INK);
+        let body = body_path(0.0, 0.0, w, h, r, rb);
+        match (body, glass) {
+            (Some(path), Some(g)) => fill_glass(&mut pm, &path, &g),
+            (body, _) => fill_path(&mut pm, body, tokens::INK),
+        }
         let inner = body_path(0.5, 0.5, w - 1.0, h - 1.0, (r - 0.5).max(0.0), (rb - 0.5).max(0.0));
         stroke_path(&mut pm, inner, tokens::LINE);
         if flat > 0.0 {
@@ -781,6 +804,66 @@ fn stroke_path(pm: &mut Pixmap, path: Option<tiny_skia::Path>, c: Rgba) {
     }
 }
 
+/// A blurred screenshot behind the island, plus where the body sits on screen.
+struct Glass<'a> {
+    backdrop: &'a crate::surface::Backdrop,
+    /// The body's top-left in physical screen pixels.
+    x: i32,
+    y: i32,
+    /// How much of the surface keeps its own ink (0 = pure glass).
+    opacity: f32,
+}
+
+/// Fills `path` with the backdrop, darkened and mixed with the island's ink the
+/// same way the palette shader does, so the two read as the same glass.
+fn fill_glass(pm: &mut Pixmap, path: &tiny_skia::Path, g: &Glass<'_>) {
+    let (w, h) = (pm.width(), pm.height());
+    let Some(mut tex) = Pixmap::new(w, h) else {
+        return;
+    };
+    let ink = tokens::INK;
+    let (ir, ig, ib) = (
+        ink.r as f32 / 255.0,
+        ink.g as f32 / 255.0,
+        ink.b as f32 / 255.0,
+    );
+    let px = tex.pixels_mut();
+    for y in 0..h {
+        let sy = g.y as f32 + y as f32 + 0.5;
+        for x in 0..w {
+            let sx = g.x as f32 + x as f32 + 0.5;
+            let c = g.backdrop.sample_screen(sx, sy);
+            let peak = c[0].max(c[1]).max(c[2]).max(0.001);
+            let limit = (crate::surface::PEAK / peak).min(1.0);
+            let mix = |v: f32, tint: f32| v * limit * (1.0 - g.opacity) + tint * g.opacity;
+            let r = (mix(c[0], ir) * 255.0).round().clamp(0.0, 255.0) as u8;
+            let gg = (mix(c[1], ig) * 255.0).round().clamp(0.0, 255.0) as u8;
+            let b = (mix(c[2], ib) * 255.0).round().clamp(0.0, 255.0) as u8;
+            if let Some(c) = tiny_skia::PremultipliedColorU8::from_rgba(r, gg, b, 255) {
+                px[(y * w + x) as usize] = c;
+            }
+        }
+    }
+    let paint = tiny_skia::Paint {
+        shader: tiny_skia::Pattern::new(
+            tex.as_ref(),
+            tiny_skia::SpreadMode::Pad,
+            tiny_skia::FilterQuality::Nearest,
+            1.0,
+            tiny_skia::Transform::identity(),
+        ),
+        anti_alias: true,
+        ..Default::default()
+    };
+    pm.fill_path(
+        path,
+        &paint,
+        tiny_skia::FillRule::Winding,
+        tiny_skia::Transform::identity(),
+        None,
+    );
+}
+
 fn shadow_margins(s: f32) -> (u32, u32, u32) {
     (
         (SHADOW_SIDE * s).ceil() as u32,
@@ -916,6 +999,20 @@ fn fullscreen_on(mon: &MonitorInfo) -> bool {
         if cls == "WorkerW" || cls == "Progman" || cls.starts_with("screenbuddy") {
             return false;
         }
+        // Maximized windows can overhang the monitor by their resize border,
+        // and some apps (Flock) draw their own frame while still being a
+        // normal framed window. Those are not fullscreen: the island belongs
+        // on top of them. Real fullscreen apps drop the caption and frame.
+        let style = GetWindowLongW(fg, GWL_STYLE) as u32;
+        let framed = (style & (WS_CAPTION.0 | WS_THICKFRAME.0)) != 0;
+        let mut wp = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        let maximized = GetWindowPlacement(fg, &mut wp).is_ok() && wp.showCmd == SW_SHOWMAXIMIZED.0 as u32;
+        if framed || maximized {
+            return false;
+        }
         let mut r = RECT::default();
         if GetWindowRect(fg, &mut r).is_err() {
             return false;
@@ -944,6 +1041,14 @@ struct Island {
     no_peek: bool,
     /// Auto-hidden because nothing is happening (polls for the top-edge reveal).
     tucked: bool,
+    /// The blurred screen behind the island (None = solid ink).
+    backdrop: Option<Arc<crate::surface::Backdrop>>,
+    /// Glass strength from settings: 0 = solid.
+    glass: f32,
+    /// When the backdrop was last captured, so it follows the screen.
+    glass_at: Instant,
+    /// Last time the foreground window was checked for true fullscreen.
+    full_at: Instant,
 }
 
 fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
@@ -967,6 +1072,10 @@ fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
         shadow_alpha: -1.0,
         no_peek: false,
         tucked: false,
+        backdrop: None,
+        glass: 60.0,
+        glass_at: now,
+        full_at: now,
     };
     isl.shown.set(1.0);
     unsafe {
@@ -1031,6 +1140,14 @@ impl Island {
             self.enabled = on;
             self.dirty = true;
         }
+        if let Some(g) = inbox.glass {
+            let g = g.clamp(0.0, 100.0);
+            if (g - self.glass).abs() > 0.01 {
+                self.glass = g;
+                self.backdrop = None;
+                self.dirty = true;
+            }
+        }
         if let Some(a) = inbox.attach {
             if let Some(a) = a {
                 if a.mon.rect != self.mon.rect || a.mon.scale != self.mon.scale {
@@ -1086,7 +1203,7 @@ impl Island {
         }
 
         // ---- input
-        let (hovered, changed, mouse, clicks, fg) = INPUT.with(|i| {
+        let (hovered_raw, changed, mouse, clicks, fg) = INPUT.with(|i| {
             let mut i = i.borrow_mut();
             let fg = std::mem::take(&mut i.foreground);
             (
@@ -1097,12 +1214,29 @@ impl Island {
                 fg,
             )
         });
-        if fg && self.view.attached.is_none() {
-            self.follow_cursor();
-            let full = fullscreen_on(&self.mon);
-            if full != self.fullscreen {
-                self.fullscreen = full;
-                self.dirty = true;
+        // A layered window only sees WM_MOUSEMOVE while it is visible, so while
+        // the island is tucked away its own hover area is checked here. That is
+        // what makes "move the mouse back to it" work, not just the top edge.
+        let over_pill = self.enabled && !self.fullscreen && self.cursor_on_pill();
+        let hovered = hovered_raw || over_pill;
+        if self.view.attached.is_none() {
+            // Re-check true fullscreen now and then: the foreground window can
+            // go fullscreen (or leave it) without another foreground event.
+            let every = if self.fullscreen {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(2)
+            };
+            if fg || now.saturating_duration_since(self.full_at) >= every {
+                self.full_at = now;
+                if fg {
+                    self.follow_cursor();
+                }
+                let full = fullscreen_on(&self.mon);
+                if full != self.fullscreen {
+                    self.fullscreen = full;
+                    self.dirty = true;
+                }
             }
         }
         let since = changed.map_or(Duration::MAX, |t| now.saturating_duration_since(t));
@@ -1184,6 +1318,27 @@ impl Island {
         // Attached, the island is the palette's header: nothing hides it.
         let hide = !attached && (!self.enabled || (self.fullscreen && resting) || self.tucked);
         self.shown.set(if hide { 0.0 } else { 1.0 });
+
+        // ---- glass: a small blurred copy of what is behind the island
+        let glass_on = self.glass > 0.0 && !hide;
+        if glass_on {
+            if self.backdrop.is_none() || self.glass_at.elapsed() >= Duration::from_secs(2) {
+                let rect = self.glass_rect();
+                match crate::capture::grab_rect(rect) {
+                    Ok(shot) => {
+                        self.backdrop = crate::surface::Backdrop::new(&shot, self.glass);
+                    }
+                    Err(e) => {
+                        crate::config::log(&format!("island glass: {e:#}"));
+                        self.backdrop = None;
+                    }
+                }
+                self.glass_at = now;
+            }
+        } else if self.backdrop.is_some() {
+            self.backdrop = None;
+        }
+
         self.view.layout(now);
 
         // ---- animate + draw
@@ -1208,10 +1363,19 @@ impl Island {
 
     fn draw(&mut self, now: Instant, opacity: f32) {
         let s = self.mon.scale;
-        let Some(pm) = self.view.render_body(s, now) else {
+        let m = self.mon.rect;
+        let (bw, _bh) = self.view.body_size(s);
+        let x = m.x + (m.w - bw as i32) / 2;
+        let y = m.y + (TOP_GAP * s).round() as i32;
+        let glass = self.backdrop.as_deref().map(|b| Glass {
+            backdrop: b,
+            x,
+            y,
+            opacity: crate::surface::glass_opacity(self.glass),
+        });
+        let Some(pm) = self.view.render_body_glass(s, now, glass) else {
             return;
         };
-        let m = self.mon.rect;
         let (bw, bh) = (pm.width() as i32, pm.height() as i32);
         let x = m.x + (m.w - bw) / 2;
         let y = m.y + (TOP_GAP * s).round() as i32;
@@ -1258,6 +1422,9 @@ impl Island {
         if !self.body.visible() {
             return if self.tucked && self.enabled {
                 Motion::Still(Some(now + EDGE_POLL))
+            } else if self.fullscreen && self.enabled {
+                // Poll for the fullscreen app leaving, so the island comes back.
+                Motion::Still(Some(now + Duration::from_millis(500)))
             } else {
                 Motion::Still(None)
             };
@@ -1265,6 +1432,15 @@ impl Island {
         let mut m = self.view.buddy.motion(now);
         // Wake for the pending peek / unpeek, the dim, and the Done/Error fallback.
         let mut at: Vec<Instant> = Vec::new();
+        if self.view.attached.is_none() {
+            at.push(
+                now + if self.fullscreen {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(2)
+                }
+            );
+        }
         let (hovered, changed) = INPUT.with(|i| {
             let i = i.borrow();
             (i.hovered, i.changed_at)
@@ -1306,6 +1482,56 @@ impl Island {
             };
         }
         m
+    }
+
+    /// True when the cursor is over where the rest pill sits, even while the
+    /// window is hidden. Lets a tucked island come back when the pointer is
+    /// moved to it, not only to the very top edge of the monitor.
+    fn cursor_on_pill(&self) -> bool {
+        let mut p = POINT::default();
+        if unsafe { GetCursorPos(&mut p) }.is_err() {
+            return false;
+        }
+        let s = self.mon.scale;
+        let (bw, bh) = self.view.body_size(s);
+        let m = self.mon.rect;
+        let x = m.x + (m.w - bw as i32) / 2;
+        let y = m.y + (TOP_GAP * s).round() as i32;
+        let pad = (10.0 * s) as i32;
+        p.x >= x - pad
+            && p.x <= x + bw as i32 + pad
+            && p.y >= y - pad
+            && p.y <= y + bh as i32 + pad
+    }
+
+    /// The screen area the glass captures: wide and tall enough for the pill,
+    /// the peek panel and an attached palette, with room for the blur to bleed.
+    fn glass_rect(&self) -> crate::capture::Rect {
+        let s = self.mon.scale;
+        let m = self.mon.rect;
+        let pad = (30.0 * s).ceil() as i32;
+        let w = (self
+            .view
+            .attached
+            .unwrap_or(0.0)
+            .max(PEEK_W)
+            .max(self.view.w.value)
+            * s)
+            .ceil() as i32
+            + 2 * pad;
+        let h = ((PILL_H + 340.0) * s).ceil() as i32 + 2 * pad;
+        let x = m.x + (m.w - w) / 2;
+        let y = m.y + (TOP_GAP * s).round() as i32 - pad;
+        let left = x.max(m.x);
+        let top = y.max(m.y);
+        let right = (x + w).min(m.x + m.w);
+        let bottom = (y + h).min(m.y + m.h);
+        crate::capture::Rect {
+            x: left,
+            y: top,
+            w: (right - left).max(1),
+            h: (bottom - top).max(1),
+        }
     }
 
     /// Moves to the monitor under the cursor if it changed.
@@ -1391,6 +1617,40 @@ mod tests {
             }
         }
         pm
+    }
+
+    #[test]
+    fn glass_shows_the_screen_behind_the_body() {
+        use crate::capture::{MonitorInfo, RawShot, Rect};
+        let rect = Rect { x: 0, y: 0, w: 200, h: 200 };
+        let mon = MonitorInfo { rect, work: rect, scale: 1.0 };
+        let shot = RawShot {
+            monitor: mon,
+            cursor: (0, 0),
+            bgra: vec![255u8; 200 * 200 * 4],
+            windows: Vec::new(),
+        };
+        let bd = crate::surface::Backdrop::new(&shot, 60.0).unwrap();
+        let mut pm = Pixmap::new(100, 100).unwrap();
+        let path = tiny_skia::PathBuilder::from_rect(
+            tiny_skia::Rect::from_xywh(0.0, 0.0, 100.0, 100.0).unwrap(),
+        );
+        fill_glass(
+            &mut pm,
+            &path,
+            &Glass {
+                backdrop: &bd,
+                x: 50,
+                y: 50,
+                opacity: crate::surface::glass_opacity(60.0),
+            },
+        );
+        let px = pm.pixel(50, 50).unwrap();
+        let ink = tokens::INK;
+        assert!(
+            px.red() > ink.r && px.green() > ink.g && px.blue() > ink.b,
+            "the blurred screen should show through the ink"
+        );
     }
 
     fn rows() -> Vec<AgentRow> {

@@ -138,6 +138,10 @@ fn glass_radius(strength: f32) -> f32 {
     8.0 + 32.0 * (strength / 100.0).clamp(0.0, 1.0)
 }
 
+/// The brightest a backdrop pixel may be. Keeping the glass dark is what makes
+/// white text readable over any wallpaper; the shader uses the same value.
+pub const PEAK: f32 = 50.0 / 255.0;
+
 /// A small, blurred copy of the monitor. It's made once per screenshot, so the
 /// surface pays for a single texture read per pixel. It doesn't follow changes
 /// on screen until the next capture.
@@ -198,6 +202,33 @@ impl Backdrop {
             }
         }
         Some(Arc::new(Self { w, h, rgba: out, area }))
+    }
+
+    /// Blurred colour at a point in virtual-screen pixels, 0..1 per channel.
+    /// Bilinear, so a small backdrop still looks smooth under a bigger surface.
+    pub fn sample_screen(&self, x: f32, y: f32) -> [f32; 3] {
+        let u = ((x - self.area.x as f32) / self.area.w.max(1) as f32).clamp(0.0, 1.0)
+            * (self.w.saturating_sub(1)) as f32;
+        let v = ((y - self.area.y as f32) / self.area.h.max(1) as f32).clamp(0.0, 1.0)
+            * (self.h.saturating_sub(1)) as f32;
+        let (x0, y0) = (u.floor() as usize, v.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(self.w - 1), (y0 + 1).min(self.h - 1));
+        let (fx, fy) = (u - x0 as f32, v - y0 as f32);
+        let at = |x: usize, y: usize| {
+            let i = (y * self.w + x) * 4;
+            [
+                self.rgba[i] as f32 / 255.0,
+                self.rgba[i + 1] as f32 / 255.0,
+                self.rgba[i + 2] as f32 / 255.0,
+            ]
+        };
+        let (a, b, c, d) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+        let lerp = |p: f32, q: f32, t: f32| p + (q - p) * t;
+        [
+            lerp(lerp(a[0], b[0], fx), lerp(c[0], d[0], fx), fy),
+            lerp(lerp(a[1], b[1], fx), lerp(c[1], d[1], fx), fy),
+            lerp(lerp(a[2], b[2], fx), lerp(c[2], d[2], fx), fy),
+        ]
     }
 }
 

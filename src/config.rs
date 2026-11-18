@@ -251,6 +251,9 @@ pub struct AgentDesktopCfg {
     pub cursor_accent: String,
     /// Show what the agent is doing next to its cursor.
     pub cursor_label: bool,
+    /// Let the assistant handle bare "open X" requests instead of opening them
+    /// instantly with the shell. Slower, but the agent is in charge.
+    pub open_with_agent: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -298,7 +301,9 @@ impl Default for AppearanceCfg {
             saved_pos: None,
             dismiss_on_blur: true,
             blur: 60.0,
-            attach: true,
+            // The floating pill is the default look; hanging from the island is
+            // opt-in in Settings → Appearance → Part of the island.
+            attach: false,
         }
     }
 }
@@ -345,6 +350,7 @@ impl Default for AgentDesktopCfg {
             cursor_rim: "#111318".into(),
             cursor_accent: "#0A84FF".into(),
             cursor_label: true,
+            open_with_agent: false,
         }
     }
 }

@@ -1234,7 +1234,7 @@ fn compose(v: &CardView, pen: &mut Pen) -> (f32, f32) {
                     h,
                     None,
                 ) + gap;
-                push_right(pen, "Dismiss", BtnLook::Quiet, Btn::Dismiss);
+                push_right(pen, "Close", BtnLook::Quiet, Btn::Dismiss);
             }
             Kind::Failed | Kind::Stopped => {
                 let look = if k == Kind::Failed {
@@ -1254,7 +1254,7 @@ fn compose(v: &CardView, pen: &mut Pen) -> (f32, f32) {
                     h,
                     None,
                 ) + gap;
-                push_right(pen, "Dismiss", BtnLook::Quiet, Btn::Dismiss);
+                push_right(pen, "Close", BtnLook::Quiet, Btn::Dismiss);
             }
             Kind::Approval => {}
         }

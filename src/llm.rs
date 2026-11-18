@@ -117,6 +117,9 @@ pub struct Conversation {
     pub cli: CliSlot,
     /// agent-desktop session id for this conversation.
     pub desktop_session: String,
+    /// What the palette did locally (fast paths) since the model last saw the
+    /// conversation, so the next Claude CLI turn still has the context.
+    pub pending_note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -232,7 +235,7 @@ impl Out {
             }
             self.status("acting…");
         }
-        let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx { session: crate::desktop::new_session_id(), cursor: None });
+        let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx { session: crate::desktop::app_session().to_string(), cursor: None });
         let out = crate::desktop::exec(exe, &args, &intent, &dctx);
         let ok = serde_json::from_str::<Value>(&out)
             .ok()
@@ -289,11 +292,52 @@ pub fn spawn(turn: Turn, out: Out) {
     std::thread::spawn(move || {
         let mut conv = turn.conv.clone();
         if conv.desktop_session.is_empty() {
-            conv.desktop_session = crate::desktop::new_session_id();
+            conv.desktop_session = crate::desktop::app_session().to_string();
         }
         let mut out = out;
         out.dctx = Some(crate::desktop::Ctx::from_config(&turn.cfg, conv.desktop_session.clone()));
         let out = out;
+        // A bare "open youtube" needs no model: open it and answer at once.
+        // Anything less trivial still goes through the normal turn. Users who
+        // want the assistant in charge can turn the shortcut off.
+        if turn.cfg.agent_desktop.enabled
+            && !turn.cfg.agent_desktop.open_with_agent
+            && let Some(q) = crate::desktop::quick_open(&turn.question)
+            && crate::desktop::open_target(&q.target).is_ok()
+        {
+            let answer = format!("Opening {}.", q.label);
+            let note = format!(
+                "The user asked \"{}\" and I opened {} for them.",
+                turn.question.trim(),
+                q.target
+            );
+            match turn.cfg.provider.as_str() {
+                "claude-cli" => match conv.pending_note.as_mut() {
+                    Some(n) => {
+                        n.push(' ');
+                        n.push_str(&note);
+                    }
+                    None => conv.pending_note = Some(note),
+                },
+                "openai" => {
+                    conv.openai
+                        .push(json!({"role": "user", "content": turn.question.clone()}));
+                    conv.openai
+                        .push(json!({"role": "assistant", "content": answer.clone()}));
+                }
+                _ => {
+                    conv.anthropic
+                        .push(json!({"role": "user", "content": turn.question.clone()}));
+                    conv.anthropic
+                        .push(json!({"role": "assistant", "content": answer.clone()}));
+                }
+            }
+            // No model saw this turn's screenshot; send it with the next one.
+            conv.image_sent = false;
+            out.delta(answer);
+            out.send(Ev::Done(conv));
+            return;
+        }
         crate::vision::turn_started(&out, &turn.cancel);
         let res = match turn.cfg.provider.as_str() {
             "openai" => openai(&turn, &mut conv, &out),
@@ -1068,7 +1112,7 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         env.insert(
             "SCREENBUDDY_DESKTOP_SESSION".into(),
-            json!(crate::desktop::new_session_id()),
+            json!(crate::desktop::app_session()),
         );
         env.insert(
             "SCREENBUDDY_APPROVAL_PORT".into(),
@@ -1212,7 +1256,11 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
     for img in &turn.attachments {
         content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(&img.jpeg)}}));
     }
-    content.push(json!({"type": "text", "text": question_text(turn)}));
+    let mut text = question_text(turn);
+    if let Some(note) = conv.pending_note.take() {
+        text.push_str(&format!("\n\n[Earlier in this conversation: {note}]"));
+    }
+    content.push(json!({"type": "text", "text": text}));
     let line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string();
     let sent = proc
         .stdin
