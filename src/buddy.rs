@@ -180,8 +180,27 @@ impl Buddy {
         self.awake = awake;
     }
 
-    pub fn tick(&mut self, dt: f32) {
+    pub fn tick(&mut self, dt: f32, now: Instant) {
         self.level.tick(dt);
+        // Reschedule a finished blink here, not only when drawing: asleep, no
+        // frame is drawn after the blink, and a stale `next_blink` would make
+        // `motion` ask to be woken "now" forever.
+        if matches!(self.state, BuddyState::Idle | BuddyState::Working(_)) {
+            self.catch_up_blink(now);
+        }
+    }
+
+    /// Schedules the next blink once the current one has run its course.
+    /// True while a blink is in progress or due.
+    fn catch_up_blink(&mut self, now: Instant) -> bool {
+        if now < self.next_blink {
+            return false;
+        }
+        if now.duration_since(self.next_blink).as_secs_f32() >= BLINK {
+            self.schedule_blink(now);
+            return false;
+        }
+        true
     }
 
     pub fn motion(&self, now: Instant) -> Motion {
@@ -268,17 +287,13 @@ impl Buddy {
 
     fn idle(&mut self, now: Instant, clock: f32) -> Grid {
         let mut g = bitmap(&IDLE, tokens::PAPER);
-        if now >= self.next_blink {
+        if self.catch_up_blink(now) {
             let bt = now.duration_since(self.next_blink).as_secs_f32();
-            if bt >= BLINK {
-                self.schedule_blink(now);
-            } else {
-                // Lids close from the top: the upper eye dots dim, the lower dip.
-                let close = (bt / BLINK * std::f32::consts::PI).sin();
-                for c in [2, 6] {
-                    g[2][c].b *= 1.0 - close;
-                    g[3][c].b *= 1.0 - 0.35 * close;
-                }
+            // Lids close from the top: the upper eye dots dim, the lower dip.
+            let close = (bt / BLINK * std::f32::consts::PI).sin();
+            for c in [2, 6] {
+                g[2][c].b *= 1.0 - close;
+                g[3][c].b *= 1.0 - 0.35 * close;
             }
         }
         if self.awake {
@@ -439,5 +454,29 @@ fn ease(k: f32) -> f32 {
         4.0 * k * k * k
     } else {
         1.0 - (-2.0 * k + 2.0).powi(3) / 2.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asleep_blink_does_not_spin() {
+        let t0 = Instant::now();
+        let mut b = Buddy::new(t0);
+        b.set_awake(false);
+        let blink = b.next_blink;
+        // Mid-blink: animating.
+        let mid = blink + Duration::from_secs_f32(BLINK / 2.0);
+        b.tick(0.0, mid);
+        assert_eq!(b.motion(mid), Motion::Fast);
+        // The blink ends with no draw in between (asleep, not animating).
+        let after = blink + Duration::from_secs_f32(BLINK + 0.05);
+        b.tick(0.0, after);
+        match b.motion(after) {
+            Motion::Still(Some(t)) => assert!(t > after, "wake deadline must be in the future"),
+            m => panic!("expected Still(Some(_)), got {m:?}"),
+        }
     }
 }

@@ -454,7 +454,7 @@ impl View {
         self.reveal.set(if peek { 1.0 } else { 0.0 });
     }
 
-    fn tick(&mut self, dt: f32) -> bool {
+    fn tick(&mut self, dt: f32, now: Instant) -> bool {
         let mut moving = false;
         for s in [
             &mut self.w,
@@ -465,7 +465,7 @@ impl View {
         ] {
             moving |= s.tick(dt);
         }
-        self.buddy.tick(dt);
+        self.buddy.tick(dt, now);
         moving
     }
 
@@ -1342,7 +1342,7 @@ impl Island {
         self.view.layout(now);
 
         // ---- animate + draw
-        let moving = self.view.tick(dt) | self.shown.tick(dt);
+        let moving = self.view.tick(dt, now) | self.shown.tick(dt);
         let animating = moving || !matches!(self.view.buddy.motion(now), Motion::Still(_));
         if !(animating || self.dirty) {
             return;
@@ -1765,7 +1765,7 @@ mod tests {
             if let BuddyState::Listening(l) = st {
                 v.buddy.set(BuddyState::Listening(l), now);
                 for _ in 0..200 {
-                    v.buddy.tick(0.01);
+                    v.buddy.tick(0.01, now);
                 }
             }
             settle(&mut v, now);

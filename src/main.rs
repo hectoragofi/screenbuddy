@@ -41,6 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 fn main() {
+    log_panics();
     if std::env::args().any(|a| a == "--mcp") {
         mcp::run();
         return;
@@ -101,6 +102,27 @@ fn main() {
         win::message_box(&format!("screenbuddy failed to start:\n{e:#}"));
     }
     desktop::shutdown();
+}
+
+/// Release builds abort on panic and have no console, so without this a panic
+/// on any thread kills the app with nothing to go on. Writes to the log file
+/// only (never stdout, which `--mcp` speaks on), then runs the default hook.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("(non-string payload)");
+        let at = info.location().map(|l| l.to_string()).unwrap_or_else(|| "unknown location".into());
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        let bt = std::backtrace::Backtrace::force_capture();
+        config::log(&format!("panic on thread '{name}' at {at}: {msg}\n{bt}"));
+        default(info);
+    }));
 }
 
 struct App {

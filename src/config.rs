@@ -487,9 +487,41 @@ pub fn load() -> (Config, Option<String>) {
 }
 
 pub fn save(cfg: &Config) -> std::io::Result<()> {
+    save_to(&config_path(), cfg)
+}
+
+/// Serialises saves so concurrent writers never interleave on the shared
+/// `config.toml.tmp` path.
+static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Writes `cfg` to `path`, refusing to replace an existing file that does not
+/// parse: callers that ignored `load`'s error hold defaults, and saving them
+/// would wipe the user's settings (API keys included) over a single typo.
+fn save_to(path: &std::path::Path, cfg: &Config) -> std::io::Result<()> {
     let body = toml::to_string_pretty(cfg).map_err(std::io::Error::other)?;
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let parses = std::str::from_utf8(&bytes).ok().is_some_and(|t| toml::from_str::<Config>(t).is_ok());
+            if !parses {
+                // Keep a copy of the broken file; skip the write (and the log
+                // line, since Settings retries every frame) if it is already there.
+                let bad = path.with_extension("toml.bad");
+                if std::fs::read(&bad).ok().as_deref() != Some(&bytes[..]) {
+                    let _ = std::fs::write(&bad, &bytes);
+                    log(&format!("config save refused: {} does not parse (copy at {})", path.display(), bad.display()));
+                }
+                return Err(std::io::Error::other(format!(
+                    "{} has an error, so it was not overwritten (copy at {}); fix or delete it, then try again",
+                    path.display(),
+                    bad.display()
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     // Write-then-rename so a crash never leaves a half-written file.
-    let path = config_path();
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, format!("{HEADER}{body}"))?;
     std::fs::rename(tmp, path)
@@ -516,5 +548,57 @@ mod tests {
         assert_eq!(toml::from_str::<Config>(&s).unwrap(), c);
         assert_eq!(hex_rgb("#0A84FF"), Some([10, 132, 255]));
         assert_eq!(rgb_hex([10, 132, 255]), "#0A84FF");
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("screenbuddy-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_creates_missing_and_replaces_valid() {
+        let dir = temp_dir("save-ok");
+        let path = dir.join("config.toml");
+        save_to(&path, &Config::default()).unwrap();
+        assert!(path.exists());
+        save_to(&path, &Config::default()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), Config::default());
+        assert!(!dir.join("config.toml.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_unparseable() {
+        let dir = temp_dir("save-bad");
+        let path = dir.join("config.toml");
+        let broken = "api_key = \"sk-secret\"\nthis is = = a typo\n";
+        std::fs::write(&path, broken).unwrap();
+        let err = save_to(&path, &Config::default()).unwrap_err();
+        assert!(err.to_string().contains("fix or delete"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        assert_eq!(std::fs::read_to_string(dir.join("config.toml.bad")).unwrap(), broken);
+        // A second refusal keeps both files intact.
+        assert!(save_to(&path, &Config::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_fail() {
+        let dir = temp_dir("save-race");
+        let path = dir.join("config.toml");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = path.clone();
+                std::thread::spawn(move || (0..10).for_each(|_| save_to(&p, &Config::default()).unwrap()))
+            })
+            .collect();
+        handles.into_iter().for_each(|h| h.join().unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(toml::from_str::<Config>(&text).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

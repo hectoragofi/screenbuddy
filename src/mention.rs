@@ -54,7 +54,7 @@ pub type Pending = Receiver<Result<Chip, String>>;
 
 /// The `@word` being typed at the end of the input, as (byte start, query).
 pub fn active_token(input: &str) -> Option<(usize, &str)> {
-    let start = input.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let start = word_start(input);
     let tok = &input[start..];
     let q = tok.strip_prefix('@')?;
     // A typed link is resolved on space/Enter, not through the menu.
@@ -67,9 +67,21 @@ pub fn active_token(input: &str) -> Option<(usize, &str)> {
 /// `@https://…` typed and finished with a space: (byte start, url).
 pub fn typed_url(input: &str) -> Option<(usize, String)> {
     let body = input.strip_suffix(' ')?;
-    let start = body.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+    let start = word_start(body);
     let url = body[start..].strip_prefix('@')?;
     (url.starts_with("http://") || url.starts_with("https://")).then(|| (start, url.to_string()))
+}
+
+/// Byte offset just past the last whitespace char (which may be multibyte,
+/// e.g. NBSP), or 0.
+fn word_start(s: &str) -> usize {
+    s.char_indices().rev().find(|(_, c)| c.is_whitespace()).map(|(i, c)| i + c.len_utf8()).unwrap_or(0)
+}
+
+/// Whether `s` starts with the tag name `name` as a whole word, so `head`
+/// does not match `header`.
+fn starts_with_tag(s: &str, name: &str) -> bool {
+    s.strip_prefix(name).is_some_and(|r| !r.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-'))
 }
 
 impl Menu {
@@ -288,17 +300,20 @@ pub fn html_text(html: &str) -> (String, String) {
     while i < b.len() {
         if b[i] == b'<' {
             let rest = &lower[i..];
-            let skip = ["script", "style", "noscript", "svg", "head"].iter().find(|t| rest[1..].starts_with(**t));
+            let skip = ["script", "style", "noscript", "svg", "head"].iter().find(|t| starts_with_tag(&rest[1..], t));
             if let Some(t) = skip {
                 let close = format!("</{t}");
                 i = rest
-                    .find(&close)
-                    .and_then(|e| lower[i + e..].find('>').map(|g| i + e + g + 1))
+                    .match_indices(&close)
+                    .find(|(e, _)| starts_with_tag(&rest[e + 2..], t))
+                    .and_then(|(e, _)| lower[i + e..].find('>').map(|g| i + e + g + 1))
                     .unwrap_or(b.len());
                 continue;
             }
-            let end = rest.find('>').map(|e| i + e + 1).unwrap_or(b.len());
-            let tag = &lower[i + 1..end.saturating_sub(1).max(i + 1)];
+            // An unclosed `<` at the end: nothing readable follows.
+            let Some(e) = rest.find('>') else { break };
+            let end = i + e + 1;
+            let tag = &lower[i + 1..i + e];
             let name = tag.trim_start_matches('/').split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("");
             if matches!(name, "p" | "br" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "article" | "pre" | "blockquote") {
                 out.push('\n');
@@ -385,5 +400,27 @@ mod tests {
         let (t, x) = html_text("<html><head><title>Hi &amp; bye</title><style>p{}</style></head><body><p>One</p><script>x()</script><div>Two  three</div></body></html>");
         assert_eq!(t, "Hi & bye");
         assert_eq!(x, "One\nTwo three\n");
+    }
+
+    #[test]
+    fn multibyte_whitespace() {
+        assert_eq!(active_token("hi\u{a0}@cl"), Some((4, "cl")));
+        assert_eq!(active_token("hi\u{3000}@cl"), Some((5, "cl")));
+        assert_eq!(active_token("\u{3000}"), None);
+        assert_eq!(typed_url("see\u{a0}@https://x.com "), Some((5, "https://x.com".into())));
+        assert_eq!(typed_url("see\u{3000}@https://x.com "), Some((6, "https://x.com".into())));
+        assert_eq!(typed_url("\u{3000} "), None);
+    }
+
+    #[test]
+    fn html_edge_cases() {
+        let (_, x) = html_text("<p>Hi</p><b héllo wörld ñ");
+        assert_eq!(x, "Hi\n");
+        let (_, x) = html_text("<p>ok</p><é");
+        assert_eq!(x, "ok\n");
+        let (_, x) = html_text("<head><title>T</title></head><header>Top</header><p>Body</p>");
+        assert_eq!(x, "Top\nBody\n");
+        let (_, x) = html_text("<svgx>kept</svgx><svg><text>gone</text></svg>end");
+        assert_eq!(x, "keptend\n");
     }
 }
