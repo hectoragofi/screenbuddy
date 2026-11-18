@@ -134,6 +134,10 @@ pub struct Conversation {
     /// What the palette did locally (fast paths) since the model last saw the
     /// conversation, so the next Claude CLI turn still has the context.
     pub pending_note: Option<String>,
+    /// Tool calls that already ran in a turn that then failed or was stopped
+    /// (empty otherwise). That turn is kept instead of rolled back, so the UI
+    /// can keep it on the thread and a retry doesn't do them again.
+    pub acted: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -198,6 +202,10 @@ pub struct Out {
     ctx: egui::Context,
     dctx: Option<crate::desktop::Ctx>,
     watch: Watch,
+    /// The turn's stop flag (set by `spawn`): a stopped turn runs no more actions.
+    cancel: Option<Arc<AtomicBool>>,
+    /// What this turn's tools actually did, for `Conversation::acted`.
+    acted: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Stall detector shared by a turn's worker and its helper threads: the time
@@ -251,7 +259,19 @@ impl Out {
             ctx,
             dctx: None,
             watch: Watch::default(),
+            cancel: None,
+            acted: Default::default(),
         }
+    }
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+    /// Notes a tool call that ran (a short description for the thread).
+    fn ran(&self, what: String) {
+        self.acted.lock().unwrap().push(what.chars().take(200).collect());
+    }
+    fn acted(&self) -> Vec<String> {
+        self.acted.lock().unwrap().clone()
     }
     fn send(&self, ev: Ev) {
         let _ = self.tx.send(ev);
@@ -263,13 +283,25 @@ impl Out {
     pub(crate) fn status(&self, s: impl Into<String>) {
         self.send(Ev::Status(s.into()));
     }
-    /// Asks the user to approve an action; false on deny or timeout.
+    /// Asks the user to approve an action; false on deny, timeout or stop.
     pub fn approve(&self, intent: &str, detail: &str) -> bool {
+        if self.cancelled() {
+            return false;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let _hold = self.watch.hold();
         self.send(Ev::Approve(intent.to_string(), detail.to_string(), tx));
-        rx.recv_timeout(std::time::Duration::from_secs(300))
-            .unwrap_or(false)
+        let until = Instant::now() + Duration::from_secs(300);
+        let yes = loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(v) => break v,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if !self.cancelled() && Instant::now() < until => {}
+                Err(_) => break false,
+            }
+        };
+        // Stopped while the card was up: a late Allow must not run the action.
+        yes && !self.cancelled()
     }
 
     /// Runs one `desktop` tool call: read-only commands directly, actions after approval.
@@ -287,8 +319,14 @@ impl Out {
             }
             self.status("acting…");
         }
+        if self.cancelled() {
+            return ("Stopped by the user before this ran.".into(), true);
+        }
         let dctx = self.dctx.clone().unwrap_or_else(|| crate::desktop::Ctx { session: crate::desktop::app_session().to_string(), cursor: None });
         let out = crate::desktop::exec(exe, &args, &intent, &dctx);
+        if !crate::desktop::is_read_only(&args) {
+            self.ran(format!("{intent} ({})", args.join(" ")));
+        }
         let ok = serde_json::from_str::<Value>(&out)
             .ok()
             .and_then(|v| v["ok"].as_bool())
@@ -299,12 +337,15 @@ impl Out {
 
     /// Dispatches a tool call by name.
     fn tool(&self, name: &str, input: Value, exe: Option<&std::path::Path>) -> (String, bool) {
-        match (name, exe) {
+        if let ("desktop", Some(exe)) = (name, exe) {
+            return self.desktop(&input, exe); // notes what ran itself
+        }
+        let what = format!("{name} {input}");
+        let (text, is_err) = match (name, exe) {
             ("draw", _) => match self.draw(input) {
                 Ok(t) => (t, false),
                 Err(e) => (e, true),
             },
-            ("desktop", Some(exe)) => self.desktop(&input, exe),
             ("spawn_agent", _) => self.spawn_agent(&input),
             ("start_walkthrough", _) => crate::walk::request(&input),
             ("remember", _) => self.remember(&input),
@@ -313,7 +354,11 @@ impl Out {
                 false,
             ),
             _ => ("error: unknown tool".into(), true),
+        };
+        if !is_err {
+            self.ran(what);
         }
+        (text, is_err)
     }
 
     /// `remember` from the brain: saves the fact (from the user) and tells the UI.
@@ -370,11 +415,14 @@ pub fn spawn(turn: Turn, out: Out) {
     }
     std::thread::spawn(move || {
         let mut conv = turn.conv.clone();
+        conv.acted.clear();
         if conv.desktop_session.is_empty() {
             conv.desktop_session = crate::desktop::app_session().to_string();
         }
         let mut out = out;
         out.dctx = Some(crate::desktop::Ctx::from_config(&turn.cfg, conv.desktop_session.clone()));
+        out.cancel = Some(turn.cancel.clone());
+        out.acted = Default::default();
         let out = out;
         // A bare "open youtube" needs no model: open it and answer at once.
         // Anything less trivial still goes through the normal turn. Users who
@@ -405,8 +453,7 @@ pub fn spawn(turn: Turn, out: Out) {
                         .push(json!({"role": "assistant", "content": answer.clone()}));
                 }
                 _ => {
-                    conv.anthropic
-                        .push(json!({"role": "user", "content": turn.question.clone()}));
+                    push_user(&mut conv.anthropic, json!(turn.question.clone()));
                     conv.anthropic
                         .push(json!({"role": "assistant", "content": answer.clone()}));
                 }
@@ -431,10 +478,114 @@ pub fn spawn(turn: Turn, out: Out) {
             out.send(Ev::Error(format!("{e:#}")));
         }
         if res.is_err() || cancelled {
-            rollback(&turn, &mut conv);
+            settle(&turn, &mut conv, out.acted());
         }
         out.send(Ev::Done(conv));
     });
+}
+
+/// A failed or cancelled turn: rolled back when nothing ran yet; once a tool
+/// has acted, kept (with every tool_use paired) so the model and a retry see
+/// what was already done instead of doing it again.
+fn settle(turn: &Turn, conv: &mut Conversation, acted: Vec<String>) {
+    if acted.is_empty() {
+        rollback(turn, conv);
+    } else {
+        pair_tool_uses(&mut conv.anthropic);
+        conv.acted = acted;
+    }
+}
+
+/// Error text for a tool_use that never ran.
+const NOT_RUN: &str = "not run: reply was cut off";
+
+/// Gives every Anthropic `tool_use` a `tool_result` in the next user message
+/// (adding that message if needed), answering ones that never ran with an
+/// error. An unpaired tool_use makes the API reject every later request.
+pub(crate) fn pair_tool_uses(msgs: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < msgs.len() {
+        let ids: Vec<Value> = if msgs[i]["role"] == "assistant" {
+            msgs[i]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|b| b["type"] == "tool_use")
+                .map(|b| b["id"].clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if ids.is_empty() {
+            i += 1;
+            continue;
+        }
+        if msgs.get(i + 1).is_none_or(|m| m["role"] != "user") {
+            msgs.insert(i + 1, json!({"role": "user", "content": []}));
+        }
+        let mut content = blocks(msgs[i + 1]["content"].take());
+        let missing: Vec<Value> = ids
+            .into_iter()
+            .filter(|id| !content.iter().any(|b| b["type"] == "tool_result" && b["tool_use_id"] == *id))
+            .map(|id| json!({"type": "tool_result", "tool_use_id": id, "content": NOT_RUN, "is_error": true}))
+            .collect();
+        // Tool results go first in a user message.
+        content.splice(0..0, missing);
+        msgs[i + 1]["content"] = Value::Array(content);
+        i += 2;
+    }
+}
+
+/// Message content as a list of blocks.
+fn blocks(c: Value) -> Vec<Value> {
+    match c {
+        Value::Array(a) => a,
+        Value::String(s) if !s.is_empty() => vec![json!({"type": "text", "text": s})],
+        _ => Vec::new(),
+    }
+}
+
+/// Adds a user message, merged into the last one when that is a user
+/// message too (tool results kept after a cut-off reply).
+pub(crate) fn push_user(msgs: &mut Vec<Value>, content: Value) {
+    match msgs.last_mut() {
+        Some(last) if last["role"] == "user" => {
+            let mut c = blocks(last["content"].take());
+            c.extend(blocks(content));
+            last["content"] = Value::Array(c);
+        }
+        _ => msgs.push(json!({"role": "user", "content": content})),
+    }
+}
+
+/// A round cut short after a tool ran: keeps what arrived of the reply (text,
+/// signed thinking, tool calls that got a result) and those results.
+fn keep_partial(msgs: &mut Vec<Value>, blocks: impl IntoIterator<Item = Value>, results: Vec<Value>) {
+    let results: Vec<Value> = results.into_iter().filter(|r| !r.is_null()).collect();
+    let content: Vec<Value> = blocks
+        .into_iter()
+        .filter(|b| match b["type"].as_str() {
+            Some("text") => b["text"].as_str().is_some_and(|t| !t.is_empty()),
+            Some("thinking") => b["signature"].as_str().is_some_and(|s| !s.is_empty()),
+            Some("redacted_thinking") => true,
+            Some("tool_use") => results.iter().any(|r| r["tool_use_id"] == b["id"]),
+            _ => false, // incomplete server tool rounds
+        })
+        .map(|mut b| {
+            // Citations point at search results that were not kept.
+            if let Some(o) = b.as_object_mut() {
+                o.remove("citations");
+            }
+            b
+        })
+        .collect();
+    if content.is_empty() {
+        return;
+    }
+    msgs.push(json!({"role": "assistant", "content": content}));
+    if !results.is_empty() {
+        msgs.push(json!({"role": "user", "content": results}));
+    }
 }
 
 /// Undoes a failed or cancelled turn so asking again starts from a clean
@@ -622,8 +773,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
     if let Some(t) = &turn.thread {
         conv.anthropic = window_messages(t);
     }
-    conv.anthropic
-        .push(json!({"role": "user", "content": content}));
+    push_user(&mut conv.anthropic, Value::Array(content));
 
     let client = http()?;
     let exe = turn.cfg.desktop_exe();
@@ -776,29 +926,43 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
                 _ => {}
             }
             Ok(true)
-        })?;
+        });
 
-        if turn.cancel.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if let Some(e) = stream_err {
-            anyhow::bail!("{e}");
-        }
-        if !ended {
+        let cancelled = turn.cancel.load(Ordering::Relaxed);
+        if cancelled || stream_err.is_some() || !matches!(ended, Ok(true)) {
+            // Tools ran mid-stream: keep this round's part so it isn't lost.
+            if !out.acted().is_empty() {
+                keep_partial(&mut conv.anthropic, blocks.into_values(), tool_results);
+            }
+            ended?;
+            if cancelled {
+                return Ok(());
+            }
+            if let Some(e) = stream_err {
+                anyhow::bail!("{e}");
+            }
             return Err(cut_off());
         }
         conv.anthropic.push(
             json!({"role": "assistant", "content": blocks.into_values().collect::<Vec<_>>()}),
         );
-        for (i, id, name, input) in deferred {
-            let r = crate::vision::handle(&name, &input, out);
-            tool_results[i] = json!({"type": "tool_result", "tool_use_id": id, "content": r.anthropic(), "is_error": r.is_error});
-        }
-        match stop_reason.as_str() {
-            "tool_use" if !tool_results.is_empty() => {
-                conv.anthropic
-                    .push(json!({"role": "user", "content": tool_results}));
+        // zoom/watch only when the model waits for them; a reply that ended
+        // otherwise leaves them unrun (and paired as such below).
+        if stop_reason == "tool_use" {
+            for (i, id, name, input) in deferred {
+                let r = crate::vision::handle(&name, &input, out);
+                tool_results[i] = json!({"type": "tool_result", "tool_use_id": id, "content": r.anthropic(), "is_error": r.is_error});
             }
+        }
+        let tool_results: Vec<Value> = tool_results.into_iter().filter(|r| !r.is_null()).collect();
+        let answered = !tool_results.is_empty();
+        if answered {
+            conv.anthropic
+                .push(json!({"role": "user", "content": tool_results}));
+        }
+        pair_tool_uses(&mut conv.anthropic);
+        match stop_reason.as_str() {
+            "tool_use" if answered => {}
             "pause_turn" => {}
             "refusal" => {
                 out.delta("\n\n*The model declined this request.*");
@@ -1736,5 +1900,124 @@ mod tests {
         rollback(&turn, &mut conv);
         assert!(conv.anthropic.is_empty());
         assert!(!conv.image_sent, "the screenshot must be resent on retry");
+    }
+
+    /// Every tool_use is answered by a tool_result in the next (user) message,
+    /// tool results lead that message, and roles alternate.
+    fn assert_paired(msgs: &[Value]) {
+        for w in msgs.windows(2) {
+            assert_ne!(w[0]["role"], w[1]["role"], "roles alternate: {msgs:?}");
+        }
+        for (i, m) in msgs.iter().enumerate() {
+            for b in m["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_use") {
+                let next = msgs.get(i + 1).expect("a reply to the tool_use");
+                assert_eq!(next["role"], "user");
+                let c = next["content"].as_array().unwrap();
+                assert!(c.iter().any(|r| r["type"] == "tool_result" && r["tool_use_id"] == b["id"]), "{msgs:?}");
+                let first_other = c.iter().position(|r| r["type"] != "tool_result").unwrap_or(c.len());
+                assert!(c[first_other..].iter().all(|r| r["type"] != "tool_result"));
+            }
+        }
+    }
+
+    fn tool_use(id: &str) -> Value {
+        json!({"type": "tool_use", "id": id, "name": "desktop", "input": {}})
+    }
+
+    #[test]
+    fn cut_off_reply_with_tool_use_is_paired() {
+        // A reply that stopped for max_tokens mid tool call, then a follow-up.
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "Sure"}, tool_use("t1")]}),
+        ];
+        pair_tool_uses(&mut msgs);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["content"][0]["content"], NOT_RUN);
+        assert_eq!(msgs[2]["content"][0]["is_error"], true);
+        push_user(&mut msgs, json!("next question"));
+        assert_paired(&msgs);
+        assert_eq!(msgs[2]["content"][1]["text"], "next question");
+
+        // An already-saved broken history: the follow-up came right after.
+        let mut msgs = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "content": [tool_use("t1"), tool_use("t2")]}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]}),
+            json!({"role": "assistant", "content": [tool_use("t3")]}),
+            json!({"role": "user", "content": "follow-up"}),
+        ];
+        pair_tool_uses(&mut msgs);
+        assert_paired(&msgs);
+        assert_eq!(msgs.len(), 5);
+        pair_tool_uses(&mut msgs);
+        assert_eq!(msgs[2]["content"].as_array().unwrap().len(), 2, "idempotent");
+    }
+
+    #[test]
+    fn cancelled_after_approval_does_not_execute() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut out = Out::new(tx, egui::Context::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        out.cancel = Some(cancel.clone());
+        // The user hits Stop, then Allow on the card that was still up.
+        std::thread::spawn(move || {
+            while let Ok(ev) = rx.recv() {
+                if let Ev::Approve(_, _, reply) = ev {
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = reply.send(true);
+                }
+            }
+        });
+        let input = json!({"args": ["click", "@s1:e9"], "intent": "Click Send in Outlook"});
+        let exe = std::path::Path::new("C:\\does-not-exist\\agent-desktop.exe");
+        let (text, is_err) = out.desktop(&input, exe);
+        assert!(is_err);
+        assert!(text.contains("declined"), "{text}");
+        assert!(out.acted().is_empty(), "nothing ran");
+        // Once stopped, later actions are refused without asking.
+        assert!(!out.approve("Send another", "click @s1:e10"));
+    }
+
+    #[test]
+    fn failed_turn_keeps_what_already_ran() {
+        let turn = Turn {
+            cfg: Config::default(),
+            conv: Default::default(),
+            question: "q".into(),
+            image: None,
+            attachments: Vec::new(),
+            cancel: Default::default(),
+            thread: None,
+        };
+        let partial = || {
+            let mut conv = turn.conv.clone();
+            conv.anthropic.push(json!({"role": "user", "content": [{"type": "text", "text": "q"}]}));
+            // The stream died after t1 ran and while t2's input was arriving.
+            let blocks = vec![
+                json!({"type": "thinking", "thinking": "half"}),
+                json!({"type": "text", "text": "Sending it now."}),
+                tool_use("t1"),
+                tool_use("t2"),
+            ];
+            let results = vec![json!({"type": "tool_result", "tool_use_id": "t1", "content": "{\"ok\":true}", "is_error": false})];
+            keep_partial(&mut conv.anthropic, blocks, results);
+            conv
+        };
+        let mut conv = partial();
+        settle(&turn, &mut conv, vec!["Click Send (click @s1:e9)".into()]);
+        assert_paired(&conv.anthropic);
+        assert_eq!(conv.anthropic.len(), 3);
+        let said = conv.anthropic[1]["content"].as_array().unwrap();
+        assert_eq!(said.len(), 2, "unsigned thinking and the unrun call are dropped");
+        assert_eq!(said[1]["id"], "t1");
+        assert_eq!(conv.anthropic[2]["content"][0]["tool_use_id"], "t1");
+        assert_eq!(conv.acted.len(), 1);
+
+        // Nothing ran before the failure: rolled back as before.
+        let mut conv = partial();
+        settle(&turn, &mut conv, Vec::new());
+        assert!(conv.anthropic.is_empty());
+        assert!(conv.acted.is_empty());
     }
 }
