@@ -3,6 +3,7 @@
 mod agent_history;
 mod agents;
 mod apeiron;
+mod brain;
 mod buddy;
 mod caption;
 mod cards;
@@ -381,6 +382,7 @@ fn headless(q: &str) -> i32 {
                 code = 2;
             }
             llm::Ev::Spawned(id) => println!("\n[spawned agent {id}]"),
+            llm::Ev::Remembered(f) => println!("\n[brain] {}: {}", f.topic, f.text),
             llm::Ev::Done(_) => break,
         }
         let _ = std::io::stdout().flush();

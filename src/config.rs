@@ -27,6 +27,21 @@ pub struct Config {
     pub input: InputCfg,
     pub agents: AgentsCfg,
     pub walk: WalkCfg,
+    pub brain: BrainCfg,
+}
+
+/// The shared brain: facts the buddy saves and every agent reads.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct BrainCfg {
+    /// Save durable facts you state and share them with every agent.
+    pub enabled: bool,
+}
+
+impl Default for BrainCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Step-by-step walkthroughs ("show me how to ...").
@@ -287,6 +302,7 @@ impl Default for Config {
             input: InputCfg::default(),
             agents: AgentsCfg::default(),
             walk: WalkCfg::default(),
+            brain: BrainCfg::default(),
         }
     }
 }

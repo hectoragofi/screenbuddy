@@ -1177,7 +1177,7 @@ fn ask_model(
             Ok(llm::Ev::Approve(_, _, reply)) => {
                 let _ = reply.send(false);
             }
-            Ok(llm::Ev::Status(_) | llm::Ev::Spawned(_)) => {}
+            Ok(llm::Ev::Status(_) | llm::Ev::Spawned(_) | llm::Ev::Remembered(_)) => {}
             Ok(llm::Ev::Done(c)) => {
                 return match err {
                     Some(e) if text.trim().is_empty() => (Err(e), c),

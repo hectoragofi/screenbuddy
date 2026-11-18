@@ -20,6 +20,7 @@
 
 use crate::agents::drive::DriveEvent;
 use crate::agents::{self, Agent, AgentEvent, Answer, AskKind, Question, Status};
+use crate::brain::Fact;
 use crate::caption::{self, Block, Span};
 use crate::ui::tokens::{self, Rgba};
 use crate::ui::{self, Face, Layer, MonitorInfo, Spring, TextStyle};
@@ -45,6 +46,8 @@ use windows::core::PCWSTR;
 enum Msg {
     Event(String, AgentEvent),
     Open(String),
+    /// The user told the buddy a fact: show who reads it.
+    Brain(Fact),
     /// The island moved: re-check where the stack hangs.
     Wake,
     Refresh,
@@ -109,6 +112,20 @@ pub fn open(id: &str) {
     post(Msg::Open(id.to_string()));
 }
 
+/// Shows a "Saved to the brain" card for this fact: the fact, each running
+/// agent that reads it, and Open (the brain list in Settings).
+pub fn brain_saved(f: &Fact) {
+    start();
+    post(Msg::Brain(f.clone()));
+}
+
+/// The card id of a brain fact (for caption notices that open it).
+pub fn brain_card_id(f: &Fact) -> String {
+    format!("{BRAIN_PREFIX}{}", f.id)
+}
+
+const BRAIN_PREFIX: &str = "brain:";
+
 /// Redraws the cards (e.g. a spoken follow-up started or stopped).
 pub fn refresh() {
     if TID.load(Ordering::Relaxed) != 0 {
@@ -168,6 +185,8 @@ enum Btn {
     Once,
     Deny,
     Send,
+    /// Brain card: open the brain list.
+    Brain,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +242,15 @@ struct CardView {
     /// Apeiron is there, so the agent has a desk to show.
     desk: bool,
     drive: Drive,
+    /// A "Saved to the brain" card instead of an agent's.
+    brain: Option<BrainView>,
+}
+
+/// A fact the user just saved and the agents that read it.
+#[derive(Clone, Debug, PartialEq)]
+struct BrainView {
+    fact: Fact,
+    readers: Vec<String>,
 }
 
 /// Where the agent is with the user's mouse and keyboard.
@@ -927,8 +955,92 @@ fn readout(v: &CardView, k: Kind) -> (String, Rgba) {
     (elapsed_label(end.saturating_sub(start)), c)
 }
 
+/// The "Saved to the brain" card: topic, the fact and who said it, one row
+/// per agent that reads it, then Open / Close.
+fn compose_brain(v: &CardView, b: &BrainView, pen: &mut Pen) -> (f32, f32) {
+    let s = pen.s;
+    let inner = CARD_W - 2.0 * PAD;
+    pen.hit(0.0, 0.0, CARD_W, 10_000.0, Hit::Card);
+    let mut y = 16.0;
+    // ---- header: ◉ SAVED TO THE BRAIN
+    let head_mid = y + 7.0;
+    pen.circle(PAD + 3.0, head_mid, 6.0, tokens::SIGNAL.fade(0.18));
+    pen.circle(PAD + 3.0, head_mid, 3.0, tokens::SIGNAL);
+    pen.text_mid("Saved to the brain", PAD + 14.0, head_mid, &label_style(s).color(tokens::SIGNAL));
+    y += 22.0;
+    // ---- topic
+    let ns = name_style(s);
+    for l in wrap_max(&b.fact.topic, &ns, inner, s, 2) {
+        pen.line(&l, PAD, y, &ns);
+        y += LINE + 1.0;
+    }
+    y += 9.0;
+    let section = |pen: &mut Pen, y: &mut f32| {
+        pen.rect(PAD, *y, inner, 1.0 / s, tokens::LINE);
+        *y += 12.0;
+    };
+    // ---- the fact, with a signal rule beside it
+    section(pen, &mut y);
+    let fs = body_style(s);
+    let top = y;
+    for l in wrap_max(&b.fact.text, &fs, inner - 12.0, s, 4) {
+        pen.line(&l, PAD + 12.0, y, &fs);
+        y += LINE;
+    }
+    pen.rounded(PAD + 1.0, top + 2.0, 2.0, (y - top - 4.0).max(2.0), 1.0, tokens::SIGNAL);
+    y += 2.0;
+    let age = crate::brain::age_label(b.fact.created, v.now.saturating_mul(1000));
+    let meta = format!("{} \u{00b7} {age}", b.fact.from_label());
+    pen.line(&meta, PAD + 12.0, y, &small_style(s));
+    y += LINE + 10.0;
+    // ---- who reads it
+    section(pen, &mut y);
+    let rs = body_style(s).size(12.0 * s);
+    let mute = small_style(s).color(tokens::MUTE);
+    if b.readers.is_empty() {
+        for l in wrap_max("No agents running. New ones read it when they start.", &mute, inner, s, 2) {
+            pen.line(&l, PAD, y, &mute);
+            y += LINE;
+        }
+    } else {
+        const ROWS: usize = 4;
+        for name in b.readers.iter().take(ROWS) {
+            let mid = y + LINE / 2.0;
+            pen.circle(PAD + 3.0, mid, 2.5, tokens::OK);
+            let tail = " \u{2014} reads it";
+            let tail_w = tw(tail, &mute, s);
+            let n = ui::ellipsize(name, &rs, (inner - 16.0 - tail_w) * s);
+            let w = pen.line(&n, PAD + 16.0, y, &rs);
+            pen.line(tail, PAD + 16.0 + w, y, &mute);
+            y += LINE + 2.0;
+        }
+        if b.readers.len() > ROWS {
+            pen.line(&format!("+{} more", b.readers.len() - ROWS), PAD + 16.0, y, &mute);
+            y += LINE;
+        }
+    }
+    y += 6.0;
+    // ---- footer
+    let foot = small_style(s).color(tokens::MUTE.fade(0.8));
+    for l in wrap_max("No hand-offs. Each agent checks the brain.", &foot, inner, s, 2) {
+        pen.line(&l, PAD, y, &foot);
+        y += LINE;
+    }
+    y += 10.0;
+    let h = v.hover;
+    button(pen, PAD, y, None, "Open", BtnLook::Ghost, Btn::Brain, h, None);
+    let close = "Close";
+    let cw = tw(close, &label_style(s), s) + 26.0;
+    button(pen, CARD_W - PAD - cw, y, Some(cw), close, BtnLook::Quiet, Btn::Dismiss, h, None);
+    y += BTN_H;
+    (y + 14.0, 0.0)
+}
+
 /// Lays out (and with a pixmap, draws) one card's content.
 fn compose(v: &CardView, pen: &mut Pen) -> (f32, f32) {
+    if let Some(b) = &v.brain {
+        return compose_brain(v, b, pen);
+    }
     let s = pen.s;
     let a = &v.agent;
     let k = kind(a);
@@ -1660,6 +1772,7 @@ struct Card {
     scroll: f32,
     drive: Drive,
     cache: Option<(CardView, Drawn)>,
+    brain: Option<BrainView>,
 }
 
 impl Card {
@@ -1688,6 +1801,27 @@ impl Card {
             scroll: 0.0,
             drive: Drive::Off,
             cache: None,
+            brain: None,
+        }
+    }
+
+    /// A "Saved to the brain" card (it leaves on its own once idle).
+    fn brain(fact: Fact, now: Instant) -> Self {
+        let readers = agents::list()
+            .into_iter()
+            .filter(|a| a.status.is_active())
+            .map(|a| a.name)
+            .collect();
+        let agent = Agent {
+            id: brain_card_id(&fact),
+            name: fact.topic.clone(),
+            status: Status::Done,
+            created: now_unix(),
+            ..Default::default()
+        };
+        Self {
+            brain: Some(BrainView { fact, readers }),
+            ..Self::new(agent, now)
         }
     }
 
@@ -1909,6 +2043,12 @@ impl Cards {
             match m {
                 Msg::Event(id, ev) => self.on_event(id, ev, now),
                 Msg::Open(id) => self.open(&id, now),
+                Msg::Brain(f) => {
+                    let id = brain_card_id(&f);
+                    self.cards.retain(|c| c.id != id);
+                    self.cards.push(Card::brain(f, now));
+                    self.dirty = true;
+                }
                 Msg::Refresh => self.dirty = true,
                 Msg::Wake => {}
             }
@@ -2027,6 +2167,17 @@ impl Cards {
             self.typed(&chars, now);
         }
 
+        // A brain card goes away once it would collapse (it has no slim row).
+        for i in 0..self.cards.len() {
+            let c = &self.cards[i];
+            if c.brain.is_some() && !c.leaving && !self.expanded(c, now) {
+                let c = &mut self.cards[i];
+                c.leaving = true;
+                c.appear.set(0.0);
+                self.dirty = true;
+            }
+        }
+
         // ---- content
         let desk = crate::apeiron::connected();
         let unix = now_unix();
@@ -2055,6 +2206,7 @@ impl Cards {
                 mic: self.listening.as_deref() == Some(c.id.as_str()),
                 desk,
                 drive: c.drive,
+                brain: c.brain.clone(),
             };
             if c.cache.as_ref().is_none_or(|(v, _)| *v != view) {
                 if let Some(d) = render_card(&view, s) {
@@ -2197,6 +2349,10 @@ impl Cards {
                 }
             }
             Btn::Send => self.submit(id),
+            Btn::Brain => {
+                crate::settings::open_brain();
+                self.dismiss(id);
+            }
         }
         true
     }
@@ -2395,6 +2551,10 @@ impl Cards {
                     Hit::Card | Hit::Result => {}
                     _ => buttons.push(r),
                 }
+            }
+            // Alt-hold over a card speaks to its agent; a brain card has none.
+            if c.brain.is_some() {
+                continue;
             }
             targets.push((
                 RECT {
@@ -2611,6 +2771,7 @@ mod tests {
             mic: false,
             desk: true,
             drive: Drive::Off,
+            brain: None,
         }
     }
 
@@ -2780,8 +2941,44 @@ mod tests {
         stack_r.hover = None;
         let mut slim_d = d.clone();
         slim_d.expanded = false;
-        out.push(("stack", vec![ap, stack_r, slim_d]));
+        out.push(("stack", vec![ap.clone(), stack_r.clone(), slim_d]));
+
+        let fact = Fact {
+            id: "f1".into(),
+            topic: "Relay pricing".into(),
+            text: "Pro is $10 a seat (was $12)".into(),
+            source: crate::brain::YOU.into(),
+            created: now_unix() * 1000,
+            updated: now_unix() * 1000,
+            ..Default::default()
+        };
+        let mut b = view(agent(Status::Done));
+        b.brain = Some(BrainView {
+            fact: fact.clone(),
+            readers: vec!["Launch post".into(), "Pricing page copy".into(), "Investor update email".into()],
+        });
+        b.hover = Some(Hit::Btn(Btn::Brain));
+        let mut stack_r2 = stack_r.clone();
+        stack_r2.expanded = false;
+        out.push(("brain", vec![b.clone(), stack_r2]));
+        let mut none = b.clone();
+        none.brain = Some(BrainView { fact, readers: Vec::new() });
+        none.hover = None;
+        out.push(("brain-no-agents", vec![none]));
         out
+    }
+
+    #[test]
+    fn brain_card_has_open_and_close() {
+        let mut v = view(agent(Status::Done));
+        v.brain = Some(BrainView {
+            fact: Fact { id: "f".into(), topic: "T".into(), text: "x".into(), source: "you".into(), ..Default::default() },
+            readers: vec!["Writer".into()],
+        });
+        let d = render_card(&v, 1.0).unwrap();
+        assert!(d.hits.iter().any(|h| h.4 == Hit::Btn(Btn::Brain)));
+        assert!(d.hits.iter().any(|h| h.4 == Hit::Btn(Btn::Dismiss)));
+        assert!(!d.hits.iter().any(|h| h.4 == Hit::Input));
     }
 
     /// `SCREENBUDDY_CARDS_PNG=<dir> cargo test cards` writes previews of every

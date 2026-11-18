@@ -1369,7 +1369,7 @@ impl St {
                 self.monitor = Some(crate::capture::monitor_at(at.0, at.1));
                 self.view = View {
                     phase: Phase::Done,
-                    label: "Agent".into(),
+                    label: if id.starts_with("brain:") { "Brain" } else { "Agent" }.into(),
                     body: text,
                     notice: true,
                     ..Default::default()
