@@ -959,6 +959,7 @@ pub fn mcp_spawn_tool() -> Value {
 /// event stream. Approvals: --yes allows, otherwise y/n on stdin; questions are
 /// answered from stdin.
 pub fn headless(brief: &str, follow: Option<String>, yes: bool, provider: Option<String>) -> i32 {
+    crate::apeiron::start();
     match provider {
         Some(p) => {
             // A runtime with the provider overridden for this process only.

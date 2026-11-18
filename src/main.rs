@@ -98,6 +98,7 @@ fn main() {
         config::log(&format!("fatal: {e:#}"));
         win::message_box(&format!("screenbuddy failed to start:\n{e:#}"));
     }
+    desktop::shutdown();
 }
 
 struct App {
@@ -133,6 +134,7 @@ impl App {
             (Some(h), on) => h.set_visible(on),
             (None, false) => {}
         }
+        island::set_glass(self.cfg.appearance.blur);
         self.cfg_error = if errs.is_empty() {
             None
         } else {
@@ -217,6 +219,7 @@ fn run() -> anyhow::Result<()> {
         config::log(e);
     }
     apeiron::start();
+    desktop::watch_camera();
     wire::start();
     cards::start();
     config::log("started");
@@ -304,6 +307,7 @@ fn run() -> anyhow::Result<()> {
 fn headless(q: &str) -> i32 {
     use std::io::Write;
     win::set_dpi_awareness();
+    crate::apeiron::start();
     let (mut cfg, _) = config::load();
     if let Some(i) = std::env::args().position(|a| a == "--provider") {
         cfg.provider = std::env::args().nth(i + 1).unwrap_or_default();
@@ -382,5 +386,6 @@ fn headless(q: &str) -> i32 {
         let _ = std::io::stdout().flush();
     }
     println!();
+    desktop::shutdown();
     code
 }

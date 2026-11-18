@@ -70,6 +70,18 @@ fn attaches(cfg: &Config, start: &Start) -> bool {
     cfg.appearance.attach && !start.region && crate::island::handle().is_some()
 }
 
+/// The spring that drops an attached surface out of the island. It starts at 0
+/// and springs to 1; without the target it would stay at 0 and the whole
+/// palette (input included) would be clipped away.
+fn opening_drop(inset: bool, reduce: bool) -> crate::ui::tokens::Spring {
+    let mut drop = crate::ui::tokens::Spring::new(if inset && !reduce { 0.0 } else { 1.0 })
+        .with(420.0, 30.0);
+    if inset && !reduce {
+        drop.set(1.0);
+    }
+    drop
+}
+
 /// Geist Mono, the island's face, in egui.
 fn geist(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("geist".into()))
@@ -308,7 +320,9 @@ pub fn run_with(
         Box::new(move |cc| {
             let cap = cap().map_err(|e| format!("Screenshot encoding failed: {e}"))?;
             setup_style(&cc.egui_ctx, accent, text_size);
-            island_type(&cc.egui_ctx, text_size);
+            if attaches(&cfg, &start) {
+                island_type(&cc.egui_ctx, text_size);
+            }
             win::set_ctx(Some(cc.egui_ctx.clone()));
             Ok(Box::new(Palette::new(cfg, cap, notice, out2, start)))
         }),
@@ -500,8 +514,7 @@ impl Palette {
         let accent = if inset { SIGNAL } else { accent_of(&cfg) };
         let width = cfg.appearance.width.clamp(480.0, 1100.0);
         let reduce = crate::surface::reduced_motion();
-        let drop = crate::ui::tokens::Spring::new(if inset && !reduce { 0.0 } else { 1.0 })
-            .with(420.0, 30.0);
+        let drop = opening_drop(inset, reduce);
         Self {
             cfg,
             cap,
@@ -520,8 +533,8 @@ impl Palette {
             lead: crate::surface::Smooth::new(PILL_H),
             body_h: 0.0,
             renderer: None,
-            // Part of the island, the surface is the island's matte INK.
-            backdrop: if inset { None } else { start.backdrop },
+            // The same glass as the floating palette, attached or not.
+            backdrop: start.backdrop,
             selection: start.selection,
             reduce,
             scale: 1.0,
@@ -1529,7 +1542,8 @@ impl Palette {
         let busy = self.busy();
         let agent = self.pending.is_some();
         let label = if agent { "Agent" } else { "Screen" };
-        let galley = ui.painter().layout_no_wrap(label.to_string(), geist(12.5), TEXT);
+        let font = if self.inset { geist(12.5) } else { FontId::proportional(13.0) };
+        let galley = ui.painter().layout_no_wrap(label.to_string(), font, TEXT);
         let pic = 24.0;
         let size = egui::vec2(7.0 + pic + 7.0 + galley.size().x + 12.0, CHIP_H);
         let idle = !busy && !agent;
@@ -1538,7 +1552,11 @@ impl Palette {
         if resp.drag_started() {
             self.start_drag(ui.ctx());
         }
-        let fill = if resp.hovered() && idle { INK_3 } else { INK_2 };
+        let fill = if self.inset {
+            if resp.hovered() && idle { INK_3 } else { INK_2 }
+        } else {
+            Color32::from_white_alpha(if resp.hovered() && idle { 40 } else { 28 })
+        };
         ui.painter().rect_filled(rect, CHIP_H / 2.0, fill);
         let spot = egui::Rect::from_center_size(
             egui::pos2(rect.left() + 7.0 + pic / 2.0, rect.center().y),
@@ -1837,7 +1855,7 @@ impl Palette {
         if self.tabs.is_empty() {
             return false;
         }
-        let font = geist(12.0);
+        let font = if self.inset { geist(12.0) } else { FontId::proportional(12.0) };
         let room = pill.width() - TAB_INDENT * 2.0;
         let label_of = |key: &str| -> String {
             if key.chars().count() > 28 {
@@ -2802,4 +2820,19 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> 
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opening_drop;
+
+    #[test]
+    fn attached_palette_springs_open() {
+        let d = opening_drop(true, false);
+        assert_eq!(d.value, 0.0);
+        assert_eq!(d.target, 1.0, "the attached surface must have somewhere to go");
+        // Reduced motion skips the drop; the floating palette never uses it.
+        assert_eq!(opening_drop(true, true).value, 1.0);
+        assert_eq!(opening_drop(false, false).value, 1.0);
+    }
 }

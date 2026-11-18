@@ -75,20 +75,24 @@ fn push_rows() {
     if let Some(h) = island::handle() {
         let seen = SEEN.load(Ordering::Relaxed);
         let opened = SEEN_IDS.lock().unwrap().clone().unwrap_or_default();
-        h.set_agents(
-            agents::list()
-                .iter()
-                .map(|a| {
-                    let mut r = row(a, seen);
-                    // Opening a card covers its run; a new run is new again.
-                    if r.kind != AgentStatus::Asking && opened.contains(&a.id) {
-                        r.unseen = false;
-                    }
-                    r
-                })
-                .collect(),
-        );
+        h.set_agents(island_rows(agents::list(), seen, &opened));
     }
+}
+
+/// The island shows what is happening now, plus what finished and the user has
+/// not looked at yet. Seen finished agents belong to history, not the pill.
+fn island_rows(all: Vec<Agent>, seen: u64, opened: &HashSet<String>) -> Vec<AgentRow> {
+    all.iter()
+        .filter(|a| !a.archived)
+        .filter_map(|a| {
+            let mut r = row(a, seen);
+            // Opening a card covers its run; a new run is new again.
+            if r.kind != AgentStatus::Asking && opened.contains(&a.id) {
+                r.unseen = false;
+            }
+            (a.status.is_active() || r.unseen).then_some(r)
+        })
+        .collect()
 }
 
 fn row(a: &Agent, seen: u64) -> AgentRow {
@@ -172,5 +176,32 @@ mod tests {
         assert!(row(&a, 150).unseen);
         assert!(!row(&a, 250).unseen);
         assert_eq!(row(&a, 250).status, "Cheapest is KLM");
+    }
+
+    #[test]
+    fn seen_finished_rows_leave_the_island() {
+        let done = Agent {
+            id: "done".into(),
+            name: "Flights".into(),
+            status: Status::Done,
+            ended: Some(200),
+            ..Default::default()
+        };
+        let running = Agent {
+            id: "run".into(),
+            name: "Report".into(),
+            status: Status::Running,
+            ..Default::default()
+        };
+        let all = vec![done.clone(), running.clone()];
+        let ids = |rows: Vec<AgentRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        let none = HashSet::new();
+        assert_eq!(ids(island_rows(all.clone(), 150, &none)), ["done", "run"]);
+        assert_eq!(ids(island_rows(all.clone(), 250, &none)), ["run"]);
+        let opened = HashSet::from(["done".to_string()]);
+        assert_eq!(ids(island_rows(all, 150, &opened)), ["run"]);
+
+        let archived = Agent { archived: true, ..done };
+        assert!(island_rows(vec![archived], 0, &none).is_empty());
     }
 }

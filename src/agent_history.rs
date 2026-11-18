@@ -185,6 +185,29 @@ impl View {
         let now = store::now();
         let mut open = None;
         let mut unarchive = None;
+        let mut clear_finished = false;
+        let finished = self
+            .rows
+            .iter()
+            .filter(|a| !a.status.is_active() && !a.archived)
+            .count();
+        if finished > 0 {
+            ui.horizontal(|ui| {
+                ui.label(label(&format!(
+                    "{finished} finished"
+                )));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(label("Clear finished")).small())
+                        .on_hover_text("Archive every finished agent")
+                        .clicked()
+                    {
+                        clear_finished = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+        }
         if enter && let Some(a) = self.rows.get(self.selected) {
             open = Some(a.id.clone());
         }
@@ -257,6 +280,14 @@ impl View {
             if resp.clicked() && unarchive.is_none() {
                 open = Some(a.id.clone());
             }
+        }
+        if clear_finished {
+            for a in self.rows.iter().filter(|a| !a.status.is_active() && !a.archived) {
+                agents::archive(&a.id, true);
+            }
+            self.loaded = None;
+            self.selected = 0;
+            open = None;
         }
         if let Some(id) = unarchive {
             agents::archive(&id, false);

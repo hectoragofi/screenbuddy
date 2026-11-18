@@ -135,9 +135,13 @@ pub(crate) fn run(job: &TurnJob, sink: &Sink) -> Result<String, String> {
     let mut env = serde_json::Map::new();
     env.insert(super::ROLE_ENV.into(), json!("agent"));
     env.insert(APPROVAL_PORT_ENV.into(), json!(port.to_string()));
+    let desktop_session = format!("screenbuddy-agent-{}", job.id);
+    // Ends the agent's desktop session (and its cursor overlay) when this turn
+    // is over, so overlays don't pile up across agents.
+    let _desktop_session = crate::desktop::SessionGuard(desktop_session.clone());
     env.insert(
         "SCREENBUDDY_DESKTOP_SESSION".into(),
-        json!(format!("screenbuddy-agent-{}", job.id)),
+        json!(desktop_session),
     );
     let mcp = json!({"mcpServers": {"screenbuddy": {"type": "stdio", "command": exe.to_string_lossy(), "args": ["--mcp"], "env": env}}}).to_string();
     let builtin = "Read,Write,Edit,Glob,Grep,WebSearch,WebFetch";

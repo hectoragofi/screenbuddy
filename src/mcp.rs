@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
 pub fn run() {
+    // Actions may be routed through Apeiron (focus, cursor placement); connect
+    // now so the layout is known by the first tool call.
+    crate::apeiron::start();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -111,7 +114,7 @@ fn desktop(input: &Value) -> (String, bool) {
         );
     }
     let cfg = crate::config::load().0;
-    let session = std::env::var("SCREENBUDDY_DESKTOP_SESSION").unwrap_or_else(|_| crate::desktop::new_session_id());
+    let session = std::env::var("SCREENBUDDY_DESKTOP_SESSION").unwrap_or_else(|_| crate::desktop::app_session().to_string());
     let t0 = crate::agents::desk::now_ms();
     let out = crate::desktop::exec(&exe, &args, &intent, &crate::desktop::Ctx::from_config(&cfg, session));
     if crate::agents::is_agent_mcp() && !crate::desktop::is_read_only(&args) {

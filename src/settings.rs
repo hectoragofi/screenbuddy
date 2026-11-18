@@ -601,6 +601,10 @@ impl Settings {
                 toggle(ui, &mut self.cfg.agent_desktop.enabled, accent);
             });
             sep(ui);
+            row(ui, "Open links with the agent", Some("Off: opens sites instantly. On: the assistant handles it, a little slower"), |ui| {
+                toggle(ui, &mut self.cfg.agent_desktop.open_with_agent, accent);
+            });
+            sep(ui);
             row(ui, "agent-desktop", Some("Reads apps through accessibility, not screenshots"), |ui| {
                 if job.running {
                     ui.spinner();
