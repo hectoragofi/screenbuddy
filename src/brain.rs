@@ -203,6 +203,23 @@ impl Store {
         n != facts.len() && self.save(&facts).is_ok()
     }
 
+    /// Takes back a just-saved fact: forgets it and brings back the fact it
+    /// superseded (if that one is still kept). False if `id` isn't there.
+    pub fn undo(&self, id: &str) -> bool {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut facts = self.load();
+        let Some(i) = facts.iter().position(|f| f.id == id) else {
+            return false;
+        };
+        let gone = facts.remove(i);
+        if let Some(old) = &gone.replaced {
+            if let Some(f) = facts.iter_mut().find(|f| &f.id == old) {
+                f.superseded = false;
+            }
+        }
+        self.save(&facts).is_ok()
+    }
+
     pub fn edit(&self, id: &str, text: &str) -> Result<Fact, String> {
         let text = one_line(text, MAX_TEXT);
         if text.is_empty() {
@@ -311,6 +328,10 @@ pub fn forget(id: &str) -> bool {
 pub fn edit(id: &str, text: &str) -> Result<Fact, String> {
     global().edit(id, text)
 }
+/// Undo a save (the island's "Remembered · Undo").
+pub fn undo(id: &str) -> bool {
+    global().undo(id)
+}
 pub fn since(ms: u64) -> Vec<Fact> {
     global().since(ms)
 }
@@ -401,6 +422,24 @@ mod tests {
         let p = std::env::temp_dir().join(format!("sb-brain-{tag}-{}-{}", std::process::id(), now_ms()));
         let _ = std::fs::remove_file(&p);
         Store::at(p)
+    }
+
+    #[test]
+    fn undo_forgets_and_restores_the_superseded_fact() {
+        let b = store("undo");
+        let a = b.remember("Relay pricing", "Pro is $12 a seat", YOU).unwrap();
+        let n = b.remember("relay pricing", "Pro is $10 a seat", YOU).unwrap();
+        assert_eq!(b.live().len(), 1);
+        assert!(b.undo(&n.id));
+        let live = b.live();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, a.id);
+        assert_eq!(live[0].text, "Pro is $12 a seat");
+        assert!(!b.undo(&n.id), "already undone");
+        // A brand-new fact just goes away.
+        let c = b.remember("Coffee", "Oat flat white", YOU).unwrap();
+        assert!(b.undo(&c.id));
+        assert_eq!(b.live().len(), 1);
     }
 
     #[test]

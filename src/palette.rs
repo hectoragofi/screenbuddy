@@ -83,12 +83,18 @@ fn opening_drop(inset: bool, reduce: bool) -> crate::ui::tokens::Spring {
 }
 
 /// Geist Mono, the island's face, in egui.
+/// Geist Mono: code and tiny metadata only.
 fn geist(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("geist".into()))
 }
 
-fn geist_medium(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("geist-medium".into()))
+/// Geist (sans): the island's, cards' and palette's body face.
+fn sans(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("geist-sans".into()))
+}
+
+fn sans_medium(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("geist-sans-medium".into()))
 }
 
 pub enum Outcome {
@@ -382,18 +388,22 @@ pub fn setup_fonts(ctx: &egui::Context) {
     for (key, bytes, name) in [
         ("geist", &include_bytes!("../assets/fonts/GeistMono-Regular.ttf")[..], "geist"),
         ("geist-medium", &include_bytes!("../assets/fonts/GeistMono-Medium.ttf")[..], "geist-medium"),
+        ("geist-sans", &include_bytes!("../assets/fonts/Geist-Regular.ttf")[..], "geist-sans"),
+        ("geist-sans-medium", &include_bytes!("../assets/fonts/Geist-Medium.ttf")[..], "geist-sans-medium"),
     ] {
         put(key, bytes.to_vec(), FontFamily::Name(name.into()), true);
     }
     if let Some(b) = read("seguisym.ttf") {
         put("sym", b.clone(), FontFamily::Proportional, false);
         put("sym", b.clone(), FontFamily::Monospace, false);
+        put("sym", b.clone(), FontFamily::Name("geist-sans".into()), false);
         put("sym", b, FontFamily::Name("geist".into()), false);
     }
     if let Some(b) = read("SegUIVar.ttf").or_else(|| read("segoeui.ttf")) {
         // Glyph fallback for the Geist families (e.g. non-Latin agent output).
-        put("ui2", b.clone(), FontFamily::Name("geist".into()), false);
-        put("ui2", b, FontFamily::Name("geist-medium".into()), false);
+        for fam in ["geist", "geist-medium", "geist-sans", "geist-sans-medium"] {
+            put("ui2", b.clone(), FontFamily::Name(fam.into()), false);
+        }
     }
     ctx.set_fonts(defs);
 }
@@ -431,15 +441,15 @@ pub fn setup_style(ctx: &egui::Context, accent: Color32, text_size: f32) {
     });
 }
 
-/// The palette speaks the island's type: Geist Mono throughout (Segoe stays as
-/// the glyph fallback), a step smaller since mono runs wide.
+/// The palette speaks the island's and cards' type: Geist for text, Geist
+/// Mono for code (Segoe stays as the glyph fallback).
 fn island_type(ctx: &egui::Context, text_size: f32) {
     ctx.global_style_mut(|s| {
         s.text_styles = [
-            (TextStyle::Heading, geist(text_size - 0.5)),
-            (TextStyle::Body, geist(text_size - 1.5)),
-            (TextStyle::Button, geist(13.0)),
-            (TextStyle::Small, geist(12.0)),
+            (TextStyle::Heading, sans_medium(text_size)),
+            (TextStyle::Body, sans(text_size - 0.5)),
+            (TextStyle::Button, sans(13.5)),
+            (TextStyle::Small, sans(12.0)),
             (TextStyle::Monospace, geist(12.5)),
         ]
         .into();
@@ -945,11 +955,8 @@ impl Palette {
                     }
                 }
                 Ev::Remembered(f) => {
+                    // "Remembered · … Undo" hangs under the island for a moment.
                     crate::cards::brain_saved(&f);
-                    crate::caption::send(crate::caption::Cmd::Notice {
-                        text: format!("Saved to the brain \u{00b7} {}", f.topic),
-                        id: crate::cards::brain_card_id(&f),
-                    });
                 }
                 Ev::Done(conv) => {
                     if self.exchanges.last().is_some_and(|x| x.error.is_none()) {
@@ -1632,7 +1639,7 @@ impl Palette {
         let busy = self.busy();
         let agent = self.pending.is_some();
         let label = if agent { "Agent" } else { "Screen" };
-        let font = if self.inset { geist(12.5) } else { FontId::proportional(13.0) };
+        let font = if self.inset { sans(13.0) } else { FontId::proportional(13.0) };
         let galley = ui.painter().layout_no_wrap(label.to_string(), font, TEXT);
         let pic = 24.0;
         let size = egui::vec2(7.0 + pic + 7.0 + galley.size().x + 12.0, CHIP_H);
@@ -1953,7 +1960,7 @@ impl Palette {
         if self.tabs.is_empty() {
             return false;
         }
-        let font = if self.inset { geist(12.0) } else { FontId::proportional(12.0) };
+        let font = if self.inset { sans(12.5) } else { FontId::proportional(12.0) };
         let room = pill.width() - TAB_INDENT * 2.0;
         let label_of = |key: &str| -> String {
             if key.chars().count() > 28 {
@@ -2756,7 +2763,7 @@ fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMa
         Status::Stopped if !a.counted => Some("Didn't count".into()),
         _ => None,
     };
-    let small = |t: &str| RichText::new(t).font(geist(12.0));
+    let small = |t: &str| RichText::new(t).font(sans(12.0));
     egui::Frame::new()
         .fill(INK_2)
         .corner_radius(12)
@@ -2770,7 +2777,7 @@ fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMa
                     ui.painter().circle_filled(r.center(), 5.0, dot.gamma_multiply(0.16));
                 }
                 ui.painter().circle_filled(r.center(), 2.6, dot);
-                ui.label(RichText::new(&a.name).font(geist_medium(13.0)).color(TEXT));
+                ui.label(RichText::new(&a.name).font(sans_medium(13.5)).color(TEXT));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let action = match a.status {
                         Status::Pending => Some("Cancel"),
@@ -2802,7 +2809,7 @@ fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMa
                 ui.add_space(2.0);
                 match q.kind {
                     AskKind::Approval => {
-                        ui.label(RichText::new(format!("Allow it to {}?", lowercase_first(&q.text))).font(geist(13.0)).color(TEXT));
+                        ui.label(RichText::new(format!("Allow it to {}?", lowercase_first(&q.text))).font(sans(13.5)).color(TEXT));
                         ui.label(small(&q.detail).color(TEXT_2));
                         ui.horizontal(|ui| {
                             let allow = egui::Button::new(small("Allow").color(SURFACE)).fill(Color32::WHITE).corner_radius(8);
@@ -2816,14 +2823,14 @@ fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMa
                     }
                     AskKind::Questions => {
                         for line in &q.questions {
-                            ui.label(RichText::new(line).font(geist(13.0)).color(TEXT));
+                            ui.label(RichText::new(line).font(sans(13.5)).color(TEXT));
                         }
                         let draft = drafts.entry(id.to_string()).or_default();
                         let mut send = false;
                         ui.horizontal(|ui| {
                             let edit = egui::TextEdit::singleline(draft)
                                 .hint_text(small("Answer\u{2026}").color(TEXT_2))
-                                .font(geist(12.5))
+                                .font(sans(13.0))
                                 .desired_width(ui.available_width() - 70.0);
                             let r = ui.add(edit);
                             send = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2836,7 +2843,7 @@ fn agent_line(ui: &mut egui::Ui, id: &str, drafts: &mut std::collections::HashMa
                 }
             }
             if a.status == Status::Done && !a.result.is_empty() {
-                ui.label(RichText::new(&a.result).font(geist(12.5)).color(TEXT));
+                ui.label(RichText::new(&a.result).font(sans(13.0)).color(TEXT));
             }
             if !a.status.is_active() && !a.files.is_empty() {
                 ui.horizontal_wrapped(|ui| {

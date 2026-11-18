@@ -142,6 +142,19 @@ fn glass_radius(strength: f32) -> f32 {
 /// white text readable over any wallpaper; the shader uses the same value.
 pub const PEAK: f32 = 50.0 / 255.0;
 
+/// One glass pixel: backdrop colour `c` (0..1), limited to `PEAK` and mixed
+/// with the surface ink by `opacity`, the same math as the palette shader.
+pub fn glass_pixel(c: [f32; 3], ink: [u8; 3], opacity: f32) -> [u8; 3] {
+    let peak = c[0].max(c[1]).max(c[2]).max(0.001);
+    let limit = (PEAK / peak).min(1.0);
+    let mix = |v: f32, tint: u8| {
+        ((v * limit * (1.0 - opacity) + tint as f32 / 255.0 * opacity) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    [mix(c[0], ink[0]), mix(c[1], ink[1]), mix(c[2], ink[2])]
+}
+
 /// A small, blurred copy of the monitor. It's made once per screenshot, so the
 /// surface pays for a single texture read per pixel. It doesn't follow changes
 /// on screen until the next capture.

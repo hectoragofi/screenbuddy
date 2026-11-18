@@ -639,11 +639,20 @@ impl Settings {
             });
         });
         group(ui, "Island", |ui| {
-            row(ui, "Show the island", Some("The buddy's pill at the top of the screen. Hover to see agents, click to ask."), |ui| {
-                toggle(ui, &mut self.cfg.island.enabled, accent);
-            });
-            row(ui, "Hide when idle", Some("Tucks away when nothing is happening. Touch the top edge near the centre to bring it back."), |ui| {
-                toggle(ui, &mut self.cfg.island.auto_hide, accent);
+            row(ui, "Show screenbuddy", Some("Only when called: just the hotkey and voice key. Approvals, finished agents and saved facts still show briefly."), |ui| {
+                use crate::config::Presence;
+                let mut v = match self.cfg.island.presence {
+                    Presence::Hotkey => "hotkey",
+                    Presence::AutoHide => "auto_hide",
+                    Presence::Always => "always",
+                }
+                .to_string();
+                segmented(ui, &mut v, &[("hotkey", "Only when called"), ("auto_hide", "When busy"), ("always", "Always")], accent);
+                self.cfg.island.presence = match v.as_str() {
+                    "auto_hide" => Presence::AutoHide,
+                    "always" => Presence::Always,
+                    _ => Presence::Hotkey,
+                };
             });
         });
         hint(ui, "Changes apply the next time you open the palette.");

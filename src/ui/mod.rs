@@ -44,19 +44,25 @@ pub enum Face {
     MonoMedium,
     /// Doto (static wght 700, round dots): dot-matrix readouts and numbers.
     Doto,
+    /// Geist Regular: body text, titles, buttons.
+    Sans,
+    /// Geist Medium: names, emphasis, button labels.
+    SansMedium,
 }
 
 static GEIST: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Regular.ttf");
 static GEIST_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/GeistMono-Medium.ttf");
 static DOTO: &[u8] = include_bytes!("../../assets/fonts/Doto-Bold-Round.ttf");
+static SANS: &[u8] = include_bytes!("../../assets/fonts/Geist-Regular.ttf");
+static SANS_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/Geist-Medium.ttf");
 
 pub(crate) fn font(face: Face) -> &'static fontdue::Font {
-    static FONTS: OnceLock<[fontdue::Font; 3]> = OnceLock::new();
+    static FONTS: OnceLock<[fontdue::Font; 5]> = OnceLock::new();
     let fonts = FONTS.get_or_init(|| {
         let load = |b: &'static [u8]| {
             fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).expect("embedded font")
         };
-        [load(GEIST), load(GEIST_MEDIUM), load(DOTO)]
+        [load(GEIST), load(GEIST_MEDIUM), load(DOTO), load(SANS), load(SANS_MEDIUM)]
     });
     &fonts[face as usize]
 }
@@ -85,15 +91,31 @@ impl TextStyle {
         }
     }
 
-    /// 12.5 px Geist Mono, PAPER.
+    /// 13 px Geist (sans), PAPER: body text, names, buttons.
     pub fn body(scale: f32) -> Self {
         Self {
-            face: Face::Mono,
+            face: Face::Sans,
             px: tokens::BODY_PX * scale,
             tracking: 0.0,
             color: tokens::PAPER,
             caps: false,
         }
+    }
+
+    /// 11 px Geist Mono, MUTE: tiny metadata and numbers (elapsed, counts).
+    pub fn mono(scale: f32) -> Self {
+        Self {
+            face: Face::Mono,
+            px: tokens::MONO_PX * scale,
+            tracking: 0.0,
+            color: tokens::MUTE,
+            caps: false,
+        }
+    }
+
+    pub fn face(mut self, f: Face) -> Self {
+        self.face = f;
+        self
     }
 
     /// Doto dot-matrix readout at `READOUT_PX`, PAPER.
@@ -747,7 +769,7 @@ mod tests {
 
     #[test]
     fn text_measures_and_wraps() {
-        let s = TextStyle::body(1.0);
+        let s = TextStyle::mono(1.0).size(12.5);
         let w = text_width("abcd", &s);
         assert!(w > 20.0 && w < 40.0, "{w}");
         // Monospace: every glyph has the same advance.
@@ -757,6 +779,9 @@ mod tests {
         let e = ellipsize("a very long agent status line indeed", &s, 100.0);
         assert!(e.ends_with('…') && text_width(&e, &s) <= 100.0);
         assert!(text_width("03", &TextStyle::readout(1.0)) > 0.0);
+        // Body text is proportional (Geist).
+        let b = TextStyle::body(1.0);
+        assert!(text_width("iiii", &b) < text_width("MMMM", &b));
     }
 
     #[test]

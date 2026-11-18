@@ -74,20 +74,47 @@ impl Default for WalkCfg {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(default)]
-pub struct IslandCfg {
-    /// The pill with the buddy's face at the top of the screen.
-    pub enabled: bool,
-    /// Tuck the island away when nothing is happening; it comes back while
-    /// listening or answering, when an agent needs you, or when the cursor
-    /// touches the top edge of the screen near the centre.
-    pub auto_hide: bool,
+/// When screenbuddy is on screen.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Presence {
+    /// Only when called: the hotkey or voice key (palette, quick ask,
+    /// listening, answering). Agents asking for an OK, finishing or failing,
+    /// and "Remembered" still show as small notices that go away by themselves.
+    #[default]
+    Hotkey,
+    /// When busy: tucks away when nothing is happening; touching the top edge
+    /// near the centre brings it back.
+    AutoHide,
+    /// The island always stays at the top of the screen.
+    Always,
 }
 
-impl Default for IslandCfg {
-    fn default() -> Self {
-        Self { enabled: true, auto_hide: true }
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default, from = "IslandRaw")]
+pub struct IslandCfg {
+    /// `presence = "hotkey" | "auto_hide" | "always"`.
+    pub presence: Presence,
+}
+
+/// `[island]` as written, old keys included: `enabled = false` or
+/// `auto_hide = true` become "hotkey", `auto_hide = false` "always".
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct IslandRaw {
+    presence: Option<Presence>,
+    enabled: Option<bool>,
+    auto_hide: Option<bool>,
+}
+
+impl From<IslandRaw> for IslandCfg {
+    fn from(r: IslandRaw) -> Self {
+        let presence = r.presence.unwrap_or(match (r.enabled, r.auto_hide) {
+            (Some(false), _) | (_, Some(true)) => Presence::Hotkey,
+            (_, Some(false)) => Presence::Always,
+            _ => Presence::Hotkey,
+        });
+        Self { presence }
     }
 }
 
@@ -548,6 +575,28 @@ mod tests {
         assert_eq!(toml::from_str::<Config>(&s).unwrap(), c);
         assert_eq!(hex_rgb("#0A84FF"), Some([10, 132, 255]));
         assert_eq!(rgb_hex([10, 132, 255]), "#0A84FF");
+    }
+
+    #[test]
+    fn island_presence_migrates_old_keys() {
+        let p = |t: &str| toml::from_str::<Config>(t).unwrap().island.presence;
+        assert_eq!(Config::default().island.presence, Presence::Hotkey);
+        assert_eq!(p(""), Presence::Hotkey);
+        assert_eq!(p("[island]\n"), Presence::Hotkey);
+        assert_eq!(p("[island]\nenabled = false\n"), Presence::Hotkey);
+        assert_eq!(p("[island]\nenabled = false\nauto_hide = false\n"), Presence::Hotkey);
+        assert_eq!(p("[island]\nauto_hide = true\n"), Presence::Hotkey);
+        assert_eq!(p("[island]\nenabled = true\nauto_hide = true\n"), Presence::Hotkey);
+        assert_eq!(p("[island]\nauto_hide = false\n"), Presence::Always);
+        assert_eq!(p("[island]\nenabled = true\nauto_hide = false\n"), Presence::Always);
+        assert_eq!(p("[island]\npresence = \"auto_hide\"\n"), Presence::AutoHide);
+        assert_eq!(p("[island]\npresence = \"always\"\nenabled = false\n"), Presence::Always);
+        // Saving writes only the new key.
+        let mut c = Config::default();
+        c.island.presence = Presence::AutoHide;
+        let s = toml::to_string_pretty(&c).unwrap();
+        assert!(s.contains("presence = \"auto_hide\"") && !s.contains("auto_hide ="), "{s}");
+        assert_eq!(toml::from_str::<Config>(&s).unwrap().island.presence, Presence::AutoHide);
     }
 
     fn temp_dir(name: &str) -> PathBuf {
