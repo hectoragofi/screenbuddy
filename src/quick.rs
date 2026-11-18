@@ -143,6 +143,9 @@ struct Quick {
     shot: Option<std::thread::JoinHandle<anyhow::Result<capture::Capture>>>,
     transcript: Option<Receiver<Result<String, String>>>,
     turn: Option<Turn>,
+    /// Stopped turns whose worker hasn't handed back yet: if it had already
+    /// acted, that goes on the thread when it does.
+    stopping: Vec<Turn>,
     /// A quick ask finished onto the thread: a click continues it in the palette.
     last: bool,
     /// Alt was held over this agent's card: the words are a follow-up to it.
@@ -157,13 +160,17 @@ impl Quick {
             shot: None,
             transcript: None,
             turn: None,
+            stopping: Vec::new(),
             last: false,
             follow: None,
         }
     }
 
     fn busy(&self) -> bool {
-        self.rec.is_some() || self.transcript.is_some() || self.turn.is_some()
+        self.rec.is_some()
+            || self.transcript.is_some()
+            || self.turn.is_some()
+            || !self.stopping.is_empty()
     }
 
     fn run(mut self, rx: Receiver<Msg>) {
@@ -322,6 +329,7 @@ impl Quick {
             }
         }
         self.pump_turn();
+        self.drain_stopped();
     }
 
     fn ask(&mut self, question: String) {
@@ -381,7 +389,8 @@ impl Quick {
 
     fn pump_turn(&mut self) {
         let Some(t) = self.turn.as_mut() else { return };
-        let mut finished = false;
+        // Some(what already ran) once the worker is done.
+        let mut finished: Option<Vec<String>> = None;
         loop {
             match t.rx.try_recv() {
                 Ok(llm::Ev::Delta(d)) => {
@@ -437,20 +446,20 @@ impl Quick {
                 Ok(llm::Ev::Error(e)) => {
                     t.error = Some(e);
                 }
-                Ok(llm::Ev::Done(_)) => {
-                    finished = true;
+                Ok(llm::Ev::Done(conv)) => {
+                    finished = Some(conv.acted);
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    finished = true;
+                    finished = Some(Vec::new());
                     break;
                 }
             }
         }
-        if finished {
+        if let Some(acted) = finished {
             let t = self.turn.take().unwrap();
-            self.last = record(&t);
+            self.last = record(&t, &acted);
             if let Some(goal) = crate::walk::take_request() {
                 // The brain chose a walkthrough: it takes over the caption.
                 crate::walk::start(goal, &self.cfg);
@@ -476,8 +485,28 @@ impl Quick {
             if t.error.is_none() && !t.answer.is_empty() {
                 t.error = Some(format!("{}stopped.", llm::INTERRUPTED));
             }
-            self.last = record(&t);
+            self.last = record(&t, &[]);
+            // What already ran only comes back with the worker's Done.
+            self.stopping.push(t);
         }
+    }
+
+    /// Waits out stopped turns; one that had already acted gets that noted on
+    /// the thread, so a retry doesn't do it again.
+    fn drain_stopped(&mut self) {
+        self.stopping.retain(|t| loop {
+            match t.rx.try_recv() {
+                Ok(llm::Ev::Done(conv)) => {
+                    if !conv.acted.is_empty() {
+                        record_acted(t, &conv.acted);
+                    }
+                    break false;
+                }
+                Ok(_) => {} // dropped, as before: its replies read as "no"
+                Err(TryRecvError::Empty) => break true,
+                Err(TryRecvError::Disconnected) => break false,
+            }
+        });
     }
 
     fn fail(&mut self, e: String) {
@@ -498,11 +527,34 @@ fn short_error(e: &str) -> String {
 }
 
 /// Adds a finished quick ask to the thread (typed and spoken asks share it).
-/// True when there was an answer to keep.
-fn record(t: &Turn) -> bool {
-    if t.answer.trim().is_empty() {
+/// True when there was an answer to keep. A failed turn that already `acted`
+/// is kept with what was done, like the palette does.
+fn record(t: &Turn, acted: &[String]) -> bool {
+    let answer = if acted.is_empty() {
+        t.answer.clone()
+    } else {
+        crate::palette::interrupted_answer(&t.answer, acted)
+    };
+    if answer.trim().is_empty() {
         return false;
     }
-    crate::thread::update(|th| th.push(&t.question, &t.answer, None));
+    crate::thread::update(|th| th.push(&t.question, &answer, None));
     true
+}
+
+/// A stopped quick ask turned out to have acted: notes that on the turn
+/// `stop_turn` kept, or keeps the turn now if it had no answer yet.
+fn record_acted(t: &Turn, acted: &[String]) {
+    let answer = crate::palette::interrupted_answer(&t.answer, acted);
+    crate::thread::update(|th| {
+        let kept = th
+            .turns
+            .iter_mut()
+            .rev()
+            .find(|x| x.question == t.question.trim() && x.answer == t.answer.trim());
+        match kept {
+            Some(x) if !t.answer.trim().is_empty() => x.answer = answer.trim().to_string(),
+            _ => th.push(&t.question, &answer, None),
+        }
+    });
 }

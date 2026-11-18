@@ -2326,12 +2326,22 @@ impl Cards {
                 crate::win::push(crate::win::AppEvent::AgentPalette(id.to_string()));
             }
             Btn::Always => {
-                let (mut cfg, _) = crate::config::load();
-                if !cfg.agents.always_approve {
-                    cfg.agents.always_approve = true;
-                    if let Err(e) = crate::config::save(&cfg) {
-                        crate::config::log(&format!("cards: saving always_approve: {e}"));
+                // Never save over a config.toml that did not load (that would
+                // write defaults); the click still allows this conversation.
+                let saved = match crate::config::load() {
+                    (_, Some(e)) => Err(e),
+                    (cfg, None) if cfg.agents.always_approve => Ok(()),
+                    (mut cfg, None) => {
+                        cfg.agents.always_approve = true;
+                        crate::config::save(&cfg).map_err(|e| e.to_string())
                     }
+                };
+                if let Err(e) = saved {
+                    crate::config::log(&format!("cards: saving always_approve: {e}"));
+                    caption::send(caption::Cmd::Notice {
+                        text: format!("Allowed for this agent, but couldn't save \"always\" ({e})."),
+                        id: id.to_string(),
+                    });
                 }
                 if let Some(q) = ask {
                     agents::answer(id, q.id, Answer::Allow);

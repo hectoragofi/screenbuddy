@@ -285,6 +285,19 @@ struct Bud {
     start: f64,
 }
 
+/// The answer kept on the thread for a turn that failed or was stopped after
+/// its tools already ran (`acted`), so a retry doesn't do them again. Shared
+/// with quick asks.
+pub(crate) fn interrupted_answer(answer: &str, acted: &[String]) -> String {
+    format!(
+        "{}\n\n[Interrupted before finishing. Already done: {}.]",
+        answer.trim(),
+        acted.join("; ")
+    )
+    .trim_start()
+    .to_string()
+}
+
 /// Opens the palette and blocks until it closes.
 #[allow(dead_code)]
 pub fn run(cfg: Config, cap: Capture, notice: Option<String>) -> Outcome {
@@ -968,13 +981,7 @@ impl Palette {
             if conv.acted.is_empty() {
                 return;
             }
-            a = format!(
-                "{}\n\n[Interrupted before finishing. Already done: {}.]",
-                a.trim(),
-                conv.acted.join("; ")
-            )
-            .trim_start()
-            .to_string();
+            a = interrupted_answer(&a, &conv.acted);
         } else if x.answer.trim().is_empty() && x.agents.is_empty() {
             return;
         }
@@ -2311,10 +2318,18 @@ impl Palette {
         if always {
             self.allow_all = true;
             self.cfg.agent_desktop.approval = "never".into();
-            let (mut disk, _) = config::load();
-            disk.agent_desktop.approval = "never".into();
-            if let Err(e) = config::save(&disk) {
+            // Never save over a config.toml that did not load: that would write
+            // defaults (the save refuses anyway). Allowed for this session only.
+            let saved = match config::load() {
+                (_, Some(e)) => Err(e),
+                (mut disk, None) => {
+                    disk.agent_desktop.approval = "never".into();
+                    config::save(&disk).map_err(|e| e.to_string())
+                }
+            };
+            if let Err(e) = saved {
                 config::log(&format!("saving approval mode failed: {e}"));
+                self.notice = Some(format!("Allowed for now, but couldn't save \"always\" ({e})."));
             }
         }
     }
