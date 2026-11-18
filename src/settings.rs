@@ -33,6 +33,7 @@ enum Page {
     Drawing,
     Voice,
     Agent,
+    Brain,
     Advanced,
 }
 
@@ -43,8 +44,18 @@ const PAGES: &[(Page, &str, &str)] = &[
     (Page::Drawing, "✎", "Drawing"),
     (Page::Voice, "◉", "Voice"),
     (Page::Agent, "➤", "Agent"),
+    (Page::Brain, "◎", "Brain"),
     (Page::Advanced, "⚙", "Advanced"),
 ];
+
+/// Set by `open_brain` so Settings opens (or switches) to the Brain page.
+static OPEN_BRAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Opens Settings on the brain list (the brain card's Open button).
+pub fn open_brain() {
+    OPEN_BRAIN.store(true, std::sync::atomic::Ordering::Relaxed);
+    win::push(AppEvent::Menu(crate::tray::SETTINGS.into()));
+}
 
 /// Background job status shown in the UI (agent-desktop install / version probe).
 #[derive(Default, Clone)]
@@ -72,6 +83,8 @@ struct Settings {
     /// Voice model download in progress.
     voice_dl: Option<Arc<Mutex<crate::voice::Download>>>,
     voice_error: Option<String>,
+    /// Brain page: the fact being edited inline (id, draft).
+    brain_edit: Option<(String, String)>,
 }
 
 /// Set by "Browse history" so the palette opens on the list once Settings closes.
@@ -120,7 +133,7 @@ impl Settings {
             saved: cfg.clone(),
             claude_found: which(&cfg.claude_cli.command),
             cfg,
-            page: Page::General,
+            page: if OPEN_BRAIN.swap(false, std::sync::atomic::Ordering::Relaxed) { Page::Brain } else { Page::General },
             recording: None,
             show_key: false,
             autostart: win::autostart_enabled(),
@@ -132,6 +145,7 @@ impl Settings {
             first: true,
             voice_dl: None,
             voice_error: None,
+            brain_edit: None,
         }
     }
 
@@ -158,6 +172,9 @@ impl Settings {
                     *self.outcome.lock().unwrap() = Outcome::Quit;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 } else if id == crate::tray::SETTINGS {
+                    if OPEN_BRAIN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        self.page = Page::Brain;
+                    }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
@@ -206,8 +223,85 @@ impl Settings {
             Page::Drawing => self.drawing(ui, accent),
             Page::Voice => self.voice(ui, accent),
             Page::Agent => self.agent(ui, accent),
+            Page::Brain => self.brain(ui, accent),
             Page::Advanced => self.advanced(ui, accent),
         }
+    }
+
+    /// The shared brain: the toggle, then live facts newest first, each with
+    /// inline edit and delete.
+    fn brain(&mut self, ui: &mut egui::Ui, accent: Color32) {
+        group(ui, "Shared brain", |ui| {
+            row(ui, "Remember what you tell it", Some("Prices, names, decisions. Every agent reads them, no hand-offs"), |ui| {
+                toggle(ui, &mut self.cfg.brain.enabled, accent);
+            });
+        });
+        let facts = crate::brain::live();
+        let now = crate::brain::now_ms();
+        let mut remove = None;
+        let mut save = None;
+        group(ui, &format!("What it knows · {}", facts.len()), |ui| {
+            if facts.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Nothing yet. Tell the buddy something like “Pro is $10 a seat now”.").color(TEXT_3).size(12.5));
+                ui.add_space(6.0);
+            }
+            for (i, f) in facts.iter().enumerate() {
+                if i > 0 {
+                    sep(ui);
+                }
+                let editing = self.brain_edit.as_ref().is_some_and(|(id, _)| *id == f.id);
+                ui.horizontal(|ui| {
+                    ui.set_min_height(40.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(3.0);
+                        ui.label(RichText::new(&f.topic).size(12.0).color(TEXT_2).strong());
+                        if editing {
+                            if let Some((_, draft)) = self.brain_edit.as_mut() {
+                                let r = ui.add(egui::TextEdit::singleline(draft).desired_width(ui.available_width() - 150.0));
+                                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    save = Some((f.id.clone(), draft.clone()));
+                                }
+                                if ui.memory(|m| m.focused().is_none()) {
+                                    r.request_focus();
+                                }
+                            }
+                        } else {
+                            ui.label(RichText::new(&f.text).size(14.0));
+                        }
+                        ui.label(RichText::new(format!("{}{} · {}", if f.pinned { "Always in mind · " } else { "" }, f.from_label(), crate::brain::age_label(f.updated, now))).size(11.5).color(TEXT_3));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(RichText::new("Delete").color(Color32::from_rgb(255, 120, 110))).clicked() {
+                            remove = Some(f.id.clone());
+                        }
+                        if editing {
+                            if ui.add(primary("Save", accent)).clicked() {
+                                save = self.brain_edit.clone();
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.brain_edit = None;
+                            }
+                        } else if ui.button("Edit").clicked() {
+                            self.brain_edit = Some((f.id.clone(), f.text.clone()));
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(id) = remove {
+            crate::brain::forget(&id);
+            if self.brain_edit.as_ref().is_some_and(|(e, _)| *e == id) {
+                self.brain_edit = None;
+            }
+        }
+        if let Some((id, text)) = save {
+            match crate::brain::edit(&id, &text) {
+                Ok(_) => self.brain_edit = None,
+                Err(e) => self.save_error = Some(format!("Couldn't save the fact: {e}")),
+            }
+        }
+        hint(ui, "Saying a fact again under the same topic replaces it. Running agents pick up changes at their next step.");
     }
 
     // ------------------------------------------------------------ pages
