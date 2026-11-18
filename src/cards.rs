@@ -985,7 +985,9 @@ fn header(pen: &mut Pen, v: &CardView, k: Kind) -> bool {
             pill(pen, "Undo", Btn::Undo, None)
         };
         let t = if b.undone { "Forgotten" } else { "Remembered" };
-        (t.to_string(), b.fact.text.clone(), right)
+        // Open, the fact is said once, in full, below.
+        let sub = if v.expanded { String::new() } else { b.fact.text.clone() };
+        (t.to_string(), sub, right)
     } else {
         status_mark(pen, k, mid);
         let right = match k {
@@ -1000,7 +1002,11 @@ fn header(pen: &mut Pen, v: &CardView, k: Kind) -> bool {
                 x - 12.0
             }
         };
-        let sub = if v.expanded && matches!(k, Kind::Approval | Kind::Questions) {
+        // Open, an ask says it in full below and the plan highlights the
+        // current step, so the row keeps just the name.
+        let quiet = matches!(k, Kind::Approval | Kind::Questions)
+            || (matches!(k, Kind::Running | Kind::Pending) && !v.agent.plan.is_empty());
+        let sub = if v.expanded && quiet {
             String::new()
         } else {
             subtitle(v, k)
@@ -1113,7 +1119,7 @@ fn compose(v: &CardView, pen: &mut Pen) -> (f32, f32) {
         return (ROW_H, 0.0);
     }
     if let Some(b) = &v.brain {
-        return (brain_body(pen, v, b, cut) + 12.0, 0.0);
+        return (brain_body(pen, v, b) + 12.0, 0.0);
     }
     let s = pen.s;
     let a = &v.agent;
@@ -1291,13 +1297,13 @@ fn questions(pen: &mut Pen, v: &CardView, q: &Question, mut y: f32) -> f32 {
     actions(pen, v, y)
 }
 
-/// Under the "Remembered" line: the fact in full (when cut), the agents
+/// Under the "Remembered" line: the fact in full, the agents
 /// that read it, and See all.
-fn brain_body(pen: &mut Pen, v: &CardView, b: &BrainView, cut: bool) -> f32 {
+fn brain_body(pen: &mut Pen, v: &CardView, b: &BrainView) -> f32 {
     let s = pen.s;
     let text_w = CARD_W - TEXT_X - PAD;
     let mut y = ROW_H - 2.0;
-    if cut {
+    {
         let fs = body_style(s);
         for l in wrap_max(&b.fact.text, &fs, text_w, s, 4) {
             pen.line(&l, TEXT_X, y, &fs);
