@@ -454,7 +454,7 @@ impl View {
         self.reveal.set(if peek { 1.0 } else { 0.0 });
     }
 
-    fn tick(&mut self, dt: f32) -> bool {
+    fn tick(&mut self, dt: f32, now: Instant) -> bool {
         let mut moving = false;
         for s in [
             &mut self.w,
@@ -465,7 +465,7 @@ impl View {
         ] {
             moving |= s.tick(dt);
         }
-        self.buddy.tick(dt);
+        self.buddy.tick(dt, now);
         moving
     }
 
@@ -1049,6 +1049,68 @@ struct Island {
     glass_at: Instant,
     /// Last time the foreground window was checked for true fullscreen.
     full_at: Instant,
+    /// What the last frame decided dimming and tucking from (for `pace`).
+    idle: Idle,
+}
+
+/// What dimming and auto-hide depend on. `frame` decides from it and `pace`
+/// wakes for its next flip, so the two can never disagree.
+#[derive(Clone, Copy, Debug)]
+struct Idle {
+    resting: bool,
+    attached: bool,
+    hovered: bool,
+    peek: bool,
+    /// An agent is asking: the island stays out.
+    needs_you: bool,
+    auto_hide: bool,
+    activity: Instant,
+}
+
+impl Idle {
+    fn new(now: Instant) -> Self {
+        Self {
+            resting: true,
+            attached: false,
+            hovered: false,
+            peek: false,
+            needs_you: false,
+            auto_hide: false,
+            activity: now,
+        }
+    }
+
+    /// Full opacity (and breathing); a resting island dims after DIM_AFTER.
+    fn awake(&self, now: Instant) -> bool {
+        !self.resting
+            || self.attached
+            || self.hovered
+            || self.peek
+            || now.saturating_duration_since(self.activity) < DIM_AFTER
+    }
+
+    /// Auto-hidden because nothing is happening.
+    fn tucked(&self, now: Instant) -> bool {
+        !self.attached
+            && self.auto_hide
+            && self.resting
+            && !self.hovered
+            && !self.peek
+            && !self.needs_you
+            && now.saturating_duration_since(self.activity) >= HIDE_AFTER
+    }
+
+    /// When `awake` or `tucked` next changes by itself. Only a deadline still
+    /// ahead that flips something counts: one that passed without a flip (an
+    /// agent asking keeps the island out) would ask for a 1 ms wait forever.
+    fn next_flip(&self, now: Instant) -> Option<Instant> {
+        [self.activity + HIDE_AFTER, self.activity + DIM_AFTER]
+            .into_iter()
+            .filter(|&t| {
+                t > now && (self.awake(t) != self.awake(now) || self.tucked(t) != self.tucked(now))
+            })
+            .min()
+    }
 }
 
 fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
@@ -1076,6 +1138,7 @@ fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
         glass: 60.0,
         glass_at: now,
         full_at: now,
+        idle: Idle::new(now),
     };
     isl.shown.set(1.0);
     unsafe {
@@ -1287,13 +1350,6 @@ impl Island {
         let state = self.view.buddy.state();
         let resting = matches!(state, BuddyState::Idle | BuddyState::Working(_));
         let attached = self.view.attached.is_some();
-        let awake = !resting
-            || attached
-            || hovered
-            || self.view.peek
-            || now.saturating_duration_since(self.activity) < DIM_AFTER;
-        self.view.buddy.set_awake(awake);
-        self.view.alpha.set(if awake { 1.0 } else { DIM_ALPHA });
         if attached {
             // Count the palette as activity, so closing it doesn't tuck at once.
             self.activity = now;
@@ -1303,18 +1359,19 @@ impl Island {
             self.follow_cursor();
             self.dirty = true;
         }
-        let needs_you = self
-            .view
-            .agents
-            .iter()
-            .any(|a| a.kind == AgentStatus::Asking);
-        self.tucked = !attached
-            && AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed)
-            && resting
-            && !hovered
-            && !self.view.peek
-            && !needs_you
-            && now.saturating_duration_since(self.activity) >= HIDE_AFTER;
+        self.idle = Idle {
+            resting,
+            attached,
+            hovered,
+            peek: self.view.peek,
+            needs_you: self.view.agents.iter().any(|a| a.kind == AgentStatus::Asking),
+            auto_hide: AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed),
+            activity: self.activity,
+        };
+        let awake = self.idle.awake(now);
+        self.view.buddy.set_awake(awake);
+        self.view.alpha.set(if awake { 1.0 } else { DIM_ALPHA });
+        self.tucked = self.idle.tucked(now);
         // Attached, the island is the palette's header: nothing hides it.
         let hide = !attached && (!self.enabled || (self.fullscreen && resting) || self.tucked);
         self.shown.set(if hide { 0.0 } else { 1.0 });
@@ -1342,7 +1399,7 @@ impl Island {
         self.view.layout(now);
 
         // ---- animate + draw
-        let moving = self.view.tick(dt) | self.shown.tick(dt);
+        let moving = self.view.tick(dt, now) | self.shown.tick(dt);
         let animating = moving || !matches!(self.view.buddy.motion(now), Motion::Still(_));
         if !(animating || self.dirty) {
             return;
@@ -1429,61 +1486,69 @@ impl Island {
                 Motion::Still(None)
             };
         }
-        let mut m = self.view.buddy.motion(now);
-        // Wake for the pending peek / unpeek, the dim, and the Done/Error fallback.
-        let mut at: Vec<Instant> = Vec::new();
-        if self.view.attached.is_none() {
-            at.push(
-                now + if self.fullscreen {
-                    Duration::from_millis(500)
-                } else {
-                    Duration::from_secs(2)
-                }
-            );
-        }
-        let (hovered, changed) = INPUT.with(|i| {
+        let input = INPUT.with(|i| {
             let i = i.borrow();
             (i.hovered, i.changed_at)
         });
-        if let Some(c) = changed {
-            if hovered && !self.view.peek && !self.no_peek {
-                at.push(c + PEEK_DELAY);
-            } else if !hovered && self.view.peek {
-                at.push(c + UNPEEK_DELAY);
-            }
-        }
-        if self.view.alpha.target == 1.0
-            && matches!(
-                self.view.buddy.state(),
-                BuddyState::Idle | BuddyState::Working(_)
-            )
-            && !hovered
-        {
-            at.push(self.activity + DIM_AFTER);
-            if AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed) {
-                at.push(self.activity + HIDE_AFTER);
-            }
-        }
-        match self.view.buddy.state() {
-            BuddyState::Done => {
-                at.push(now + Duration::from_millis(2600).saturating_sub(self.view.buddy.age(now)))
-            }
-            BuddyState::Error => {
-                at.push(now + Duration::from_secs(6).saturating_sub(self.view.buddy.age(now)))
-            }
-            _ => {}
-        }
-        if let Some(t) = at.into_iter().min() {
-            m = match m {
-                Motion::Still(None) => Motion::Still(Some(t)),
-                Motion::Still(Some(b)) => Motion::Still(Some(b.min(t))),
-                Motion::Slow if t <= now + Duration::from_millis(33) => Motion::Fast,
-                other => other,
-            };
-        }
-        m
+        wake(&self.view, &self.idle, self.fullscreen, input, self.no_peek, now)
     }
 
+}
+
+/// When a visible, settled island next needs a frame: the buddy's own motion,
+/// the fullscreen poll, the pending peek / unpeek, the dim / tuck and the
+/// Done/Error fallback. `input` is the window's (hovered, changed_at).
+fn wake(
+    view: &View,
+    idle: &Idle,
+    fullscreen: bool,
+    (hovered, changed): (bool, Option<Instant>),
+    no_peek: bool,
+    now: Instant,
+) -> Motion {
+    let mut m = view.buddy.motion(now);
+    let mut at: Vec<Instant> = Vec::new();
+    if view.attached.is_none() {
+        at.push(
+            now + if fullscreen {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(2)
+            },
+        );
+    }
+    if let Some(c) = changed {
+        if hovered && !view.peek && !no_peek {
+            at.push(c + PEEK_DELAY);
+        } else if !hovered && view.peek {
+            at.push(c + UNPEEK_DELAY);
+        }
+    }
+    at.extend(idle.next_flip(now));
+    match view.buddy.state() {
+        BuddyState::Done => {
+            at.push(now + Duration::from_millis(2600).saturating_sub(view.buddy.age(now)))
+        }
+        BuddyState::Error => {
+            at.push(now + Duration::from_secs(6).saturating_sub(view.buddy.age(now)))
+        }
+        _ => {}
+    }
+    // The frame just run at `now` already acted on (or deliberately kept) any
+    // earlier deadline, e.g. the unpeek while the cursor sits just beside the
+    // pill; waking for it again would be a 1 ms wait on every loop.
+    if let Some(t) = at.into_iter().filter(|&t| t >= now).min() {
+        m = match m {
+            Motion::Still(None) => Motion::Still(Some(t)),
+            Motion::Still(Some(b)) => Motion::Still(Some(b.min(t))),
+            Motion::Slow if t <= now + Duration::from_millis(33) => Motion::Fast,
+            other => other,
+        };
+    }
+    m
+}
+
+impl Island {
     /// True when the cursor is over where the rest pill sits, even while the
     /// window is hidden. Lets a tucked island come back when the pointer is
     /// moved to it, not only to the very top edge of the monitor.
@@ -1739,6 +1804,89 @@ mod tests {
         assert!(v.render_body(1.5, now).is_some());
     }
 
+    /// A resting island must not spin. Runs what `frame` decides (`Idle`, the
+    /// view's tick) and what `pace` then waits (`wake`) with time moving on, for
+    /// each resting state: with nothing animating no wait under 10 ms repeats
+    /// (one can, when a real deadline falls just after a poll), and breathing
+    /// never turns into a run of display-rate frames.
+    #[test]
+    fn island_idle_never_spins() {
+        let asking: Vec<AgentRow> = rows()
+            .into_iter()
+            .filter(|r| r.kind == AgentStatus::Asking)
+            .collect();
+        let t0 = Instant::now();
+        // (name, agents, auto-hide, seconds since the last activity at the start)
+        let cases = [
+            ("visible-idle", Vec::new(), false, 0),
+            ("visible-idle auto-hide", Vec::new(), true, 0),
+            ("dimmed", Vec::new(), false, 12),
+            ("dimmed auto-hide", Vec::new(), true, 12),
+            ("tucked", Vec::new(), true, 5),
+            ("working", rows(), false, 0),
+            ("working auto-hide", rows(), true, 0),
+            ("asking", asking.clone(), false, 0),
+            ("asking auto-hide", asking, true, 0),
+        ];
+        for (name, agents, auto_hide, ago) in cases {
+            let mut v = View::new(t0);
+            v.set_agents(agents, t0);
+            let start = t0 + Duration::from_secs(20);
+            let activity = start - Duration::from_secs(ago);
+            let (mut now, mut last, mut fast_run, mut short_run) = (start, start, 0, 0);
+            while now < start + Duration::from_secs(40) {
+                // What `frame` decides…
+                let idle = Idle {
+                    resting: matches!(v.buddy.state(), BuddyState::Idle | BuddyState::Working(_)),
+                    attached: false,
+                    hovered: false,
+                    peek: false,
+                    needs_you: v.agents.iter().any(|a| a.kind == AgentStatus::Asking),
+                    auto_hide,
+                    activity,
+                };
+                let awake = idle.awake(now);
+                v.buddy.set_awake(awake);
+                v.alpha.set(if awake { 1.0 } else { DIM_ALPHA });
+                v.tick(now.saturating_duration_since(last).as_secs_f32().min(0.05), now);
+                settle(&mut v, now);
+                last = now;
+                // …and how long `pace` then waits.
+                let at = now - start;
+                let own = v.buddy.motion(now);
+                let paced = wake(&v, &idle, false, (false, None), false, now);
+                if !matches!((paced, own), (Motion::Fast, Motion::Slow)) {
+                    fast_run = 0;
+                }
+                let step = match paced {
+                    Motion::Fast => {
+                        assert!(!matches!(own, Motion::Still(_)), "{name}: Fast with nothing animating at {at:?}");
+                        if matches!(own, Motion::Slow) {
+                            fast_run += 1;
+                            assert!(fast_run < 5, "{name}: breathing stuck at display rate at {at:?}");
+                        }
+                        Duration::from_millis(16)
+                    }
+                    Motion::Slow => Duration::from_millis(33),
+                    Motion::Still(Some(t)) => {
+                        // A real deadline can fall just after a poll; a stale
+                        // one asks for the same short wait again and again.
+                        let w = t.saturating_duration_since(now);
+                        short_run = if w < Duration::from_millis(10) { short_run + 1 } else { 0 };
+                        assert!(short_run < 2, "{name}: waits {w:?} again at {at:?}");
+                        w
+                    }
+                    Motion::Still(None) => Duration::from_secs(1),
+                };
+                if !matches!(paced, Motion::Still(Some(_))) {
+                    short_run = 0;
+                }
+                // The island's loop waits 1 ms past the deadline.
+                now += step + Duration::from_millis(1);
+            }
+        }
+    }
+
     /// `SCREENBUDDY_ISLAND_PNG=<dir> cargo test island` writes previews of the
     /// rest pill, the peek panel and every buddy state.
     #[test]
@@ -1765,7 +1913,7 @@ mod tests {
             if let BuddyState::Listening(l) = st {
                 v.buddy.set(BuddyState::Listening(l), now);
                 for _ in 0..200 {
-                    v.buddy.tick(0.01);
+                    v.buddy.tick(0.01, now);
                 }
             }
             settle(&mut v, now);

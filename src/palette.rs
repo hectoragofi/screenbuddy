@@ -246,6 +246,8 @@ pub struct Palette {
     send_when_ready: bool,
     /// Give the input focus back on the next frame.
     refocus: bool,
+    /// The composer's widget id, to tell it from other focused fields.
+    composer_id: Option<egui::Id>,
     /// Move the input's cursor to the end of the text on the next frame.
     cursor_end: bool,
     /// Recent mic levels for the recording waveform, oldest first.
@@ -281,6 +283,19 @@ struct Bud {
     from: egui::Pos2,
     to: egui::Pos2,
     start: f64,
+}
+
+/// The answer kept on the thread for a turn that failed or was stopped after
+/// its tools already ran (`acted`), so a retry doesn't do them again. Shared
+/// with quick asks.
+pub(crate) fn interrupted_answer(answer: &str, acted: &[String]) -> String {
+    format!(
+        "{}\n\n[Interrupted before finishing. Already done: {}.]",
+        answer.trim(),
+        acted.join("; ")
+    )
+    .trim_start()
+    .to_string()
 }
 
 /// Opens the palette and blocks until it closes.
@@ -583,6 +598,7 @@ impl Palette {
             attaching: Vec::new(),
             send_when_ready: false,
             refocus: false,
+            composer_id: None,
             cursor_end: false,
             wave: Vec::new(),
             wave_t: 0.0,
@@ -699,6 +715,10 @@ impl Palette {
     /// conversation back via Done.
     fn stop_turn(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        // A stopped turn must not act later: the waiting action is denied.
+        if self.pending.is_some() {
+            self.decide(false, false);
+        }
         crate::island::buddy(crate::island::BuddyState::Idle);
         if let Some(x) = self.exchanges.last_mut() {
             x.error = Some(friendly("cancelled"));
@@ -706,7 +726,8 @@ impl Palette {
     }
 
     /// Asks the last question again after it failed or was stopped. The
-    /// worker already rolled the conversation back to before that question.
+    /// worker already rolled the conversation back to before that question,
+    /// or, if it had acted, kept it (with what was done) on the thread.
     fn retry(&mut self, ctx: &egui::Context) {
         if self.busy() || self.exchanges.last().is_none_or(|x| x.error.is_none()) {
             return;
@@ -904,7 +925,9 @@ impl Palette {
                     let _ = reply.send(r);
                 }
                 Ev::Approve(intent, detail, reply) => {
-                    if self.allow_all || self.cfg.agent_desktop.approval == "never" {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        let _ = reply.send(false); // asked after Stop
+                    } else if self.allow_all || self.cfg.agent_desktop.approval == "never" {
                         let _ = reply.send(true);
                     } else {
                         self.pending = Some((intent, detail, reply));
@@ -951,7 +974,15 @@ impl Palette {
     fn record_turn(&mut self, conv: &Conversation) {
         let held = self.cli_held.take();
         let Some(x) = self.exchanges.last() else { return };
-        if x.error.is_some() || (x.answer.trim().is_empty() && x.agents.is_empty()) {
+        let mut a = x.answer.clone();
+        if x.error.is_some() {
+            // A failed or stopped turn is dropped, unless it already acted:
+            // then it stays, with what was done, so a retry doesn't redo it.
+            if conv.acted.is_empty() {
+                return;
+            }
+            a = interrupted_answer(&a, &conv.acted);
+        } else if x.answer.trim().is_empty() && x.agents.is_empty() {
             return;
         }
         let cli = held.zip(conv.cli_session.clone()).map(|(h, s)| (s, h));
@@ -959,7 +990,6 @@ impl Palette {
         if !x.attached.is_empty() {
             q.push_str(&format!(" [attached: {}]", x.attached.join(", ")));
         }
-        let a = x.answer.clone();
         crate::thread::update(|t| t.push(&q, &a, cli));
     }
 
@@ -1719,6 +1749,7 @@ impl Palette {
             .align(egui::Align2::LEFT_CENTER)
             .desired_width(f32::INFINITY);
         let resp = ui.add_sized([ui.available_width(), ICON_H], edit);
+        self.composer_id = Some(resp.id);
         if std::mem::take(&mut self.cursor_end) {
             if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), resp.id) {
                 let end = egui::text::CCursor::new(self.input.chars().count());
@@ -2287,10 +2318,18 @@ impl Palette {
         if always {
             self.allow_all = true;
             self.cfg.agent_desktop.approval = "never".into();
-            let (mut disk, _) = config::load();
-            disk.agent_desktop.approval = "never".into();
-            if let Err(e) = config::save(&disk) {
+            // Never save over a config.toml that did not load: that would write
+            // defaults (the save refuses anyway). Allowed for this session only.
+            let saved = match config::load() {
+                (_, Some(e)) => Err(e),
+                (mut disk, None) => {
+                    disk.agent_desktop.approval = "never".into();
+                    config::save(&disk).map_err(|e| e.to_string())
+                }
+            };
+            if let Err(e) = saved {
                 config::log(&format!("saving approval mode failed: {e}"));
+                self.notice = Some(format!("Allowed for now, but couldn't save \"always\" ({e})."));
             }
         }
     }
@@ -2487,10 +2526,18 @@ impl eframe::App for Palette {
             }
         }
 
+        // Another field (an agent's answer box) has focus: Enter is its own.
+        let other_focus = ctx
+            .memory(|m| m.focused())
+            .is_some_and(|f| Some(f) != self.composer_id);
         if self.pending.is_some() {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
                 self.decide(false, false);
-            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)) {
+            } else if self.input.trim().is_empty()
+                && !other_focus
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
+            {
+                // Only a bare Enter allows; typing a follow-up never does.
                 self.decide(true, false);
             }
         }
@@ -2504,7 +2551,7 @@ impl eframe::App for Palette {
                 }
             }
         }
-        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+        let enter = !other_focus && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
 
         let full = ui.max_rect();
         self.scale = ctx.pixels_per_point();

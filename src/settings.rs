@@ -805,9 +805,23 @@ impl Settings {
                 if ui.add(btn).clicked() {
                     if self.confirm_reset {
                         let keep = (self.cfg.anthropic.api_key.clone(), self.cfg.openai.api_key.clone());
+                        let menu = self.cfg.context.explorer_menu;
                         self.cfg = Config::default();
                         self.cfg.anthropic.api_key = keep.0;
                         self.cfg.openai.api_key = keep.1;
+                        // The registry follows the toggle, as when it is flipped by hand.
+                        let mut menu_err = None;
+                        if self.cfg.context.explorer_menu != menu {
+                            if let Err(e) = crate::context::set_explorer_menu(self.cfg.context.explorer_menu) {
+                                self.cfg.context.explorer_menu = menu;
+                                menu_err = Some(format!("Couldn't change the Explorer menu: {e}"));
+                            }
+                        }
+                        // Save now so a successful save does not clear the menu error.
+                        self.persist();
+                        if menu_err.is_some() {
+                            self.save_error = menu_err;
+                        }
                         self.confirm_reset = false;
                     } else {
                         self.confirm_reset = true;

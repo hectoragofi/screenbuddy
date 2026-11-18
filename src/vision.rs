@@ -683,7 +683,7 @@ fn server() -> Option<&'static (u16, String)> {
         .get_or_init(|| {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
             let port = listener.local_addr().ok()?.port();
-            let token = random_token();
+            let token = crate::mcp::loopback::token()?;
             let t = token.clone();
             std::thread::spawn(move || {
                 for stream in listener.incoming().flatten() {
@@ -696,24 +696,13 @@ fn server() -> Option<&'static (u16, String)> {
         .as_ref()
 }
 
-fn random_token() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-    let a = h.finish();
-    let b = std::collections::hash_map::RandomState::new().build_hasher().finish();
-    format!("{a:016x}{b:016x}")
-}
-
+/// Token line, then one request line (see `mcp::loopback`); anything else is dropped.
 fn serve(stream: std::net::TcpStream, token: &str) {
-    let mut line = String::new();
-    if BufReader::new(&stream).read_line(&mut line).is_err() {
+    let Some(line) = crate::mcp::loopback::read_request(&stream, token) else {
         return;
-    }
+    };
     let req: Value = serde_json::from_str(&line).unwrap_or_default();
-    let res = if req["token"].as_str() != Some(token) {
-        ToolOut::text("error: unauthorized", true)
-    } else {
+    let res = {
         let out = state().out.clone();
         match out {
             Some(out) => handle(req["tool"].as_str().unwrap_or(""), &req["input"], &out),
@@ -725,22 +714,20 @@ fn serve(stream: std::net::TcpStream, token: &str) {
     let _ = writeln!(w, "{reply}");
 }
 
-/// Environment for the MCP server spawned by the Claude CLI.
-pub fn cli_env(env: &mut serde_json::Map<String, Value>) {
-    if let Some((port, token)) = server() {
-        env.insert(PORT_ENV.into(), json!(port.to_string()));
-        env.insert(TOKEN_ENV.into(), json!(token));
-    }
+/// Environment for the MCP server spawned by the Claude CLI. Returns the
+/// token variable, which goes in the CLI's own environment (the MCP server
+/// inherits it), not in `env`: that ends up on the CLI's command line.
+pub fn cli_env(env: &mut serde_json::Map<String, Value>) -> Option<(&'static str, String)> {
+    let (port, token) = server()?;
+    env.insert(PORT_ENV.into(), json!(port.to_string()));
+    Some((TOKEN_ENV, token.clone()))
 }
 
 /// `tools/call` for zoom/watch inside `screenbuddy --mcp`: forwarded to the parent.
 pub fn mcp_call(name: &str, args: &Value) -> Value {
-    let port = std::env::var(PORT_ENV).ok().and_then(|p| p.parse::<u16>().ok());
-    let token = std::env::var(TOKEN_ENV).unwrap_or_default();
-    let res = port
-        .and_then(|p| std::net::TcpStream::connect(("127.0.0.1", p)).ok())
+    let res = crate::mcp::loopback::connect(PORT_ENV, TOKEN_ENV)
         .and_then(|mut s| {
-            writeln!(s, "{}", json!({"token": token, "tool": name, "input": args})).ok()?;
+            writeln!(s, "{}", json!({"tool": name, "input": args})).ok()?;
             let mut line = String::new();
             BufReader::new(&s).read_line(&mut line).ok()?;
             serde_json::from_str::<Value>(&line).ok()
@@ -844,6 +831,26 @@ mod tests {
         }
         assert!(is_change(changed_cells(&a, &b)));
         assert!(is_change(changed_cells(&a, &a[..10])));
+    }
+
+    #[test]
+    fn bridge_requires_token() {
+        let (port, token) = server().unwrap();
+        let ask = |msg: String| {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", *port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let _ = s.write_all(msg.as_bytes());
+            let mut r = String::new();
+            let _ = BufReader::new(&s).read_line(&mut r);
+            r
+        };
+        let req = json!({"tool": "zoom", "input": {}}).to_string();
+        assert_eq!(ask(format!("{req}\n")), "");
+        assert_eq!(ask(format!("{}\n{req}\n", "f".repeat(64))), "");
+        // The old in-JSON token is no longer accepted.
+        assert_eq!(ask(format!("{}\n", json!({"token": token, "tool": "zoom", "input": {}}))), "");
+        let ok: Value = serde_json::from_str(&ask(format!("{token}\n{req}\n"))).unwrap();
+        assert!(ok["text"].is_string(), "{ok}");
     }
 
     #[test]

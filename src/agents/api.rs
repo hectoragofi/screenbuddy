@@ -201,14 +201,27 @@ fn load_history(cwd: &Path, first: bool) -> Vec<Value> {
     if first {
         return Vec::new();
     }
-    std::fs::read_to_string(cwd.join(HISTORY))
+    let mut msgs: Vec<Value> = std::fs::read_to_string(cwd.join(HISTORY))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Older saves could hold a tool_use with no result, which the API rejects.
+    crate::llm::pair_tool_uses(&mut msgs);
+    msgs
 }
 
 fn save_history(cwd: &Path, msgs: &[Value]) {
     let _ = std::fs::write(cwd.join(HISTORY), serde_json::to_string(msgs).unwrap_or_default());
+}
+
+/// Ends an Anthropic round early: adds the results so far, pairs every
+/// tool_use (unrun ones get an error result) and saves.
+fn finish_round(cwd: &Path, msgs: &mut Vec<Value>, results: Vec<Value>) {
+    if !results.is_empty() {
+        msgs.push(json!({"role": "user", "content": results}));
+    }
+    crate::llm::pair_tool_uses(msgs);
+    save_history(cwd, msgs);
 }
 
 /// Sends a request, polling `sink.stopped()` so stop works mid-request.
@@ -270,7 +283,7 @@ fn anthropic(job: &TurnJob, sink: &Sink) -> Result<String, String> {
         content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64::engine::general_purpose::STANDARD.encode(img.as_slice())}}));
     }
     content.push(json!({"type": "text", "text": job.prompt}));
-    msgs.push(json!({"role": "user", "content": content}));
+    crate::llm::push_user(&mut msgs, Value::Array(content));
     let http = client()?;
     let url = format!("{}/v1/messages", c.base_url.trim_end_matches('/'));
     let system = super::agent_prompt(&job.cfg, desktop);
@@ -298,12 +311,14 @@ fn anthropic(job: &TurnJob, sink: &Sink) -> Result<String, String> {
                 results.push(json!({"type": "tool_result", "tool_use_id": b["id"], "content": content}));
             } else if b["type"] == "tool_use" {
                 let (text, is_error) = call(b["name"].as_str().unwrap_or(""), &b["input"], job, sink);
-                if sink.stopped() {
-                    return Err("stopped".into());
-                }
                 results.push(
                     json!({"type": "tool_result", "tool_use_id": b["id"], "content": text, "is_error": is_error}),
                 );
+                if sink.stopped() {
+                    // Keep what already ran so a follow-up doesn't redo it.
+                    finish_round(&job.cwd, &mut msgs, results);
+                    return Err("stopped".into());
+                }
             } else if b["type"] == "server_tool_use" {
                 if let Some(q) = b["input"]["query"].as_str() {
                     sink.step(&format!("Searching: {q}"));
@@ -314,7 +329,9 @@ fn anthropic(job: &TurnJob, sink: &Sink) -> Result<String, String> {
             "tool_use" if !results.is_empty() => msgs.push(json!({"role": "user", "content": results})),
             "pause_turn" => {}
             _ => {
-                save_history(&job.cwd, &msgs);
+                // Cut off (max_tokens, refusal...) with tool calls in it:
+                // their results still go in, so the saved history stays valid.
+                finish_round(&job.cwd, &mut msgs, results);
                 let text: Vec<&str> = blocks
                     .iter()
                     .filter(|b| b["type"] == "text")
@@ -391,4 +408,70 @@ fn openai(job: &TurnJob, sink: &Sink) -> Result<String, String> {
         save_history(&job.cwd, &msgs);
     }
     Err("the agent used too many steps without finishing".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("screenbuddy-api-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn unpaired(msgs: &[Value]) -> usize {
+        msgs.iter()
+            .enumerate()
+            .flat_map(|(i, m)| {
+                m["content"].as_array().into_iter().flatten().filter(move |b| {
+                    b["type"] == "tool_use"
+                        && !msgs.get(i + 1).is_some_and(|n| {
+                            n["role"] == "user"
+                                && n["content"].as_array().is_some_and(|c| {
+                                    c.iter().any(|r| r["type"] == "tool_result" && r["tool_use_id"] == b["id"])
+                                })
+                        })
+                })
+            })
+            .count()
+    }
+
+    #[test]
+    fn cut_off_round_saves_a_valid_history() {
+        let d = dir("cut");
+        // A reply that stopped at max_tokens with one call run and one not.
+        let mut msgs = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "do it"}]}),
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "report_step", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "write_file", "input": {}}
+            ]}),
+        ];
+        let results = vec![json!({"type": "tool_result", "tool_use_id": "a", "content": "ok", "is_error": false})];
+        finish_round(&d, &mut msgs, results);
+        let mut saved = load_history(&d, false);
+        assert_eq!(unpaired(&saved), 0);
+        assert_eq!(saved, msgs);
+        // The follow-up joins the results message instead of a second user turn.
+        crate::llm::push_user(&mut saved, json!([{"type": "text", "text": "and now?"}]));
+        assert_eq!(saved.len(), 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn broken_saved_history_is_repaired_on_load() {
+        let d = dir("load");
+        let broken = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": [{"type": "tool_use", "id": "x", "name": "desktop", "input": {}}]}),
+        ];
+        save_history(&d, &broken);
+        let msgs = load_history(&d, false);
+        assert_eq!(unpaired(&broken), 1);
+        assert_eq!(unpaired(&msgs), 0);
+        assert_eq!(msgs[2]["content"][0]["is_error"], true);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

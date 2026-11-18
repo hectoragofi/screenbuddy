@@ -26,7 +26,6 @@ use crate::ui::tokens::{self, Rgba};
 use crate::ui::{self, Face, Layer, MonitorInfo, Spring, TextStyle};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2289,9 +2288,9 @@ impl Cards {
                 let file = self.find(id).and_then(|c| c.agent.files.get(i).cloned());
                 if let Some(f) = file {
                     if right {
-                        reveal(&f);
+                        crate::win::reveal(&f);
                     } else {
-                        open_file(&f);
+                        crate::win::open_agent_file(&f);
                     }
                 }
                 true
@@ -2327,12 +2326,22 @@ impl Cards {
                 crate::win::push(crate::win::AppEvent::AgentPalette(id.to_string()));
             }
             Btn::Always => {
-                let (mut cfg, _) = crate::config::load();
-                if !cfg.agents.always_approve {
-                    cfg.agents.always_approve = true;
-                    if let Err(e) = crate::config::save(&cfg) {
-                        crate::config::log(&format!("cards: saving always_approve: {e}"));
+                // Never save over a config.toml that did not load (that would
+                // write defaults); the click still allows this conversation.
+                let saved = match crate::config::load() {
+                    (_, Some(e)) => Err(e),
+                    (cfg, None) if cfg.agents.always_approve => Ok(()),
+                    (mut cfg, None) => {
+                        cfg.agents.always_approve = true;
+                        crate::config::save(&cfg).map_err(|e| e.to_string())
                     }
+                };
+                if let Err(e) = saved {
+                    crate::config::log(&format!("cards: saving always_approve: {e}"));
+                    caption::send(caption::Cmd::Notice {
+                        text: format!("Allowed for this agent, but couldn't save \"always\" ({e})."),
+                        id: id.to_string(),
+                    });
                 }
                 if let Some(q) = ask {
                     agents::answer(id, q.id, Answer::Allow);
@@ -2678,27 +2687,6 @@ impl Cards {
         }
         Some(at.into_iter().filter(|t| *t > now).min())
     }
-}
-
-fn open_file(p: &Path) {
-    let file = crate::util::wide(&p.to_string_lossy());
-    let verb = crate::util::wide("open");
-    unsafe {
-        windows::Win32::UI::Shell::ShellExecuteW(
-            None,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(file.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-    }
-}
-
-fn reveal(p: &Path) {
-    let _ = std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", p.display()))
-        .spawn();
 }
 
 fn clipboard_text() -> Option<String> {
