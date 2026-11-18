@@ -28,6 +28,22 @@ pub struct Config {
     pub agents: AgentsCfg,
     pub walk: WalkCfg,
     pub brain: BrainCfg,
+    pub thread: ThreadCfg,
+}
+
+/// The ongoing conversation with the buddy.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ThreadCfg {
+    /// Turns sent with each request; older ones are summed up in one line
+    /// and found with recall.
+    pub window: usize,
+}
+
+impl Default for ThreadCfg {
+    fn default() -> Self {
+        Self { window: 6 }
+    }
 }
 
 /// The shared brain: facts the buddy saves and every agent reads.
@@ -303,6 +319,7 @@ impl Default for Config {
             agents: AgentsCfg::default(),
             walk: WalkCfg::default(),
             brain: BrainCfg::default(),
+            thread: ThreadCfg::default(),
         }
     }
 }

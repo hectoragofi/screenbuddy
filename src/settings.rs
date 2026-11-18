@@ -351,6 +351,10 @@ impl Settings {
                 toggle(ui, &mut self.cfg.history, accent);
             });
             sep(ui);
+            row(ui, "Recent turns sent", Some("One ongoing chat; older turns are summed up and looked up when needed"), |ui| {
+                ui.add(egui::Slider::new(&mut self.cfg.thread.window, 2..=20));
+            });
+            sep(ui);
             row(ui, "Past conversations", Some("Search, read and continue them (Ctrl+H in the palette)"), |ui| {
                 if ui.button("Show in Explorer").clicked() {
                     win::shell_open(&config::history_dir());

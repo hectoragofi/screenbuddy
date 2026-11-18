@@ -10,8 +10,7 @@
 use crate::caption::{self, CaptionEvent, Cmd};
 use crate::config::{self, Config};
 use crate::keys::{self, KeyEvent};
-use crate::{capture, history, llm, overlay, vision, voice, win};
-use std::path::PathBuf;
+use crate::{capture, llm, overlay, vision, voice, win};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -144,8 +143,8 @@ struct Quick {
     shot: Option<std::thread::JoinHandle<anyhow::Result<capture::Capture>>>,
     transcript: Option<Receiver<Result<String, String>>>,
     turn: Option<Turn>,
-    /// The last finished quick ask, saved so the palette can continue it.
-    last: Option<PathBuf>,
+    /// A quick ask finished onto the thread: a click continues it in the palette.
+    last: bool,
     /// Alt was held over this agent's card: the words are a follow-up to it.
     follow: Option<String>,
 }
@@ -158,7 +157,7 @@ impl Quick {
             shot: None,
             transcript: None,
             turn: None,
-            last: None,
+            last: false,
             follow: None,
         }
     }
@@ -271,8 +270,9 @@ impl Quick {
         match c {
             CaptionEvent::Clicked => {
                 self.stop_turn();
-                if let Some(dir) = self.last.take() {
-                    win::push(win::AppEvent::OpenChat(dir));
+                if std::mem::take(&mut self.last) {
+                    // The palette opens on the thread, which now holds this ask.
+                    win::push(win::AppEvent::IslandClick);
                 }
                 status(Status::Idle);
             }
@@ -348,6 +348,7 @@ impl Quick {
         vision::set_capture(&cap, &cfg);
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let provider = cfg.provider.clone();
         let turn = llm::Turn {
             cfg,
             conv: Default::default(),
@@ -359,6 +360,12 @@ impl Quick {
             }),
             attachments: Vec::new(),
             cancel: cancel.clone(),
+            // The ongoing thread's last few turns; one-shot, so no CLI resume.
+            thread: Some(crate::thread::load().context(
+                crate::thread::Thread::window_of(&self.cfg),
+                &provider,
+                false,
+            )),
         };
         llm::spawn(turn, llm::Out::new(tx, egui::Context::default()));
         self.turn = Some(Turn {
@@ -443,7 +450,7 @@ impl Quick {
         }
         if finished {
             let t = self.turn.take().unwrap();
-            self.last = save(&self.cfg, &t);
+            self.last = record(&t);
             if let Some(goal) = crate::walk::take_request() {
                 // The brain chose a walkthrough: it takes over the caption.
                 crate::walk::start(goal, &self.cfg);
@@ -469,7 +476,7 @@ impl Quick {
             if t.error.is_none() && !t.answer.is_empty() {
                 t.error = Some(format!("{}stopped.", llm::INTERRUPTED));
             }
-            self.last = save(&self.cfg, &t);
+            self.last = record(&t);
         }
     }
 
@@ -490,32 +497,12 @@ fn short_error(e: &str) -> String {
     first.chars().take(160).collect()
 }
 
-/// Writes the exchange like the palette's history, so the palette can open it.
-/// With history off it goes to a temp folder instead.
-fn save(cfg: &Config, t: &Turn) -> Option<PathBuf> {
-    let root = if cfg.history {
-        config::history_dir()
-    } else {
-        std::env::temp_dir().join("screenbuddy-quick")
-    };
-    let dir = root.join(format!("{}-quick", crate::util::file_stamp()));
-    std::fs::create_dir_all(&dir).ok()?;
-    let _ = std::fs::write(dir.join("screenshot.jpg"), &t.cap.jpeg);
-    let chat = history::Chat {
-        created: crate::util::timestamp(),
-        provider: cfg.provider_label(),
-        exchanges: vec![history::SavedExchange {
-            question: t.question.clone(),
-            answer: t.answer.clone(),
-            error: t.error.clone(),
-            attached: Vec::new(),
-        }],
-    };
-    match history::write(&dir, &chat) {
-        Ok(()) => Some(dir),
-        Err(e) => {
-            config::log(&format!("saving quick ask failed: {e}"));
-            None
-        }
+/// Adds a finished quick ask to the thread (typed and spoken asks share it).
+/// True when there was an answer to keep.
+fn record(t: &Turn) -> bool {
+    if t.answer.trim().is_empty() {
+        return false;
     }
+    crate::thread::update(|th| th.push(&t.question, &t.answer, None));
+    true
 }

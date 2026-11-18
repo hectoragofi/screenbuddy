@@ -39,6 +39,8 @@ pub fn start() {
     });
 
     SEEN.store(now(), Ordering::Relaxed);
+    // Finished agents post their short result onto the buddy's thread.
+    crate::thread::watch_agents();
     let rx = agents::subscribe();
     let _ = std::thread::Builder::new()
         .name("screenbuddy-agent-rows".into())

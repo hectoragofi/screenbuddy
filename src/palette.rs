@@ -253,6 +253,8 @@ pub struct Palette {
     wave_t: f64,
     /// Typed answers to agents' questions, by agent id.
     agent_drafts: std::collections::HashMap<String, String>,
+    /// Claude CLI: turns its session will hold after the answer in flight.
+    cli_held: Option<usize>,
     /// Laid out as part of the island: tabs inside, top edge under the pill.
     inset: bool,
     /// The island is merged with the surface right now (it lets go on a dodge).
@@ -508,8 +510,16 @@ impl Palette {
     ) -> Self {
         let mut cap = cap;
         let jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
-        let conv = Conversation::default();
+        // Reopen on the ongoing thread; a still-current Claude CLI session resumes.
+        let thread = crate::thread::load();
+        let mut conv = Conversation::default();
+        if cfg.provider == "claude-cli"
+            && thread.cli_plan(crate::thread::Thread::window_of(&cfg)) == crate::thread::CliPlan::Resume
+        {
+            conv.cli_session = thread.cli.as_ref().map(|c| c.session.clone());
+        }
         llm::prewarm(&cfg, &conv);
+        let exchanges = shown_turns(&thread);
         let inset = attaches(&cfg, &start);
         let accent = if inset { SIGNAL } else { accent_of(&cfg) };
         let width = cfg.appearance.width.clamp(480.0, 1100.0);
@@ -521,7 +531,7 @@ impl Palette {
             jpeg,
             thumb: None,
             input: String::new(),
-            exchanges: Vec::new(),
+            exchanges,
             conv: Some(conv),
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -549,7 +559,7 @@ impl Palette {
             notice,
             quit: false,
             outcome,
-            history_dir: None,
+            history_dir: thread.history_dir.clone(),
             pending: None,
             allow_all: false,
             accent,
@@ -559,7 +569,7 @@ impl Palette {
             agent_view: None,
             draft: String::new(),
             resume: None,
-            created: None,
+            created: Some(thread.created.clone()).filter(|c| !c.is_empty()),
             rec: None,
             ptt: None,
             transcribing: None,
@@ -577,6 +587,7 @@ impl Palette {
             wave: Vec::new(),
             wave_t: 0.0,
             agent_drafts: Default::default(),
+            cli_held: None,
             inset,
             attached: false,
             drop,
@@ -620,7 +631,21 @@ impl Palette {
         if let Some(pre) = self.resume.take() {
             prompt = pre + &prompt;
         }
-        let image = if conv.image_sent {
+        // Only the last few turns of the thread go along, text only.
+        let n = crate::thread::Thread::window_of(&self.cfg);
+        let thread = crate::thread::load();
+        let window = thread.context(n, &self.cfg.provider, true);
+        let cli = self.cfg.provider == "claude-cli";
+        self.cli_held = cli.then(|| match thread.cli_plan(n) {
+            crate::thread::CliPlan::Resume => thread.cli.as_ref().map_or(0, |c| c.held) + 1,
+            crate::thread::CliPlan::Fresh { seed } => seed + 1,
+        });
+        if window.cli_fresh {
+            conv.image_sent = false;
+        }
+        // The current screenshot goes with every turn (older ones are never
+        // resent); a Claude CLI session already holds it after its first turn.
+        let image = if cli && conv.image_sent {
             None
         } else {
             conv.image_sent = true;
@@ -650,6 +675,7 @@ impl Palette {
                 image,
                 attachments,
                 cancel: self.cancel.clone(),
+                thread: Some(window),
             },
             llm::Out::new(tx, ctx.clone()),
         );
@@ -709,22 +735,14 @@ impl Palette {
                 }
                 cap.cursor = self.cap.cursor;
                 crate::vision::set_capture(&cap, &self.cfg);
-                self.save_history();
                 self.jpeg = Arc::new(std::mem::take(&mut cap.jpeg));
                 self.cap = cap;
                 self.thumb = thumbnail(ctx, &self.jpeg);
-                self.conv = Some({
-                    let c = Conversation::default();
-                    llm::prewarm(&self.cfg, &c);
-                    c
-                });
+                // Same thread, new screen: it goes with the next question.
+                if let Some(c) = self.conv.as_mut() {
+                    c.image_sent = false;
+                }
                 self.overlay = None;
-                self.exchanges.clear();
-                self.math.borrow_mut().clear();
-                self.diagrams.clear();
-                self.history_dir = None;
-                self.resume = None;
-                self.created = None;
                 self.notice = None;
             }
             Err(e) => self.notice = Some(format!("Couldn't take a new screenshot ({e}).")),
@@ -915,6 +933,7 @@ impl Palette {
                         crate::island::buddy(crate::island::BuddyState::Done);
                     }
                     self.trim_at = 0.0; // the answer's working memory is now cold
+                    self.record_turn(&conv);
                     self.conv = Some(conv);
                     self.status.clear();
                     keep = false;
@@ -927,18 +946,42 @@ impl Palette {
         }
     }
 
+    /// Puts the answered exchange on the thread (with the CLI session that
+    /// now carries it).
+    fn record_turn(&mut self, conv: &Conversation) {
+        let held = self.cli_held.take();
+        let Some(x) = self.exchanges.last() else { return };
+        if x.error.is_some() || (x.answer.trim().is_empty() && x.agents.is_empty()) {
+            return;
+        }
+        let cli = held.zip(conv.cli_session.clone()).map(|(h, s)| (s, h));
+        let mut q = x.question.clone();
+        if !x.attached.is_empty() {
+            q.push_str(&format!(" [attached: {}]", x.attached.join(", ")));
+        }
+        let a = x.answer.clone();
+        crate::thread::update(|t| t.push(&q, &a, cli));
+    }
+
+    /// Writes the whole thread to its History folder (when History is on).
     fn save_history(&mut self) {
-        if !self.cfg.history || self.exchanges.is_empty() {
+        if !self.cfg.history {
             return;
         }
-        // Only agents opened from the island: nothing of this chat to keep.
-        if self.exchanges.iter().all(|x| x.answer.is_empty() && x.error.is_none() && !x.agents.is_empty()) {
+        let thread = crate::thread::load();
+        if thread.turns.is_empty() {
             return;
         }
-        let dir = self
-            .history_dir
-            .get_or_insert_with(|| config::history_dir().join(crate::util::file_stamp()))
-            .clone();
+        let dir = match self.history_dir.clone().or_else(|| thread.history_dir.clone()) {
+            Some(d) => d,
+            None => {
+                let d = config::history_dir().join(crate::util::file_stamp());
+                let keep = d.clone();
+                crate::thread::update(|t| t.history_dir = Some(keep));
+                d
+            }
+        };
+        self.history_dir = Some(dir.clone());
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
@@ -946,20 +989,10 @@ impl Palette {
         if !shot.exists() {
             let _ = std::fs::write(&shot, &*self.jpeg);
         }
-        let chat = history::Chat {
-            created: self.created.get_or_insert_with(crate::util::timestamp).clone(),
-            provider: self.cfg.provider_label(),
-            exchanges: self
-                .exchanges
-                .iter()
-                .map(|x| history::SavedExchange {
-                    question: x.question.clone(),
-                    answer: x.answer.clone(),
-                    error: x.error.as_ref().map(|e| e.detail.clone()),
-                    attached: x.attached.clone(),
-                })
-                .collect(),
-        };
+        let mut chat = thread.chat(self.cfg.provider_label());
+        if chat.created.is_empty() {
+            chat.created = self.created.get_or_insert_with(crate::util::timestamp).clone();
+        }
         if let Err(e) = history::write(&dir, &chat) {
             config::log(&format!("saving history failed: {e}"));
         }
@@ -993,19 +1026,13 @@ impl Palette {
             self.notice = Some("Couldn't open that conversation.".into());
             return;
         };
+        // The current thread is in History already; the old chat becomes the
+        // thread (only its last few turns ever go to the model).
         self.save_history();
-        self.exchanges = chat
-            .exchanges
-            .iter()
-            .map(|x| Exchange {
-                question: x.question.clone(),
-                answer: x.answer.clone(),
-                error: x.error.as_deref().map(friendly),
-                attached: x.attached.clone(),
-                agents: Vec::new(),
-            })
-            .collect();
-        self.resume = Some(chat.preamble());
+        let thread = crate::thread::Thread::from_chat(&chat, dir.clone());
+        crate::thread::reset(thread.clone());
+        self.exchanges = shown_turns(&thread);
+        self.resume = None;
         self.created = Some(chat.created).filter(|c| !c.is_empty());
         self.history_dir = Some(dir);
         self.conv = Some({
@@ -1020,6 +1047,32 @@ impl Palette {
         self.input = std::mem::take(&mut self.draft);
         self.notice = None;
         ctx.request_repaint();
+    }
+
+    /// "New chat": the thread so far goes to History (when it's on) and a
+    /// fresh one starts.
+    fn new_chat(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.save_history();
+        crate::thread::reset(crate::thread::Thread::default());
+        self.conv = Some({
+            let c = Conversation::default();
+            llm::prewarm(&self.cfg, &c);
+            c
+        });
+        self.exchanges.clear();
+        self.overlay = None;
+        self.math.borrow_mut().clear();
+        self.diagrams.clear();
+        self.history_dir = None;
+        self.resume = None;
+        self.created = None;
+        self.notice = None;
+        self.browser = None;
+        self.agent_view = None;
+        self.refocus = true;
     }
 
     fn toggle_browser(&mut self) {
@@ -1705,6 +1758,13 @@ impl Palette {
             }
             if browsing || self.rec.is_some() {
                 return;
+            }
+            if !self.exchanges.is_empty() && !self.busy() {
+                let new = icon_button(ui, Icon::NewChat, false, self.accent)
+                    .on_hover_text("New chat (Ctrl+N)");
+                if new.clicked() {
+                    self.new_chat();
+                }
             }
             let add = icon_button(ui, Icon::Plus, false, self.accent)
                 .on_hover_text("Attach a file, page, or the clipboard (@)");
@@ -2396,6 +2456,9 @@ impl eframe::App for Palette {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::H)) {
             self.toggle_browser();
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::N)) {
+            self.new_chat();
+        }
         let mut keys = (false, false, false);
         if self.browser.is_some() {
             keys = ctx.input_mut(|i| {
@@ -2754,6 +2817,8 @@ fn lowercase_first(s: &str) -> String {
 
 enum Icon {
     Plus,
+    /// A page with a plus: start a new chat.
+    NewChat,
     History,
     Gear,
     /// Microphone; `Some(level)` while recording.
@@ -2799,6 +2864,12 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, active: bool, accent: Color32) -> 
             p.line_segment([c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)], st);
             p.line_segment([c + egui::vec2(0.0, -6.0), c + egui::vec2(0.0, 6.0)], st);
         }
+        Icon::NewChat => {
+            let r = egui::Rect::from_center_size(c, egui::vec2(11.0, 12.0));
+            p.rect_stroke(r, 2.5, st, egui::StrokeKind::Middle);
+            p.line_segment([c + egui::vec2(-2.5, 0.0), c + egui::vec2(2.5, 0.0)], st);
+            p.line_segment([c + egui::vec2(0.0, -2.5), c + egui::vec2(0.0, 2.5)], st);
+        }
         Icon::Gear => {
             p.circle_stroke(c, 3.6, st);
             for i in 0..8 {
@@ -2842,4 +2913,22 @@ mod tests {
         assert_eq!(opening_drop(true, true).value, 1.0);
         assert_eq!(opening_drop(false, false).value, 1.0);
     }
+}
+
+/// The thread's last few turns as palette exchanges (agent lines in italics).
+fn shown_turns(t: &crate::thread::Thread) -> Vec<Exchange> {
+    t.window(crate::thread::SHOWN)
+        .iter()
+        .map(|x| Exchange {
+            question: x.question.clone(),
+            answer: if x.notes.is_empty() {
+                x.answer.clone()
+            } else {
+                format!("{}\n\n*{}*", x.answer, x.notes.join(" · "))
+            },
+            error: None,
+            attached: Vec::new(),
+            agents: Vec::new(),
+        })
+        .collect()
 }
