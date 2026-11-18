@@ -152,11 +152,12 @@ impl App {
         }
         quick::configure(&cfg);
         self.cfg = cfg;
-        island::set_auto_hide(self.cfg.island.auto_hide);
-        match (&self.island, self.cfg.island.enabled) {
-            (None, true) => self.island = Some(island::start()),
-            (Some(h), on) => h.set_visible(on),
-            (None, false) => {}
+        // The island always runs (it is the palette's header and the voice
+        // indicator); `presence` decides when it is on screen.
+        island::set_presence(self.cfg.island.presence);
+        cards::set_presence(self.cfg.island.presence);
+        if self.island.is_none() {
+            self.island = Some(island::start());
         }
         island::set_glass(self.cfg.appearance.blur);
         self.cfg_error = if errs.is_empty() {

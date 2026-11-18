@@ -11,6 +11,7 @@
 
 pub use crate::buddy::BuddyState;
 use crate::buddy::{Buddy, Motion};
+use crate::config::Presence;
 use crate::ui::tokens::{self, Rgba};
 use crate::ui::{self, Layer, MonitorInfo, Spring, TextStyle};
 use std::cell::RefCell;
@@ -75,7 +76,6 @@ struct Shared {
 struct Inbox {
     state: Option<BuddyState>,
     agents: Option<Vec<AgentRow>>,
-    visible: Option<bool>,
     attach: Option<Option<Attach>>,
     /// Blur strength (0 = solid), from `[appearance] blur`.
     glass: Option<f32>,
@@ -112,12 +112,6 @@ impl IslandHandle {
     /// Replaces the agent rows shown on peek (newest first; 5 shown).
     pub fn set_agents(&self, rows: Vec<AgentRow>) {
         self.shared.inbox.lock().unwrap().agents = Some(rows);
-        self.wake();
-    }
-
-    /// Shows or hides the island (the `[island] enabled` setting).
-    pub fn set_visible(&self, on: bool) {
-        self.shared.inbox.lock().unwrap().visible = Some(on);
         self.wake();
     }
 
@@ -220,6 +214,27 @@ pub fn start() -> IslandHandle {
 }
 
 /// The running island, if it was started.
+/// The island's glass (blurred backdrop + how much ink it keeps), shared so
+/// the cards hanging below it are the same material.
+static GLASS: Mutex<Option<(Arc<crate::surface::Backdrop>, f32)>> = Mutex::new(None);
+
+fn publish_glass(b: &Option<Arc<crate::surface::Backdrop>>, opacity: f32) {
+    let mut g = GLASS.lock().unwrap();
+    let same = match (&*g, b) {
+        (Some((a, o)), Some(b)) => Arc::ptr_eq(a, b) && *o == opacity,
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        *g = b.clone().map(|b| (b, opacity));
+    }
+}
+
+/// The island's current glass, if it has one (None = solid ink).
+pub fn glass() -> Option<(Arc<crate::surface::Backdrop>, f32)> {
+    GLASS.lock().unwrap().clone()
+}
+
 pub fn handle() -> Option<IslandHandle> {
     HANDLE.get().cloned()
 }
@@ -255,18 +270,52 @@ const EDGE_POLL: Duration = Duration::from_millis(120);
 /// Half-width (logical px) of the top-edge zone that brings the island back.
 const EDGE_HALF_W: f32 = 160.0;
 
-static AUTO_HIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// `[island] presence`: 0 = hotkey, 1 = auto-hide, 2 = always.
+static PRESENCE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Hide the island when idle (from config `[island] auto_hide`).
-pub fn set_auto_hide(on: bool) {
-    AUTO_HIDE.store(on, std::sync::atomic::Ordering::Relaxed);
+/// When the island is on screen (from config `[island] presence`).
+pub fn set_presence(p: Presence) {
+    let v = match p {
+        Presence::Hotkey => 0,
+        Presence::AutoHide => 1,
+        Presence::Always => 2,
+    };
+    PRESENCE.store(v, std::sync::atomic::Ordering::Relaxed);
     if let Some(h) = handle() {
         h.wake();
     }
 }
 
+fn presence() -> Presence {
+    match PRESENCE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Presence::AutoHide,
+        2 => Presence::Always,
+        _ => Presence::Hotkey,
+    }
+}
+
+/// Only-when-called: the island is out while it is the palette's header or
+/// the buddy is listening, thinking, answering or showing an error; a done
+/// face after the palette closed doesn't bring it back.
+fn summoned(attached: bool, state: BuddyState) -> bool {
+    attached
+        || matches!(
+            state,
+            BuddyState::Listening(_) | BuddyState::Thinking | BuddyState::Streaming | BuddyState::Error
+        )
+}
+
+static GLASS_STRENGTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4270_0000); // 60.0
+
+/// The blur strength surfaces use (0 = solid), for the cards' own glass
+/// while the island is away.
+pub fn glass_strength() -> f32 {
+    f32::from_bits(GLASS_STRENGTH.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// How much of the screen shows through the island (0 = solid).
 pub fn set_glass(strength: f32) {
+    GLASS_STRENGTH.store(strength.clamp(0.0, 100.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
     if let Some(h) = handle() {
         h.set_glass(strength);
     }
@@ -1028,7 +1077,6 @@ struct Island {
     shadow: Layer,
     shared: Arc<Shared>,
     mon: MonitorInfo,
-    enabled: bool,
     fullscreen: bool,
     /// 0..1 fade for hide/show (multiplies alpha).
     shown: Spring,
@@ -1124,7 +1172,6 @@ fn run(shared: Arc<Shared>) -> anyhow::Result<()> {
         shadow,
         shared,
         mon,
-        enabled: true,
         fullscreen: false,
         shown: Spring::new(0.0).with(160.0, 26.0),
         activity: now,
@@ -1199,10 +1246,6 @@ impl Island {
 
         // ---- inbox
         let inbox = std::mem::take(&mut *self.shared.inbox.lock().unwrap());
-        if let Some(on) = inbox.visible {
-            self.enabled = on;
-            self.dirty = true;
-        }
         if let Some(g) = inbox.glass {
             let g = g.clamp(0.0, 100.0);
             if (g - self.glass).abs() > 0.01 {
@@ -1280,7 +1323,8 @@ impl Island {
         // A layered window only sees WM_MOUSEMOVE while it is visible, so while
         // the island is tucked away its own hover area is checked here. That is
         // what makes "move the mouse back to it" work, not just the top edge.
-        let over_pill = self.enabled && !self.fullscreen && self.cursor_on_pill();
+        let presence = presence();
+        let over_pill = presence != Presence::Hotkey && !self.fullscreen && self.cursor_on_pill();
         let hovered = hovered_raw || over_pill;
         if self.view.attached.is_none() {
             // Re-check true fullscreen now and then: the foreground window can
@@ -1365,7 +1409,7 @@ impl Island {
             hovered,
             peek: self.view.peek,
             needs_you: self.view.agents.iter().any(|a| a.kind == AgentStatus::Asking),
-            auto_hide: AUTO_HIDE.load(std::sync::atomic::Ordering::Relaxed),
+            auto_hide: presence == Presence::AutoHide,
             activity: self.activity,
         };
         let awake = self.idle.awake(now);
@@ -1373,7 +1417,8 @@ impl Island {
         self.view.alpha.set(if awake { 1.0 } else { DIM_ALPHA });
         self.tucked = self.idle.tucked(now);
         // Attached, the island is the palette's header: nothing hides it.
-        let hide = !attached && (!self.enabled || (self.fullscreen && resting) || self.tucked);
+        let called = presence != Presence::Hotkey || summoned(attached, state);
+        let hide = !attached && (!called || (self.fullscreen && resting) || self.tucked);
         self.shown.set(if hide { 0.0 } else { 1.0 });
 
         // ---- glass: a small blurred copy of what is behind the island
@@ -1395,6 +1440,7 @@ impl Island {
         } else if self.backdrop.is_some() {
             self.backdrop = None;
         }
+        publish_glass(&self.backdrop, crate::surface::glass_opacity(self.glass));
 
         self.view.layout(now);
 
@@ -1477,9 +1523,9 @@ impl Island {
             return Motion::Fast;
         }
         if !self.body.visible() {
-            return if self.tucked && self.enabled {
+            return if self.tucked {
                 Motion::Still(Some(now + EDGE_POLL))
-            } else if self.fullscreen && self.enabled {
+            } else if self.fullscreen && presence() != Presence::Hotkey {
                 // Poll for the fullscreen app leaving, so the island comes back.
                 Motion::Still(Some(now + Duration::from_millis(500)))
             } else {
@@ -1584,7 +1630,8 @@ impl Island {
             * s)
             .ceil() as i32
             + 2 * pad;
-        let h = ((PILL_H + 340.0) * s).ceil() as i32 + 2 * pad;
+        // Tall enough for the peek panel and the agent cards hanging below.
+        let h = ((PILL_H + 560.0) * s).ceil() as i32 + 2 * pad;
         let x = m.x + (m.w - w) / 2;
         let y = m.y + (TOP_GAP * s).round() as i32 - pad;
         let left = x.max(m.x);
@@ -1682,6 +1729,17 @@ mod tests {
             }
         }
         pm
+    }
+
+    #[test]
+    fn only_when_called_shows_for_the_palette_and_voice() {
+        assert!(summoned(true, BuddyState::Idle));
+        assert!(summoned(false, BuddyState::Listening(0.3)));
+        assert!(summoned(false, BuddyState::Thinking));
+        assert!(summoned(false, BuddyState::Streaming));
+        assert!(!summoned(false, BuddyState::Idle));
+        assert!(!summoned(false, BuddyState::Working(2)), "running agents stay off screen");
+        assert!(!summoned(false, BuddyState::Done));
     }
 
     #[test]

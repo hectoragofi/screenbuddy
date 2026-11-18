@@ -77,8 +77,10 @@ pub const ERR: Rgba = Rgba::rgb(0xFF3B30);
 /// UI labels: Geist Mono, ALL CAPS, +6 % tracking.
 pub const LABEL_PX: f32 = 10.5;
 pub const LABEL_TRACKING: f32 = 0.06;
-/// Body text: Geist Mono.
-pub const BODY_PX: f32 = 12.5;
+/// Body text: Geist (sans).
+pub const BODY_PX: f32 = 13.0;
+/// Metadata (elapsed, counts): Geist Mono.
+pub const MONO_PX: f32 = 11.0;
 /// Doto readouts (`03`, `00:41`) in the island.
 pub const READOUT_PX: f32 = 15.0;
 

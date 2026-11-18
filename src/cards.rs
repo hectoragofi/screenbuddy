@@ -1,33 +1,40 @@
-//! Agent cards: one small card per agent, hanging below the island (newest
-//! on top, at most four, then "+N"). A card shows the agent's plan, live step,
-//! result, files and the buttons that matter for its state (cancel during the
-//! 5 s window, stop, retry, dismiss, show its desk, open in the palette), a
-//! follow-up box with a mic, and approval / question asks, so those surface
-//! even with the palette closed. Holding Alt over a card speaks a follow-up to
-//! that agent (`keys::set_cursor_target` + `quick`).
+//! Agent cards: live activities hanging from the island. At rest each agent
+//! is one calm line (status dot, name, what it is doing, elapsed); hovering a
+//! card opens it in place (plan, a follow-up box, its actions) and it closes
+//! again shortly after the cursor leaves. Only an approval or a question opens
+//! by itself. Finished cards shrink to one line ("Flight prices · Open") and
+//! fade after a few seconds; at most three show, the rest fold into "+N". A
+//! fact saved to the brain shows as a short "Remembered · …" line with Undo.
+//! With `[island] presence = "hotkey"` (the default) running agents keep
+//! nothing on screen: only asks, finished agents and the brain line show
+//! unsummoned. Holding Alt over a card speaks a follow-up to that agent
+//! (`keys::set_cursor_target` + `quick`).
 //!
 //! Runs on its own thread with two layered windows (`screenbuddy.cards` for
 //! the cards, click-through `screenbuddy.cards-shadow` under it), rendered with
-//! tiny-skia. It draws only while something moves; at rest it sleeps until an
-//! agent event, the mouse or the next readout second.
+//! tiny-skia on the island's glass ([`crate::island::glass`], or its own copy
+//! while the island is away), so cards and island read as one material. It
+//! draws only while something moves.
 //!
 //! The card window is non-activating, except while its follow-up box has
-//! focus: a click there turns activation on so keys reach it, and losing focus
-//! (Enter, Esc, clicking elsewhere) turns it off again.
+//! focus or a card was clicked for the keyboard (Enter = the card's primary
+//! action, Esc = close / dismiss); losing focus turns it off again.
 //!
 //! API: [`start`] (once), [`open`] (expand an agent's card, e.g. from the
-//! island), [`target_at`] (the agent whose card is under a screen point).
+//! island), [`target_at`] (the agent whose card is under a screen point),
+//! [`brain_saved`] (the "Remembered" line), [`set_presence`].
 
 use crate::agents::drive::DriveEvent;
 use crate::agents::{self, Agent, AgentEvent, Answer, AskKind, Question, Status};
 use crate::brain::Fact;
+use crate::config::Presence;
 use crate::caption::{self, Block, Span};
 use crate::ui::tokens::{self, Rgba};
 use crate::ui::{self, Face, Layer, MonitorInfo, Spring, TextStyle};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use windows::Win32::Foundation::*;
@@ -111,8 +118,8 @@ pub fn open(id: &str) {
     post(Msg::Open(id.to_string()));
 }
 
-/// Shows a "Saved to the brain" card for this fact: the fact, each running
-/// agent that reads it, and Open (the brain list in Settings).
+/// Shows "Remembered · <fact>" with Undo for a few seconds; hovering it shows
+/// the running agents that read it and See all (Settings → Brain).
 pub fn brain_saved(f: &Fact) {
     start();
     post(Msg::Brain(f.clone()));
@@ -124,6 +131,30 @@ pub fn brain_card_id(f: &Fact) -> String {
 }
 
 const BRAIN_PREFIX: &str = "brain:";
+
+/// `[island] presence`: 0 = hotkey, 1 = auto-hide, 2 = always.
+static PRESENCE: AtomicU8 = AtomicU8::new(0);
+
+/// Which cards show unsummoned (from config `[island] presence`): with
+/// "hotkey" only asks, finished agents and the brain line.
+pub fn set_presence(p: Presence) {
+    let v = match p {
+        Presence::Hotkey => 0,
+        Presence::AutoHide => 1,
+        Presence::Always => 2,
+    };
+    if PRESENCE.swap(v, Ordering::Relaxed) != v {
+        refresh();
+    }
+}
+
+fn presence() -> Presence {
+    match PRESENCE.load(Ordering::Relaxed) {
+        1 => Presence::AutoHide,
+        2 => Presence::Always,
+        _ => Presence::Hotkey,
+    }
+}
 
 /// Redraws the cards (e.g. a spoken follow-up started or stopped).
 pub fn refresh() {
@@ -142,33 +173,55 @@ pub fn target_at(p: (i32, i32)) -> Option<String> {
         .map(|(_, id)| id.clone())
 }
 
+
 // ---------------------------------------------------------------- layout (logical px)
 
 const CARD_W: f32 = 340.0;
 const PAD: f32 = 16.0;
+/// The status dot's centre, and where text starts right of it.
+const DOT_X: f32 = 22.0;
+const TEXT_X: f32 = 38.0;
+/// One line: a whole card at rest, the header row of an open one.
+const ROW_H: f32 = 44.0;
+/// A one-line card is a pill, like the island at rest.
+const RADIUS: f32 = 22.0;
 /// Between cards in the stack.
 const STACK_GAP: f32 = 8.0;
 /// Below the island's pill.
 const HANG: f32 = 10.0;
-const SLIM_H: f32 = 40.0;
 const LINE: f32 = 18.0;
-const BTN_H: f32 = 28.0;
-const INPUT_H: f32 = 34.0;
+const BTN_H: f32 = 32.0;
+/// Buttons inside the one-line row (concentric with its corners).
+const ROW_BTN_H: f32 = 28.0;
+/// Quiet text buttons (Stop, Show desk, Open).
+const QUIET_H: f32 = 30.0;
+const INPUT_H: f32 = 36.0;
 const CHIP_H: f32 = 26.0;
-const RESULT_MAX_H: f32 = 168.0;
-const MORE_H: f32 = 26.0;
-const MAX_VISIBLE: usize = 4;
+const RESULT_MAX_H: f32 = 132.0;
+const MORE_H: f32 = 28.0;
+const MAX_VISIBLE: usize = 3;
 const PLAN_ROWS: usize = 5;
-const IDLE_COLLAPSE: Duration = Duration::from_secs(20);
-/// A card stays open this long after the cursor leaves it.
-const HOVER_LINGER: Duration = Duration::from_millis(700);
+/// An open card stays open this long after the cursor leaves it.
+const HOVER_LINGER: Duration = Duration::from_millis(450);
+/// A finished card fades this long after it finished, unless hovered.
+const FINISHED_FOR: Duration = Duration::from_secs(8);
+/// The "Remembered" line's life.
+const NOTICE_FOR: Duration = Duration::from_secs(4);
+/// Left alone again after a hover, a timed card waits at least this long.
+const AFTER_HOVER: Duration = Duration::from_secs(3);
+/// A card opened from the island stays open this long without a hover.
+const OPENED_FOR: Duration = Duration::from_secs(5);
 const SHADOW_SIDE: f32 = 28.0;
 const SHADOW_TOP: f32 = 12.0;
 const SHADOW_BELOW: f32 = 40.0;
 
-/// Brighter hairlines (button outlines).
-const LINE_2: Rgba = Rgba::rgba(0xFFFFFF, 34);
-const LINE_3: Rgba = Rgba::rgba(0xFFFFFF, 52);
+// Text on the dark glass, and two white tints for controls. Colour means
+// status only in the small dot; the accent (SIGNAL) marks live and focus.
+const TEXT: Rgba = tokens::PAPER;
+const TEXT_2: Rgba = Rgba::rgb(0x9D9A93);
+const TEXT_3: Rgba = Rgba::rgb(0x75726C);
+const FILL: Rgba = Rgba::rgba(0xFFFFFF, 24);
+const FILL_HOVER: Rgba = Rgba::rgba(0xFFFFFF, 40);
 
 // ---------------------------------------------------------------- view (pure data)
 
@@ -177,20 +230,22 @@ enum Btn {
     Cancel,
     Stop,
     Retry,
-    Dismiss,
     Show,
+    /// Open the agent in the palette thread.
     Palette,
     Always,
     Once,
     Deny,
     Send,
-    /// Brain card: open the brain list.
+    /// Brain line: see all facts (Settings → Brain).
     Brain,
+    /// Brain line: take the save back.
+    Undo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hit {
-    /// Anywhere else on the card (a slim row expands on click).
+    /// Anywhere else on the card (a click takes the keyboard, if it can).
     Card,
     Btn(Btn),
     File(usize),
@@ -230,7 +285,10 @@ struct CardView {
     agent: Agent,
     expanded: bool,
     hover: Option<Hit>,
+    /// The follow-up / answer box has the keyboard.
     focused: bool,
+    /// The card itself has the keyboard (Enter = its primary action).
+    keyed: bool,
     draft: String,
     /// Unix seconds now, for the elapsed readout.
     now: u64,
@@ -241,7 +299,7 @@ struct CardView {
     /// Apeiron is there, so the agent has a desk to show.
     desk: bool,
     drive: Drive,
-    /// A "Saved to the brain" card instead of an agent's.
+    /// A "Remembered" line instead of an agent's card.
     brain: Option<BrainView>,
 }
 
@@ -250,6 +308,8 @@ struct CardView {
 struct BrainView {
     fact: Fact,
     readers: Vec<String>,
+    /// Undo was pressed: the line says "Forgotten" on its way out.
+    undone: bool,
 }
 
 /// Where the agent is with the user's mouse and keyboard.
@@ -283,31 +343,43 @@ struct Drawn {
     h: f32,
     hits: Vec<(f32, f32, f32, f32, Hit)>,
     max_scroll: f32,
-    edge: Rgba,
 }
 
-fn label_style(s: f32) -> TextStyle {
-    TextStyle::label(s)
+/// Names: Geist Medium.
+fn title_style(s: f32) -> TextStyle {
+    TextStyle::body(s).face(Face::SansMedium).size(13.5 * s)
 }
 
 fn body_style(s: f32) -> TextStyle {
     TextStyle::body(s)
 }
 
-fn small_style(s: f32) -> TextStyle {
-    TextStyle::body(s).size(11.5 * s).color(tokens::MUTE)
+/// What it's doing, next to the name.
+fn sec_style(s: f32) -> TextStyle {
+    TextStyle::body(s).color(TEXT_2)
 }
 
-fn name_style(s: f32) -> TextStyle {
-    TextStyle {
-        face: Face::MonoMedium,
-        ..TextStyle::body(s).size(13.5 * s)
-    }
+fn small_style(s: f32) -> TextStyle {
+    TextStyle::body(s).size(12.5 * s).color(TEXT_2)
+}
+
+/// Elapsed, counts, commands: small and quiet.
+fn meta_style(s: f32) -> TextStyle {
+    TextStyle::body(s).size(12.0 * s).color(TEXT_3)
+}
+
+fn btn_style(s: f32) -> TextStyle {
+    TextStyle::body(s).face(Face::SansMedium)
 }
 
 /// Logical width of `t` in `st` (built at scale `s`).
 fn tw(t: &str, st: &TextStyle, s: f32) -> f32 {
     ui::text_width(t, st) / s
+}
+
+/// The baseline that optically centres `st`'s capitals on `mid` (logical).
+fn base(mid: f32, st: &TextStyle, s: f32) -> f32 {
+    mid + ui::cap_height(st) / s / 2.0
 }
 
 /// Draws in logical px onto an optional pixmap (None = measure only) and
@@ -338,6 +410,24 @@ impl Pen<'_> {
         tw(t, st, s)
     }
 
+    /// Text on the baseline `base`; returns the logical width.
+    fn text_base(&mut self, t: &str, x: f32, base: f32, st: &TextStyle) -> f32 {
+        let s = self.s;
+        if let Some(pm) = self.pm.as_deref_mut() {
+            ui::draw_text_baseline(pm, t, (x * s).round(), (base * s).round(), st);
+        }
+        tw(t, st, s)
+    }
+
+    /// A rounded outline `width` logical px thick, inside the shape.
+    #[allow(clippy::too_many_arguments)]
+    fn outline(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, width: f32, c: Rgba) {
+        let s = self.s;
+        if let Some(pm) = self.pm.as_deref_mut() {
+            ui::stroke_rounded(pm, x * s, y * s, w * s, h * s, r * s, width * s, c);
+        }
+    }
+
     /// One body line in a `LINE`-tall row starting at `y`.
     fn line(&mut self, t: &str, x: f32, y: f32, st: &TextStyle) -> f32 {
         let lh = ui::line_height(st) / self.s;
@@ -348,13 +438,6 @@ impl Pen<'_> {
         let s = self.s;
         if let Some(pm) = self.pm.as_deref_mut() {
             ui::fill_rounded(pm, x * s, y * s, w * s, h * s, r * s, c);
-        }
-    }
-
-    fn stroke(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, c: Rgba) {
-        let s = self.s;
-        if let Some(pm) = self.pm.as_deref_mut() {
-            ui::stroke_rounded(pm, x * s, y * s, w * s, h * s, r * s, s.max(1.0), c);
         }
     }
 
@@ -422,7 +505,7 @@ fn elapsed_label(secs: u64) -> String {
     if secs >= 3600 {
         format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
     } else {
-        format!("{:02}:{:02}", secs / 60, secs % 60)
+        format!("{}:{:02}", secs / 60, secs % 60)
     }
 }
 
@@ -487,11 +570,8 @@ impl MdLine {
 fn run_style(r: Run, s: f32) -> TextStyle {
     match r {
         Run::Plain => body_style(s),
-        Run::Bold => TextStyle {
-            face: Face::MonoMedium,
-            ..body_style(s)
-        },
-        Run::Code => body_style(s).color(tokens::PAPER.mix(tokens::MUTE, 0.35)),
+        Run::Bold => body_style(s).face(Face::SansMedium),
+        Run::Code => TextStyle::mono(s).size(12.0 * s).color(TEXT.mix(TEXT_2, 0.3)),
     }
 }
 
@@ -596,7 +676,7 @@ fn md_lines(md: &str, width: f32) -> Vec<MdLine> {
     out
 }
 
-fn draw_md(pen: &mut Pen, lines: &[MdLine], x: f32, mut y: f32) {
+fn draw_md(pen: &mut Pen, lines: &[MdLine], x: f32, mut y: f32, width: f32) {
     let s = pen.s;
     for l in lines {
         if l.gap {
@@ -604,11 +684,11 @@ fn draw_md(pen: &mut Pen, lines: &[MdLine], x: f32, mut y: f32) {
             continue;
         }
         if l.code_block {
-            pen.rect(x, y, CARD_W - 2.0 * PAD, LINE, tokens::INK_2);
-            pen.rect(x, y, 2.0, LINE, tokens::LINE);
+            pen.rect(x, y, width, LINE, FILL.fade(0.6));
+            pen.rect(x, y, 2.0, LINE, FILL_HOVER);
         }
         if let Some(m) = &l.marker {
-            pen.line(m, x, y, &body_style(s).color(tokens::MUTE));
+            pen.line(m, x, y, &body_style(s).color(TEXT_2));
         }
         let mut lx = x + l.indent;
         for (t, r) in &l.runs {
@@ -618,87 +698,79 @@ fn draw_md(pen: &mut Pen, lines: &[MdLine], x: f32, mut y: f32) {
     }
 }
 
+
 // ---- pieces
 
 #[derive(Clone, Copy, PartialEq)]
-enum BtnLook {
+enum Look {
+    /// The one thing to do: a light pill.
     Primary,
-    Accent,
-    Ghost,
+    /// A tinted pill.
+    Secondary,
+    /// Text until hovered.
     Quiet,
 }
 
-/// A pill button at (x, y); `w` None = fit the label. Returns its width.
+fn button_w(label: &str, ring: bool, s: f32) -> f32 {
+    tw(label, &btn_style(s), s) + if ring { 18.0 } else { 0.0 } + 28.0
+}
+
+/// A pill button at (x, y); `w` None = fit the label. `ring` = seconds left
+/// on a countdown ring, `focus` = Enter presses it. Returns its width.
 #[allow(clippy::too_many_arguments)]
 fn button(
     pen: &mut Pen,
     x: f32,
     y: f32,
     w: Option<f32>,
+    h: f32,
     label: &str,
-    look: BtnLook,
+    look: Look,
     btn: Btn,
-    hover: Option<Hit>,
+    v: &CardView,
     ring: Option<f32>,
+    focus: bool,
 ) -> f32 {
     let s = pen.s;
-    let hovered = hover == Some(Hit::Btn(btn));
-    let ls = label_style(s);
+    let hovered = v.hover == Some(Hit::Btn(btn));
+    let ls = btn_style(s);
     let lw = tw(label, &ls, s);
     let ring_w = if ring.is_some() { 18.0 } else { 0.0 };
-    let w = w.unwrap_or(lw + ring_w + 26.0);
-    let r = BTN_H / 2.0;
+    let w = w.unwrap_or(lw + ring_w + 28.0);
+    let r = h / 2.0;
     let fg = match look {
-        BtnLook::Primary => {
-            let c = if hovered {
-                tokens::PAPER
-            } else {
-                tokens::PAPER.mix(tokens::MUTE, 0.08)
-            };
-            pen.rounded(x, y, w, BTN_H, r, c);
+        Look::Primary => {
+            let c = if hovered { Rgba::rgb(0xFFFFFF) } else { TEXT };
+            pen.rounded(x, y, w, h, r, c);
             tokens::INK
         }
-        BtnLook::Accent => {
-            let c = if hovered {
-                tokens::ASK.mix(tokens::PAPER, 0.12)
+        Look::Secondary => {
+            pen.rounded(x, y, w, h, r, if hovered { FILL_HOVER } else { FILL });
+            TEXT
+        }
+        Look::Quiet => {
+            if hovered {
+                pen.rounded(x, y, w, h, r, FILL);
+                TEXT
             } else {
-                tokens::ASK
-            };
-            pen.rounded(x, y, w, BTN_H, r, c);
-            Rgba::rgb(0xFFFFFF)
-        }
-        BtnLook::Ghost => {
-            if hovered {
-                pen.rounded(x, y, w, BTN_H, r, tokens::INK_2);
+                TEXT_2
             }
-            pen.stroke(x, y, w, BTN_H, r, if hovered { LINE_3 } else { LINE_2 });
-            tokens::PAPER
-        }
-        BtnLook::Quiet => {
-            if hovered {
-                pen.rounded(x, y, w, BTN_H, r, tokens::INK_2);
-            }
-            if hovered { tokens::PAPER } else { tokens::MUTE }
         }
     };
-    let content = lw + ring_w;
-    let mut cx = x + (w - content) / 2.0;
-    let mid = y + BTN_H / 2.0;
+    if focus {
+        pen.outline(x - 3.0, y - 3.0, w + 6.0, h + 6.0, r + 3.0, 1.5, tokens::SIGNAL.fade(0.55));
+    }
+    let mut cx = x + (w - lw - ring_w) / 2.0;
+    let mid = y + h / 2.0;
     if let Some(left) = ring {
         let rc = cx + 6.0;
-        pen.arc(rc, mid, 5.5, 1.0, 1.4, LINE_2);
-        pen.arc(
-            rc,
-            mid,
-            5.5,
-            (left / 5.0).clamp(0.0, 1.0),
-            1.6,
-            tokens::SIGNAL,
-        );
+        let whole = agents::PENDING_WINDOW.as_secs_f32().max(1.0);
+        pen.arc(rc, mid, 5.5, 1.0, 1.4, FILL_HOVER);
+        pen.arc(rc, mid, 5.5, (left / whole).clamp(0.0, 1.0), 1.6, tokens::SIGNAL);
         cx += ring_w;
     }
     pen.text_mid(label, cx, mid, &ls.color(fg));
-    pen.hit(x, y, w, BTN_H, Hit::Btn(btn));
+    pen.hit(x, y, w, h, Hit::Btn(btn));
     w
 }
 
@@ -706,34 +778,26 @@ fn button(
 fn input_box(pen: &mut Pen, v: &CardView, y: f32, placeholder: &str) {
     let s = pen.s;
     let (x, w) = (PAD, CARD_W - 2.0 * PAD);
+    let r = INPUT_H / 2.0;
     let hovered = v.hover == Some(Hit::Input);
-    let fill = if v.focused || hovered {
-        tokens::INK_2.mix(tokens::PAPER, 0.03)
-    } else {
-        tokens::INK_2
-    };
-    pen.rounded(x, y, w, INPUT_H, 10.0, fill);
+    pen.rounded(x, y, w, INPUT_H, r, if v.focused || hovered { FILL_HOVER.fade(0.75) } else { FILL.fade(0.75) });
     if v.focused {
-        pen.stroke(x, y, w, INPUT_H, 10.0, tokens::PAPER.fade(0.22));
+        pen.outline(x, y, w, INPUT_H, r, 1.5, tokens::SIGNAL.fade(0.45));
     }
-    let btn_d = 24.0;
+    let btn_d = 26.0;
     let bx = x + w - 5.0 - btn_d;
     let by = y + (INPUT_H - btn_d) / 2.0;
-    let text_x = x + 12.0;
+    let text_x = x + 15.0;
     let room = bx - 8.0 - text_x;
     let bs = body_style(s);
     let mid = y + INPUT_H / 2.0;
+    let b = base(mid, &bs, s);
     if v.draft.is_empty() {
         let ph = if v.mic { "Listening…" } else { placeholder };
-        let c = if v.mic { tokens::SIGNAL } else { tokens::MUTE };
-        pen.text_mid(
-            ph,
-            text_x,
-            mid,
-            &bs.color(c.fade(if v.focused { 0.6 } else { 1.0 })),
-        );
+        let c = if v.mic { tokens::SIGNAL } else { TEXT_3 };
+        pen.text_base(ph, text_x, b, &bs.color(c));
         if v.focused {
-            pen.rect(text_x - 1.0, mid - 7.5, 1.5, 15.0, tokens::SIGNAL);
+            pen.rect(text_x - 1.5, mid - 8.0, 1.5, 16.0, tokens::SIGNAL);
         }
     } else {
         // Keep the end in view while typing.
@@ -746,9 +810,9 @@ fn input_box(pen: &mut Pen, v: &CardView, y: f32, placeholder: &str) {
             cut = true;
         }
         let shown = if cut { format!("…{shown}") } else { shown };
-        let w = pen.text_mid(&shown, text_x, mid, &bs);
+        let w = pen.text_base(&shown, text_x, b, &bs);
         if v.focused {
-            pen.rect(text_x + w + 1.5, mid - 7.5, 1.5, 15.0, tokens::SIGNAL);
+            pen.rect(text_x + w + 1.5, mid - 8.0, 1.5, 16.0, tokens::SIGNAL);
         }
     }
     pen.hit(x, y, bx - x - 2.0, INPUT_H, Hit::Input);
@@ -757,27 +821,18 @@ fn input_box(pen: &mut Pen, v: &CardView, y: f32, placeholder: &str) {
     let (cx, cy) = (bx + btn_d / 2.0, by + btn_d / 2.0);
     if !v.draft.trim().is_empty() {
         let hov = v.hover == Some(Hit::Btn(Btn::Send));
-        let c = if hov {
-            tokens::PAPER
-        } else {
-            tokens::PAPER.mix(tokens::MUTE, 0.1)
-        };
-        pen.circle(cx, cy, btn_d / 2.0, c);
+        pen.circle(cx, cy, btn_d / 2.0, if hov { Rgba::rgb(0xFFFFFF) } else { TEXT });
         pen.poly(&[(cx, cy + 5.0), (cx, cy - 5.0)], 1.7, tokens::INK);
-        pen.poly(
-            &[(cx - 4.0, cy - 1.0), (cx, cy - 5.0), (cx + 4.0, cy - 1.0)],
-            1.7,
-            tokens::INK,
-        );
+        pen.poly(&[(cx - 4.0, cy - 1.0), (cx, cy - 5.0), (cx + 4.0, cy - 1.0)], 1.7, tokens::INK);
         pen.hit(bx - 2.0, y, btn_d + 7.0, INPUT_H, Hit::Btn(Btn::Send));
     } else {
         let hov = v.hover == Some(Hit::Mic);
         let (bg, fg) = if v.mic {
             (tokens::SIGNAL, tokens::INK)
         } else if hov {
-            (tokens::PAPER.fade(0.12), tokens::PAPER)
+            (FILL, TEXT)
         } else {
-            (Rgba::rgba(0, 0), tokens::MUTE)
+            (Rgba::rgba(0, 0), TEXT_2)
         };
         pen.circle(cx, cy, btn_d / 2.0, bg);
         // Capsule + cradle + stem.
@@ -794,15 +849,16 @@ fn input_box(pen: &mut Pen, v: &CardView, y: f32, placeholder: &str) {
     }
 }
 
-fn file_chips(pen: &mut Pen, v: &CardView, mut y: f32) -> f32 {
+/// The agent's files as chips from `x0`; the rest fold into "+N".
+fn file_chips(pen: &mut Pen, v: &CardView, x0: f32, mut y: f32) -> f32 {
     let s = pen.s;
     let files = &v.agent.files;
     if files.is_empty() {
         return y;
     }
-    let (x0, right) = (PAD, CARD_W - PAD);
-    let es = label_style(s).size(9.0 * s);
-    let ns = body_style(s).size(12.0 * s);
+    let right = CARD_W - PAD;
+    let es = meta_style(s).size(10.0 * s);
+    let ns = body_style(s).size(12.5 * s);
     let mut x = x0;
     let mut rows = 1;
     for (i, f) in files.iter().enumerate() {
@@ -811,46 +867,22 @@ fn file_chips(pen: &mut Pen, v: &CardView, mut y: f32) -> f32 {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| f.display().to_string());
         let (stem, ext) = match name.rsplit_once('.') {
-            Some((a, b)) if !a.is_empty() && b.len() <= 4 => (a.to_string(), b.to_string()),
-            _ => (
-                name.clone(),
-                if f.is_dir() {
-                    "dir".into()
-                } else {
-                    String::new()
-                },
-            ),
+            Some((a, b)) if !a.is_empty() && b.len() <= 4 => (a.to_string(), b.to_lowercase()),
+            _ => (name.clone(), if f.is_dir() { "dir".into() } else { String::new() }),
         };
-        let ew = if ext.is_empty() {
-            0.0
-        } else {
-            tw(&ext, &es, s) + 7.0
-        };
-        let stem = ui::ellipsize(&stem, &ns, 150.0 * s);
-        let w = 10.0 + ew + tw(&stem, &ns, s) + 10.0;
+        let ew = if ext.is_empty() { 0.0 } else { tw(&ext, &es, s) + 6.0 };
+        let stem = ui::ellipsize(&stem, &ns, 140.0 * s);
+        let w = 11.0 + ew + tw(&stem, &ns, s) + 11.0;
         let rest = files.len() - i;
-        let more_w = 44.0;
+        let more_w = 40.0;
         if x > x0 && x + w > right - if rest > 1 && rows == 2 { more_w } else { 0.0 } {
             if rows == 2 {
-                // Out of room: the rest go into "+N".
+                // Out of room: the rest go into "+N" (the palette has them all).
                 let label = format!("+{rest}");
                 let hov = v.hover == Some(Hit::Btn(Btn::Palette));
-                let c = if hov { tokens::PAPER } else { tokens::MUTE };
-                pen.rounded(
-                    x,
-                    y,
-                    more_w - 6.0,
-                    CHIP_H,
-                    tokens::RADIUS_CHIP,
-                    tokens::INK_2,
-                );
+                pen.rounded(x, y, more_w - 6.0, CHIP_H, CHIP_H / 2.0, if hov { FILL_HOVER } else { FILL });
                 let lw = tw(&label, &ns, s);
-                pen.text_mid(
-                    &label,
-                    x + (more_w - 6.0 - lw) / 2.0,
-                    y + CHIP_H / 2.0,
-                    &ns.color(c),
-                );
+                pen.text_mid(&label, x + (more_w - 6.0 - lw) / 2.0, y + CHIP_H / 2.0, &ns.color(TEXT_2));
                 pen.hit(x, y, more_w - 6.0, CHIP_H, Hit::Btn(Btn::Palette));
                 break;
             }
@@ -859,18 +891,14 @@ fn file_chips(pen: &mut Pen, v: &CardView, mut y: f32) -> f32 {
             y += CHIP_H + 6.0;
         }
         let hov = v.hover == Some(Hit::File(i));
-        let bg = if hov {
-            tokens::INK_2.mix(tokens::PAPER, 0.07)
-        } else {
-            tokens::INK_2
-        };
-        pen.rounded(x, y, w, CHIP_H, tokens::RADIUS_CHIP, bg);
+        pen.rounded(x, y, w, CHIP_H, CHIP_H / 2.0, if hov { FILL_HOVER } else { FILL });
         let mid = y + CHIP_H / 2.0;
-        let mut tx = x + 10.0;
+        let b = base(mid, &ns, s);
+        let mut tx = x + 11.0;
         if !ext.is_empty() {
-            tx += pen.text_mid(&ext, tx, mid, &es.color(tokens::MUTE)) + 7.0;
+            tx += pen.text_base(&ext, tx, b, &es) + 6.0;
         }
-        pen.text_mid(&stem, tx, mid, &ns.color(tokens::PAPER));
+        pen.text_base(&stem, tx, b, &ns.color(TEXT));
         pen.hit(x, y, w, CHIP_H, Hit::File(i));
         x += w + 6.0;
     }
@@ -889,596 +917,429 @@ fn wrap_max(text: &str, st: &TextStyle, w: f32, s: f32, max: usize) -> Vec<Strin
     lines
 }
 
-/// Header colour + label for the state.
-fn status_label(v: &CardView, k: Kind) -> (String, Rgba) {
-    let a = &v.agent;
+/// The status, as the only colour on the card: a small dot (a check when
+/// done). Live states get a soft halo.
+fn status_mark(pen: &mut Pen, k: Kind, cy: f32) {
+    let halo = |pen: &mut Pen, c: Rgba| pen.circle(DOT_X, cy, 3.5, c);
     match k {
-        Kind::Pending => ("Starting".into(), tokens::MUTE),
-        Kind::Running if v.drive == Drive::Driving => ("Driving…".into(), tokens::SIGNAL),
-        Kind::Running if v.drive == Drive::Paused => ("Driving · paused".into(), tokens::ASK),
-        Kind::Running => {
-            if a.plan.len() > 1 {
-                let i = plan_progress(&a.plan, &a.steps) + 1;
-                (format!("Working · {i}/{}", a.plan.len()), tokens::SIGNAL)
-            } else {
-                ("Working".into(), tokens::SIGNAL)
-            }
-        }
-        Kind::Approval => ("Needs your OK".into(), tokens::ASK),
-        Kind::Questions => {
-            let n = a.ask.as_ref().map_or(0, |q| q.questions.len());
-            let l = if n == 1 { "A question" } else { "Questions" };
-            (l.into(), tokens::ASK)
-        }
-        Kind::Done => ("Done".into(), tokens::OK),
-        Kind::Failed => ("Failed".into(), tokens::ERR),
-        Kind::Stopped => {
-            let l = if a.counted {
-                "Stopped"
-            } else {
-                "Stopped · didn't count"
-            };
-            (l.into(), tokens::MUTE)
-        }
+        Kind::Running => halo(pen, tokens::SIGNAL),
+        Kind::Approval | Kind::Questions => halo(pen, tokens::ASK),
+        Kind::Done => pen.poly(
+            &[(DOT_X - 4.2, cy + 0.2), (DOT_X - 1.4, cy + 3.0), (DOT_X + 4.4, cy - 3.4)],
+            1.8,
+            tokens::OK,
+        ),
+        Kind::Failed => pen.circle(DOT_X, cy, 3.5, tokens::ERR),
+        Kind::Pending => pen.arc(DOT_X, cy, 3.4, 1.0, 1.3, TEXT_2),
+        Kind::Stopped => pen.circle(DOT_X, cy, 3.5, TEXT_3),
     }
 }
 
-fn dot_color(k: Kind) -> Rgba {
+/// What the agent is doing, said next to its name.
+fn subtitle(v: &CardView, k: Kind) -> String {
+    let a = &v.agent;
     match k {
-        Kind::Running => tokens::SIGNAL,
-        Kind::Approval | Kind::Questions => tokens::ASK,
-        Kind::Done => tokens::OK,
-        Kind::Failed => tokens::ERR,
-        Kind::Pending | Kind::Stopped => tokens::MUTE,
+        Kind::Pending => "Starting…".into(),
+        Kind::Running if v.drive == Drive::Driving => "Using your mouse and keyboard".into(),
+        Kind::Running if v.drive == Drive::Paused => "Paused while you work".into(),
+        Kind::Running => a.steps.last().cloned().unwrap_or_else(|| "Working…".into()),
+        Kind::Approval => "Needs your OK".into(),
+        Kind::Questions => match a.ask.as_ref().map_or(0, |q| q.questions.len()) {
+            0 | 1 => "Has a question".into(),
+            n => format!("Has {n} questions"),
+        },
+        Kind::Done => String::new(),
+        Kind::Failed => "Didn't finish".into(),
+        Kind::Stopped if a.counted => "Stopped".into(),
+        Kind::Stopped => "Stopped · didn't count".into(),
     }
 }
 
-/// The Doto readout: elapsed (counting down while pending).
-fn readout(v: &CardView, k: Kind) -> (String, Rgba) {
+fn elapsed(v: &CardView) -> String {
     let a = &v.agent;
-    if k == Kind::Pending {
-        let left = v.pending_left.ceil().max(0.0) as u64;
-        return (elapsed_label(left), tokens::SIGNAL);
-    }
     let start = a.started.unwrap_or(a.created);
-    let end = if a.status.is_active() {
-        v.now
-    } else {
-        a.ended.unwrap_or(v.now)
-    };
-    let c = if a.status.is_active() {
-        tokens::PAPER
-    } else {
-        tokens::MUTE.mix(tokens::PAPER, 0.25)
-    };
-    (elapsed_label(end.saturating_sub(start)), c)
+    let end = if a.status.is_active() { v.now } else { a.ended.unwrap_or(v.now) };
+    elapsed_label(end.saturating_sub(start))
 }
 
-/// The "Saved to the brain" card: topic, the fact and who said it, one row
-/// per agent that reads it, then Open / Close.
-fn compose_brain(v: &CardView, b: &BrainView, pen: &mut Pen) -> (f32, f32) {
+/// The one-line row (the whole card at rest, the header when open): status,
+/// name, what it's doing, then elapsed or the row's one action. Returns
+/// whether the "doing" text had to be cut.
+fn header(pen: &mut Pen, v: &CardView, k: Kind) -> bool {
     let s = pen.s;
-    let inner = CARD_W - 2.0 * PAD;
-    pen.hit(0.0, 0.0, CARD_W, 10_000.0, Hit::Card);
-    let mut y = 16.0;
-    // ---- header: ◉ SAVED TO THE BRAIN
-    let head_mid = y + 7.0;
-    pen.circle(PAD + 3.0, head_mid, 6.0, tokens::SIGNAL.fade(0.18));
-    pen.circle(PAD + 3.0, head_mid, 3.0, tokens::SIGNAL);
-    pen.text_mid("Saved to the brain", PAD + 14.0, head_mid, &label_style(s).color(tokens::SIGNAL));
-    y += 22.0;
-    // ---- topic
-    let ns = name_style(s);
-    for l in wrap_max(&b.fact.topic, &ns, inner, s, 2) {
-        pen.line(&l, PAD, y, &ns);
-        y += LINE + 1.0;
-    }
-    y += 9.0;
-    let section = |pen: &mut Pen, y: &mut f32| {
-        pen.rect(PAD, *y, inner, 1.0 / s, tokens::LINE);
-        *y += 12.0;
+    let mid = ROW_H / 2.0;
+    let by = (ROW_H - ROW_BTN_H) / 2.0;
+    // Pills sit concentric with the card's corners.
+    let edge = CARD_W - by;
+    let pill = |pen: &mut Pen, label: &str, btn: Btn, ring: Option<f32>| -> f32 {
+        let w = button_w(label, ring.is_some(), s);
+        button(pen, edge - w, by, Some(w), ROW_BTN_H, label, Look::Secondary, btn, v, ring, v.keyed);
+        edge - w - 10.0
     };
-    // ---- the fact, with a signal rule beside it
-    section(pen, &mut y);
-    let fs = body_style(s);
-    let top = y;
-    for l in wrap_max(&b.fact.text, &fs, inner - 12.0, s, 4) {
-        pen.line(&l, PAD + 12.0, y, &fs);
-        y += LINE;
-    }
-    pen.rounded(PAD + 1.0, top + 2.0, 2.0, (y - top - 4.0).max(2.0), 1.0, tokens::SIGNAL);
-    y += 2.0;
-    let age = crate::brain::age_label(b.fact.created, v.now.saturating_mul(1000));
-    let meta = format!("{} \u{00b7} {age}", b.fact.from_label());
-    pen.line(&meta, PAD + 12.0, y, &small_style(s));
-    y += LINE + 10.0;
-    // ---- who reads it
-    section(pen, &mut y);
-    let rs = body_style(s).size(12.0 * s);
-    let mute = small_style(s).color(tokens::MUTE);
-    if b.readers.is_empty() {
-        for l in wrap_max("No agents running. New ones read it when they start.", &mute, inner, s, 2) {
-            pen.line(&l, PAD, y, &mute);
-            y += LINE;
-        }
+    let ts = title_style(s);
+    let (title, sub, right) = if let Some(b) = &v.brain {
+        pen.circle(DOT_X, mid, 3.5, tokens::SIGNAL);
+        let right = if b.undone {
+            CARD_W - PAD
+        } else {
+            pill(pen, "Undo", Btn::Undo, None)
+        };
+        let t = if b.undone { "Forgotten" } else { "Remembered" };
+        (t.to_string(), b.fact.text.clone(), right)
     } else {
-        const ROWS: usize = 4;
-        for name in b.readers.iter().take(ROWS) {
-            let mid = y + LINE / 2.0;
-            pen.circle(PAD + 3.0, mid, 2.5, tokens::OK);
-            let tail = " \u{2014} reads it";
-            let tail_w = tw(tail, &mute, s);
-            let n = ui::ellipsize(name, &rs, (inner - 16.0 - tail_w) * s);
-            let w = pen.line(&n, PAD + 16.0, y, &rs);
-            pen.line(tail, PAD + 16.0 + w, y, &mute);
-            y += LINE + 2.0;
-        }
-        if b.readers.len() > ROWS {
-            pen.line(&format!("+{} more", b.readers.len() - ROWS), PAD + 16.0, y, &mute);
-            y += LINE;
-        }
+        status_mark(pen, k, mid);
+        let right = match k {
+            Kind::Pending => pill(pen, "Cancel", Btn::Cancel, Some(v.pending_left)),
+            Kind::Done | Kind::Stopped => pill(pen, "Open", Btn::Palette, None),
+            Kind::Failed => pill(pen, "Retry", Btn::Retry, None),
+            _ => {
+                let ms = meta_style(s);
+                let t = elapsed(v);
+                let x = CARD_W - PAD - 2.0 - tw(&t, &ms, s);
+                pen.text_base(&t, x, base(mid, &ts, s), &ms);
+                x - 12.0
+            }
+        };
+        let sub = if v.expanded && matches!(k, Kind::Approval | Kind::Questions) {
+            String::new()
+        } else {
+            subtitle(v, k)
+        };
+        (v.agent.name.clone(), sub, right)
+    };
+    let ss = sec_style(s);
+    let b = base(mid, &ts, s);
+    let avail = right - TEXT_X;
+    let gap = 8.0;
+    let nw = tw(&title, &ts, s);
+    let sw = if sub.is_empty() { 0.0 } else { tw(&sub, &ss, s) };
+    let name_w = if sub.is_empty() || nw + gap + sw <= avail {
+        nw.min(avail)
+    } else {
+        nw.min((avail - sw - gap).max(avail * 0.58))
+    };
+    let name = ui::ellipsize(&title, &ts, name_w * s);
+    let drawn = pen.text_base(&name, TEXT_X, b, &ts);
+    if sub.is_empty() {
+        return false;
     }
-    y += 6.0;
-    // ---- footer
-    let foot = small_style(s).color(tokens::MUTE.fade(0.8));
-    for l in wrap_max("No hand-offs. Each agent checks the brain.", &foot, inner, s, 2) {
-        pen.line(&l, PAD, y, &foot);
-        y += LINE;
+    let room = avail - drawn - gap;
+    if room < 36.0 {
+        return true;
     }
-    y += 10.0;
-    let h = v.hover;
-    button(pen, PAD, y, None, "Open", BtnLook::Ghost, Btn::Brain, h, None);
-    let close = "Close";
-    let cw = tw(close, &label_style(s), s) + 26.0;
-    button(pen, CARD_W - PAD - cw, y, Some(cw), close, BtnLook::Quiet, Btn::Dismiss, h, None);
-    y += BTN_H;
-    (y + 14.0, 0.0)
+    let t = ui::ellipsize(&sub, &ss, room * s);
+    pen.text_base(&t, TEXT_X + drawn + gap, b, &ss);
+    sw > room
 }
 
-/// Lays out (and with a pixmap, draws) one card's content.
+/// The plan, one row per item under the status dot: done items checked,
+/// the current one live, the rest waiting.
+fn plan_list(pen: &mut Pen, v: &CardView, k: Kind, mut y: f32) -> f32 {
+    let s = pen.s;
+    let a = &v.agent;
+    let cur = if k == Kind::Pending { 0 } else { plan_progress(&a.plan, &a.steps) };
+    let first = if a.plan.len() > PLAN_ROWS {
+        cur.saturating_sub(1).min(a.plan.len() - PLAN_ROWS)
+    } else {
+        0
+    };
+    let ps = body_style(s).size(12.5 * s);
+    let row = 22.0;
+    for (i, item) in a.plan.iter().enumerate().skip(first).take(PLAN_ROWS) {
+        let mid = y + row / 2.0;
+        let c = if i < cur {
+            pen.poly(
+                &[(DOT_X - 3.2, mid + 0.2), (DOT_X - 1.0, mid + 2.4), (DOT_X + 3.4, mid - 2.6)],
+                1.4,
+                TEXT_3,
+            );
+            TEXT_3
+        } else if i == cur && k != Kind::Pending {
+            pen.circle(DOT_X, mid, 3.0, tokens::SIGNAL);
+            TEXT
+        } else {
+            pen.arc(DOT_X, mid, 2.6, 1.0, 1.1, TEXT_3);
+            TEXT_2
+        };
+        let t = ui::ellipsize(item, &ps, (CARD_W - TEXT_X - PAD) * s);
+        pen.text_base(&t, TEXT_X, base(mid, &ps, s), &ps.color(c));
+        y += row;
+    }
+    let more = a.plan.len().saturating_sub(first + PLAN_ROWS);
+    if more > 0 {
+        let st = small_style(s).color(TEXT_3);
+        pen.text_base(&format!("+{more} more"), TEXT_X, base(y + 9.0, &st, s), &st);
+        y += 18.0;
+    }
+    y
+}
+
+/// Stop / Show desk on the left, Open on the right, all quiet.
+fn actions(pen: &mut Pen, v: &CardView, y: f32) -> f32 {
+    let s = pen.s;
+    let mut x = PAD;
+    x += button(pen, x, y, None, QUIET_H, "Stop", Look::Quiet, Btn::Stop, v, None, false) + 2.0;
+    if v.desk {
+        button(pen, x, y, None, QUIET_H, "Show desk", Look::Quiet, Btn::Show, v, None, false);
+    }
+    let w = button_w("Open", false, s);
+    button(pen, CARD_W - PAD - w, y, Some(w), QUIET_H, "Open", Look::Quiet, Btn::Palette, v, None, false);
+    y + QUIET_H
+}
+
+/// Files, the follow-up box and Show desk, under a finished card.
+fn after(pen: &mut Pen, v: &CardView, mut y: f32) -> f32 {
+    if !v.agent.files.is_empty() {
+        y = file_chips(pen, v, TEXT_X, y) + 12.0;
+    }
+    input_box(pen, v, y, "Follow up…");
+    y += INPUT_H;
+    if v.desk {
+        y += 6.0;
+        button(pen, PAD, y, None, QUIET_H, "Show desk", Look::Quiet, Btn::Show, v, None, false);
+        y += QUIET_H;
+    }
+    y
+}
+
+/// Lays out (and with a pixmap, draws) one card's content. Returns its
+/// height and how far its result scrolls.
 fn compose(v: &CardView, pen: &mut Pen) -> (f32, f32) {
+    let k = kind(&v.agent);
+    let tall = if v.expanded { 10_000.0 } else { ROW_H };
+    pen.hit(0.0, 0.0, CARD_W, tall, Hit::Card);
+    let cut = header(pen, v, k);
+    if !v.expanded {
+        return (ROW_H, 0.0);
+    }
     if let Some(b) = &v.brain {
-        return compose_brain(v, b, pen);
+        return (brain_body(pen, v, b, cut) + 12.0, 0.0);
     }
     let s = pen.s;
     let a = &v.agent;
-    let k = kind(a);
-    let inner = CARD_W - 2.0 * PAD;
-    let dot = dot_color(k);
-    let (rtext, rcolor) = readout(v, k);
-    let rs = TextStyle::readout(s).size(16.0 * s).color(rcolor);
-    let rw = tw(&rtext, &rs, s);
-
-    if !v.expanded {
-        // Slim row: dot · name ······ readout.
-        let mid = SLIM_H / 2.0;
-        if k == Kind::Running {
-            pen.circle(PAD + 3.0, mid, 6.0, dot.fade(0.18));
-        }
-        pen.circle(PAD + 3.0, mid, 3.0, dot);
-        let right = CARD_W - PAD;
-        pen.text_mid(&rtext, right - rw, mid, &rs);
-        let mut name_right = right - rw - 12.0;
-        if matches!(k, Kind::Approval | Kind::Questions) {
-            let ls = label_style(s).color(tokens::ASK);
-            let t = "Ask";
-            let w = tw(t, &ls, s);
-            pen.text_mid(t, name_right - w, mid, &ls);
-            name_right -= w + 12.0;
-        }
-        let ns = body_style(s);
-        let name = ui::ellipsize(&a.name, &ns, (name_right - PAD - 16.0) * s);
-        pen.text_mid(&name, PAD + 16.0, mid, &ns);
-        pen.hit(0.0, 0.0, CARD_W, SLIM_H, Hit::Card);
-        return (SLIM_H, 0.0);
-    }
-
-    pen.hit(0.0, 0.0, CARD_W, 10_000.0, Hit::Card);
-    let mut y = 16.0;
-    // ---- header: ● LABEL ········ 00:41
-    let head_mid = y + 7.0;
-    if k == Kind::Running {
-        pen.circle(PAD + 3.0, head_mid, 6.0, dot.fade(0.18));
-    }
-    pen.circle(PAD + 3.0, head_mid, 3.0, dot);
-    let (label, lcolor) = status_label(v, k);
-    let ls = label_style(s).color(lcolor);
-    let label = ui::ellipsize(&label, &ls, (inner - 16.0 - rw - 12.0) * s);
-    pen.text_mid(&label, PAD + 14.0, head_mid, &ls);
-    pen.text_mid(&rtext, CARD_W - PAD - rw, head_mid, &rs);
-    y += 22.0;
-    // ---- name
-    let ns = name_style(s);
-    for l in wrap_max(&a.name, &ns, inner, s, 2) {
-        pen.line(&l, PAD, y, &ns);
-        y += LINE + 1.0;
-    }
-    y += 9.0;
-
+    let text_w = CARD_W - TEXT_X - PAD;
+    let top = ROW_H - 2.0;
+    let mut y = top;
     let mut max_scroll = 0.0;
-    let section = |pen: &mut Pen, y: &mut f32| {
-        pen.rect(PAD, *y, inner, 1.0 / s, tokens::LINE);
-        *y += 12.0;
-    };
-
-    // ---- plan
-    let show_plan = !a.plan.is_empty()
-        && matches!(
-            k,
-            Kind::Running | Kind::Approval | Kind::Questions | Kind::Pending
-        );
-    if show_plan {
-        section(pen, &mut y);
-        let cur = if k == Kind::Pending {
-            0
-        } else {
-            plan_progress(&a.plan, &a.steps)
-        };
-        let first = if a.plan.len() > PLAN_ROWS {
-            cur.saturating_sub(1).min(a.plan.len() - PLAN_ROWS)
-        } else {
-            0
-        };
-        let ps = body_style(s).size(12.0 * s);
-        for (i, item) in a.plan.iter().enumerate().skip(first).take(PLAN_ROWS) {
-            let mid = y + LINE / 2.0;
-            let mx = PAD + 3.0;
-            let (tc, text) = if i < cur {
-                pen.poly(
-                    &[
-                        (mx - 3.2, mid + 0.2),
-                        (mx - 0.9, mid + 2.5),
-                        (mx + 3.4, mid - 2.6),
-                    ],
-                    1.4,
-                    tokens::MUTE,
-                );
-                (tokens::MUTE, item.as_str())
-            } else if i == cur && k != Kind::Pending {
-                // Waiting on the user: the step holds in the ask colour.
-                let c = if k == Kind::Running {
-                    tokens::SIGNAL
-                } else {
-                    tokens::ASK
-                };
-                pen.circle(mx, mid, 6.0, c.fade(0.18));
-                pen.circle(mx, mid, 3.0, c);
-                (tokens::PAPER, item.as_str())
-            } else {
-                let ring = |pen: &mut Pen| pen.arc(mx, mid, 2.8, 1.0, 1.1, tokens::MUTE.fade(0.7));
-                ring(pen);
-                (tokens::MUTE.fade(0.75), item.as_str())
-            };
-            let t = ui::ellipsize(text, &ps, (inner - 16.0) * s);
-            pen.line(&t, PAD + 16.0, y, &ps.color(tc));
-            y += LINE + 2.0;
-        }
-        if a.plan.len() > PLAN_ROWS {
-            let more = a.plan.len() - first - PLAN_ROWS.min(a.plan.len() - first);
-            if more > 0 {
-                let st = small_style(s).color(tokens::MUTE.fade(0.7));
-                pen.line(&format!("+{more} more"), PAD + 16.0, y - 2.0, &st);
-                y += LINE - 2.0;
-            }
-        }
-        y += 4.0;
-    }
-
-    // ---- live step
-    if k == Kind::Running {
-        if let Some(step) = a.steps.last() {
-            if !show_plan {
-                section(pen, &mut y);
-            }
-            let st = body_style(s)
-                .size(12.0 * s)
-                .color(tokens::PAPER.mix(tokens::MUTE, 0.4));
-            let lines = wrap_max(step, &st, inner - 16.0, s, 2);
-            pen.line("›", PAD + 1.0, y, &st.color(tokens::SIGNAL));
-            for l in lines {
-                pen.line(&l, PAD + 16.0, y, &st);
-                y += LINE;
-            }
-            y += 8.0;
-        }
-    }
-
-    // ---- asks
-    if let (Some(q), Kind::Approval) = (&a.ask, k) {
-        y = approval(pen, v, q, y);
-    }
-    if let (Some(q), Kind::Questions) = (&a.ask, k) {
-        section(pen, &mut y);
-        let qs = body_style(s);
-        let num = TextStyle::readout(s).size(15.0 * s).color(tokens::ASK);
-        let list: Vec<&String> = if q.questions.is_empty() {
-            vec![&q.text]
-        } else {
-            q.questions.iter().collect()
-        };
-        let many = list.len() > 1;
-        for (i, item) in list.iter().enumerate() {
-            let x = if many {
-                pen.line(&format!("{}", i + 1), PAD, y, &num);
-                PAD + 16.0
-            } else {
-                PAD
-            };
-            for l in wrap_max(item, &qs, CARD_W - PAD - x, s, 4) {
-                pen.line(&l, x, y, &qs);
-                y += LINE;
-            }
-            y += 6.0;
-        }
-        y += 4.0;
-        input_box(pen, v, y, "Your answer…");
-        y += INPUT_H + 10.0;
-    }
-
-    // ---- result
-    if k == Kind::Done {
-        section(pen, &mut y);
-        let body = if a.result.trim().is_empty() {
-            "Done."
-        } else {
-            a.result.trim()
-        };
-        let lines = md_lines(body, inner);
-        let total: f32 = lines.iter().map(|l| l.h()).sum();
-        let vh = total.min(RESULT_MAX_H);
-        max_scroll = (total - vh).max(0.0);
-        let scroll = v.scroll.clamp(0.0, max_scroll);
-        if pen.pm.is_some() {
-            if let Some(mut sub) = Pixmap::new(
-                ((CARD_W - PAD) * s).ceil() as u32,
-                (vh * s).ceil().max(1.0) as u32,
-            ) {
-                let mut sp = Pen {
-                    pm: Some(&mut sub),
-                    s,
-                    hits: Vec::new(),
-                };
-                draw_md(&mut sp, &lines, PAD, -scroll);
-                if scroll > 0.5 {
-                    fade_edge(&mut sub, true, 18.0 * s);
-                }
-                if scroll < max_scroll - 0.5 {
-                    fade_edge(&mut sub, false, 22.0 * s);
-                }
-                if let Some(pm) = pen.pm.as_deref_mut() {
-                    pm.draw_pixmap(
-                        0,
-                        (y * s).round() as i32,
-                        sub.as_ref(),
-                        &PixmapPaint::default(),
-                        Transform::identity(),
-                        None,
-                    );
-                }
-            }
-        }
-        if max_scroll > 0.0 {
-            // A slim scroll thumb.
-            let th = (vh * vh / total).max(18.0);
-            let ty = y + (vh - th) * (scroll / max_scroll);
-            pen.rounded(CARD_W - 7.0, ty, 2.5, th, 1.25, tokens::MUTE.fade(0.45));
-        }
-        pen.hit(0.0, y, CARD_W, vh, Hit::Result);
-        y += vh + 12.0;
-    }
-
-    // ---- error
-    if k == Kind::Failed {
-        section(pen, &mut y);
-        let es = body_style(s).color(tokens::ERR.mix(tokens::PAPER, 0.45));
-        let err = a.error.as_deref().unwrap_or("Something went wrong.");
-        for l in wrap_max(err, &es, inner, s, 4) {
-            pen.line(&l, PAD, y, &es);
+    // What it's doing, in full, when the row had to cut it.
+    if cut && matches!(k, Kind::Running | Kind::Pending) && a.plan.is_empty() {
+        let st = small_style(s);
+        for l in wrap_max(&subtitle(v, k), &st, text_w, s, 3) {
+            pen.line(&l, TEXT_X, y, &st);
             y += LINE;
         }
-        y += 10.0;
+        y += 6.0;
     }
-
-    // ---- files
-    if !a.files.is_empty() && matches!(k, Kind::Done | Kind::Running | Kind::Stopped | Kind::Failed)
-    {
-        y = file_chips(pen, v, y) + 12.0;
-    }
-
-    // ---- follow-up
-    if matches!(k, Kind::Running | Kind::Done | Kind::Stopped | Kind::Failed) {
-        let ph = if k == Kind::Running {
-            "Add to it…"
-        } else {
-            "Follow up…"
-        };
-        input_box(pen, v, y, ph);
-        y += INPUT_H + 10.0;
-    }
-
-    // ---- buttons
-    if k != Kind::Approval {
-        let h = v.hover;
-        let mut x = PAD;
-        let gap = 6.0;
-        let mut right = CARD_W - PAD;
-        let mut push_right = |pen: &mut Pen, label: &str, look: BtnLook, btn: Btn| {
-            let st = label_style(s);
-            let w = tw(label, &st, s) + 26.0;
-            right -= w;
-            button(pen, right, y, Some(w), label, look, btn, h, None);
-            right -= gap;
-        };
-        match k {
-            Kind::Pending => {
-                x += button(
-                    pen,
-                    x,
-                    y,
-                    None,
-                    "Cancel",
-                    BtnLook::Ghost,
-                    Btn::Cancel,
-                    h,
-                    Some(v.pending_left),
-                ) + gap;
+    match k {
+        Kind::Pending | Kind::Running => {
+            if !a.plan.is_empty() {
+                y = plan_list(pen, v, k, y) + 6.0;
             }
-            Kind::Running | Kind::Questions => {
-                x += button(pen, x, y, None, "Stop", BtnLook::Ghost, Btn::Stop, h, None) + gap;
-                if v.desk {
-                    x += button(pen, x, y, None, "Show", BtnLook::Quiet, Btn::Show, h, None) + gap;
-                }
-                push_right(pen, "Palette ›", BtnLook::Quiet, Btn::Palette);
+            if k == Kind::Running {
+                y += 2.0;
+                input_box(pen, v, y, "Add to it…");
+                y += INPUT_H + 6.0;
+                y = actions(pen, v, y);
+            } else if y == top {
+                return (ROW_H, 0.0);
             }
-            Kind::Done => {
-                if v.desk {
-                    x += button(pen, x, y, None, "Show", BtnLook::Ghost, Btn::Show, h, None) + gap;
-                }
-                x += button(
-                    pen,
-                    x,
-                    y,
-                    None,
-                    "Palette ›",
-                    BtnLook::Quiet,
-                    Btn::Palette,
-                    h,
-                    None,
-                ) + gap;
-                push_right(pen, "Close", BtnLook::Quiet, Btn::Dismiss);
-            }
-            Kind::Failed | Kind::Stopped => {
-                let look = if k == Kind::Failed {
-                    BtnLook::Primary
-                } else {
-                    BtnLook::Ghost
-                };
-                x += button(pen, x, y, None, "Retry", look, Btn::Retry, h, None) + gap;
-                x += button(
-                    pen,
-                    x,
-                    y,
-                    None,
-                    "Palette ›",
-                    BtnLook::Quiet,
-                    Btn::Palette,
-                    h,
-                    None,
-                ) + gap;
-                push_right(pen, "Close", BtnLook::Quiet, Btn::Dismiss);
-            }
-            Kind::Approval => {}
         }
-        let _ = x;
-        y += BTN_H;
+        Kind::Approval => {
+            if let Some(q) = &a.ask {
+                y = approval(pen, v, q, y);
+            }
+        }
+        Kind::Questions => {
+            if let Some(q) = &a.ask {
+                y = questions(pen, v, q, y);
+            }
+        }
+        Kind::Done => {
+            let (ny, ms) = result(pen, v, y);
+            max_scroll = ms;
+            y = after(pen, v, ny);
+        }
+        Kind::Failed | Kind::Stopped => {
+            if k == Kind::Failed {
+                let es = small_style(s);
+                let err = a.error.as_deref().unwrap_or("Something went wrong.");
+                for l in wrap_max(err, &es, text_w, s, 4) {
+                    pen.line(&l, TEXT_X, y, &es);
+                    y += LINE;
+                }
+                y += 10.0;
+            }
+            y = after(pen, v, y);
+        }
     }
-    (y + 14.0, max_scroll)
+    (y + 12.0, max_scroll)
 }
 
-/// The approval ask: what it wants to do, then Always / Once / Don't.
+/// The result as markdown-lite, in a scrolling window.
+fn result(pen: &mut Pen, v: &CardView, mut y: f32) -> (f32, f32) {
+    let s = pen.s;
+    let a = &v.agent;
+    let text_w = CARD_W - TEXT_X - PAD;
+    let body = if a.result.trim().is_empty() { "Done." } else { a.result.trim() };
+    let lines = md_lines(body, text_w);
+    let total: f32 = lines.iter().map(|l| l.h()).sum();
+    let vh = total.min(RESULT_MAX_H);
+    let max_scroll = (total - vh).max(0.0);
+    let scroll = v.scroll.clamp(0.0, max_scroll);
+    if pen.pm.is_some() {
+        if let Some(mut sub) = Pixmap::new(((CARD_W - PAD) * s).ceil() as u32, (vh * s).ceil().max(1.0) as u32) {
+            let mut sp = Pen {
+                pm: Some(&mut sub),
+                s,
+                hits: Vec::new(),
+            };
+            draw_md(&mut sp, &lines, TEXT_X, -scroll, text_w);
+            if scroll > 0.5 {
+                fade_edge(&mut sub, true, 18.0 * s);
+            }
+            if scroll < max_scroll - 0.5 {
+                fade_edge(&mut sub, false, 22.0 * s);
+            }
+            if let Some(pm) = pen.pm.as_deref_mut() {
+                pm.draw_pixmap(
+                    0,
+                    (y * s).round() as i32,
+                    sub.as_ref(),
+                    &PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+    }
+    if max_scroll > 0.0 {
+        // A slim scroll thumb.
+        let th = (vh * vh / total).max(18.0);
+        let ty = y + (vh - th) * (scroll / max_scroll);
+        pen.rounded(CARD_W - 8.0, ty, 2.5, th, 1.25, TEXT_3.fade(0.6));
+    }
+    pen.hit(0.0, y, CARD_W, vh, Hit::Result);
+    y += vh + 12.0;
+    (y, max_scroll)
+}
+
+/// The approval ask: what it wants to do, then Don't Allow / Allow, and a
+/// quiet "Always allow for this agent".
 fn approval(pen: &mut Pen, v: &CardView, q: &Question, mut y: f32) -> f32 {
     let s = pen.s;
-    let inner = CARD_W - 2.0 * PAD;
-    let ip = 12.0;
-    let tw_ = inner - 2.0 * ip;
-    let is = body_style(s);
-    let ds = TextStyle::body(s).size(11.0 * s).color(tokens::MUTE);
-    let intent = wrap_max(&q.text, &is, tw_, s, 3);
-    let detail = if q.detail.trim().is_empty() {
-        Vec::new()
-    } else {
-        wrap_max(&q.detail.replace('\n', " "), &ds, tw_, s, 2)
-    };
-    let dl = 15.0;
-    let ph = ip
-        + intent.len() as f32 * LINE
-        + if detail.is_empty() {
-            0.0
-        } else {
-            6.0 + detail.len() as f32 * dl
-        }
-        + ip;
-    pen.rounded(PAD, y, inner, ph, 12.0, tokens::ASK.fade(0.11));
-    pen.stroke(PAD, y, inner, ph, 12.0, tokens::ASK.fade(0.28));
-    let mut ty = y + ip;
-    for l in &intent {
-        pen.line(l, PAD + ip, ty, &is);
-        ty += LINE;
+    let text_w = CARD_W - TEXT_X - PAD;
+    let is = body_style(s).size(13.5 * s);
+    let row = 19.0;
+    let lh = ui::line_height(&is) / s;
+    for l in wrap_max(&q.text, &is, text_w, s, 3) {
+        pen.text(&l, TEXT_X, y + (row - lh) / 2.0, &is);
+        y += row;
     }
-    if !detail.is_empty() {
-        ty += 6.0;
-        for l in &detail {
-            let lh = ui::line_height(&ds) / s;
-            pen.text(l, PAD + ip, ty + (dl - lh) / 2.0, &ds);
-            ty += dl;
+    if !q.detail.trim().is_empty() {
+        let ds = meta_style(s);
+        let dl = ui::line_height(&ds) / s;
+        y += 3.0;
+        for l in wrap_max(&q.detail.replace('\n', " "), &ds, text_w, s, 2) {
+            pen.text(&l, TEXT_X, y + (15.0 - dl) / 2.0, &ds);
+            y += 15.0;
         }
     }
-    y += ph + 12.0;
-    let h = v.hover;
-    if matches!(v.drive, Drive::Asking | Drive::Paused) {
+    y += 12.0;
+    // One quiet row: Always on the left; Don't Allow and Allow on the right.
+    let h = 30.0;
+    let aw = button_w("Allow", false, s) + 6.0;
+    let ax = CARD_W - PAD - aw;
+    button(pen, ax, y, Some(aw), h, "Allow", Look::Primary, Btn::Once, v, None, v.keyed);
+    let dw = button_w("Don't Allow", false, s);
+    button(pen, ax - 4.0 - dw, y, Some(dw), h, "Don't Allow", Look::Quiet, Btn::Deny, v, None, false);
+    if !matches!(v.drive, Drive::Asking | Drive::Paused) {
         // The drive machine remembers its own yes for the conversation;
         // agents.always_approve doesn't cover driving.
-        let half = (inner - 6.0) / 2.0;
-        button(
-            pen,
-            PAD,
-            y,
-            Some(half),
-            "Allow",
-            BtnLook::Accent,
-            Btn::Once,
-            h,
-            None,
-        );
-        button(
-            pen,
-            PAD + half + 6.0,
-            y,
-            Some(half),
-            "Don't allow",
-            BtnLook::Quiet,
-            Btn::Deny,
-            h,
-            None,
-        );
-        return y + BTN_H;
+        button(pen, PAD, y, None, h, "Always allow", Look::Quiet, Btn::Always, v, None, false);
     }
-    button(
-        pen,
-        PAD,
-        y,
-        Some(inner),
-        "Always approve",
-        BtnLook::Accent,
-        Btn::Always,
-        h,
-        None,
-    );
-    y += BTN_H + 6.0;
-    let half = (inner - 6.0) / 2.0;
-    button(
-        pen,
-        PAD,
-        y,
-        Some(half),
-        "Approve once",
-        BtnLook::Ghost,
-        Btn::Once,
-        h,
-        None,
-    );
-    button(
-        pen,
-        PAD + half + 6.0,
-        y,
-        Some(half),
-        "Don't allow",
-        BtnLook::Quiet,
-        Btn::Deny,
-        h,
-        None,
-    );
-    y + BTN_H
+    y + h
+}
+
+/// Questions, numbered when there are several, then the answer box.
+fn questions(pen: &mut Pen, v: &CardView, q: &Question, mut y: f32) -> f32 {
+    let s = pen.s;
+    let text_w = CARD_W - TEXT_X - PAD;
+    let qs = body_style(s).size(13.5 * s);
+    let num = meta_style(s).size(11.5 * s);
+    let row = 19.0;
+    let list: Vec<&String> = if q.questions.is_empty() {
+        vec![&q.text]
+    } else {
+        q.questions.iter().collect()
+    };
+    let many = list.len() > 1;
+    for (i, item) in list.iter().enumerate() {
+        for (j, l) in wrap_max(item, &qs, text_w, s, 4).iter().enumerate() {
+            let b = base(y + row / 2.0, &qs, s);
+            if many && j == 0 {
+                let n = format!("{}", i + 1);
+                pen.text_base(&n, DOT_X - tw(&n, &num, s) / 2.0, b, &num);
+            }
+            pen.text_base(l, TEXT_X, b, &qs);
+            y += row;
+        }
+        y += 5.0;
+    }
+    y += 5.0;
+    input_box(pen, v, y, "Your answer…");
+    y += INPUT_H + 6.0;
+    actions(pen, v, y)
+}
+
+/// Under the "Remembered" line: the fact in full (when cut), the agents
+/// that read it, and See all.
+fn brain_body(pen: &mut Pen, v: &CardView, b: &BrainView, cut: bool) -> f32 {
+    let s = pen.s;
+    let text_w = CARD_W - TEXT_X - PAD;
+    let mut y = ROW_H - 2.0;
+    if cut {
+        let fs = body_style(s);
+        for l in wrap_max(&b.fact.text, &fs, text_w, s, 4) {
+            pen.line(&l, TEXT_X, y, &fs);
+            y += LINE;
+        }
+        y += 8.0;
+    }
+    let ss = small_style(s);
+    if b.readers.is_empty() {
+        pen.line("Agents read it when they start.", TEXT_X, y, &ss);
+        y += LINE + 4.0;
+    } else {
+        const ROWS: usize = 3;
+        let row = 22.0;
+        for name in b.readers.iter().take(ROWS) {
+            let mid = y + row / 2.0;
+            pen.circle(DOT_X, mid, 2.5, tokens::SIGNAL);
+            let ns = ss.color(TEXT);
+            let tail = "reads it";
+            let tail_w = tw(tail, &ss, s);
+            let n = ui::ellipsize(name, &ns, (text_w - tail_w - 8.0) * s);
+            let w = pen.text_base(&n, TEXT_X, base(mid, &ns, s), &ns);
+            pen.text_base(tail, TEXT_X + w + 6.0, base(mid, &ns, s), &ss.color(TEXT_3));
+            y += row;
+        }
+        if b.readers.len() > ROWS {
+            let st = ss.color(TEXT_3);
+            let t = format!("+{} more", b.readers.len() - ROWS);
+            pen.text_base(&t, TEXT_X, base(y + 9.0, &st, s), &st);
+            y += 18.0;
+        }
+        y += 4.0;
+    }
+    // Footer: where it lives, and the way to all of it.
+    let st = small_style(s).color(TEXT_3);
+    let w = button_w("See all", false, s);
+    let mid = y + QUIET_H / 2.0;
+    let meta = format!("{} \u{00b7} {}", b.fact.topic, b.fact.from_label());
+    let meta = ui::ellipsize(&meta, &st, (CARD_W - PAD - w - TEXT_X - 6.0) * s);
+    pen.text_base(&meta, TEXT_X, base(mid, &st, s), &st);
+    button(pen, CARD_W - PAD - w, y, Some(w), QUIET_H, "See all", Look::Quiet, Btn::Brain, v, None, false);
+    y + QUIET_H
 }
 
 /// Fades the top or bottom `px` rows of a premultiplied pixmap to clear.
@@ -1511,88 +1372,152 @@ fn render_card(v: &CardView, s: f32) -> Option<Drawn> {
     };
     let (_, max_scroll) = compose(v, &mut pen);
     let hits = std::mem::take(&mut pen.hits);
-    let edge = match kind(&v.agent) {
-        Kind::Approval | Kind::Questions => tokens::ASK.fade(0.45),
-        _ => tokens::LINE,
-    };
     Some(Drawn {
         pm,
         h,
         hits,
         max_scroll,
-        edge,
     })
 }
 
+/// What a card's surface is filled with: the island's glass (a texture in
+/// the card window's pixels) or, without one, the island's solid ink.
+enum Fill<'a> {
+    Ink,
+    Glass(&'a Pixmap),
+}
+
+fn fill_surface(pm: &mut Pixmap, path: &tiny_skia::Path, fill: &Fill, alpha: f32) {
+    let paint = match fill {
+        Fill::Ink => {
+            let mut p = tiny_skia::Paint::default();
+            p.set_color(tokens::INK.fade(alpha).skia());
+            p.anti_alias = true;
+            p
+        }
+        Fill::Glass(tex) => tiny_skia::Paint {
+            shader: tiny_skia::Pattern::new(
+                tex.as_ref(),
+                tiny_skia::SpreadMode::Pad,
+                tiny_skia::FilterQuality::Nearest,
+                alpha.clamp(0.0, 1.0),
+                Transform::identity(),
+            ),
+            anti_alias: true,
+            ..Default::default()
+        },
+    };
+    pm.fill_path(path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+}
+
+/// The island's glass under the card window, one texel per window pixel
+/// (`x0`, `top`: the window's screen position).
+fn glass_texture(
+    b: &crate::surface::Backdrop,
+    opacity: f32,
+    x0: i32,
+    top: i32,
+    w: u32,
+    h: u32,
+) -> Option<Pixmap> {
+    let mut tex = Pixmap::new(w, h)?;
+    let ink = [tokens::INK.r, tokens::INK.g, tokens::INK.b];
+    let px = tex.pixels_mut();
+    for y in 0..h {
+        let sy = top as f32 + y as f32 + 0.5;
+        for x in 0..w {
+            let c = b.sample_screen(x0 as f32 + x as f32 + 0.5, sy);
+            let [r, g, bl] = crate::surface::glass_pixel(c, ink, opacity);
+            if let Some(p) = tiny_skia::PremultipliedColorU8::from_rgba(r, g, bl, 255) {
+                px[(y * w + x) as usize] = p;
+            }
+        }
+    }
+    Some(tex)
+}
+
 /// Draws one card's surface at (x, y) with height `h` (logical; may be
-/// shorter than the content while it animates) and its content clipped to it.
+/// shorter than the content while it animates) and its content clipped to
+/// it, cross-fading from `prev` (with the fade's progress) when it morphs.
 #[allow(clippy::too_many_arguments)]
-fn paint_card(pm: &mut Pixmap, d: &Drawn, x: f32, y: f32, h: f32, alpha: f32, s: f32) {
+fn paint_card(
+    pm: &mut Pixmap,
+    d: &Drawn,
+    prev: Option<(&Drawn, f32)>,
+    x: f32,
+    y: f32,
+    h: f32,
+    alpha: f32,
+    s: f32,
+    fill: &Fill,
+) {
     if alpha <= 0.002 || h <= 0.5 {
         return;
     }
     let (px, py, pw, ph) = (x * s, y * s, CARD_W * s, h * s);
-    let r = tokens::RADIUS_CARD.min(h / 2.0) * s;
-    ui::fill_rounded(pm, px, py, pw, ph, r, tokens::INK.fade(alpha));
-    if let (Some(mut mask), Some(path)) = (
-        tiny_skia::Mask::new(pm.width(), pm.height()),
-        ui::rounded_rect_path(px, py, pw, ph, r),
-    ) {
-        mask.fill_path(
-            &path,
-            tiny_skia::FillRule::Winding,
-            true,
-            Transform::identity(),
-        );
-        let paint = PixmapPaint {
-            opacity: alpha.clamp(0.0, 1.0),
-            ..Default::default()
+    let r = RADIUS.min(h / 2.0) * s;
+    let Some(path) = ui::rounded_rect_path(px, py, pw, ph, r) else {
+        return;
+    };
+    fill_surface(pm, &path, fill, alpha);
+    if let Some(mut mask) = tiny_skia::Mask::new(pm.width(), pm.height()) {
+        mask.fill_path(&path, tiny_skia::FillRule::Winding, true, Transform::identity());
+        let mut layer = |src: &Drawn, a: f32| {
+            if a > 0.002 {
+                let paint = PixmapPaint {
+                    opacity: a.clamp(0.0, 1.0),
+                    ..Default::default()
+                };
+                pm.draw_pixmap(
+                    px.round() as i32,
+                    py.round() as i32,
+                    src.pm.as_ref(),
+                    &paint,
+                    Transform::identity(),
+                    Some(&mask),
+                );
+            }
         };
-        pm.draw_pixmap(
-            px.round() as i32,
-            py.round() as i32,
-            d.pm.as_ref(),
-            &paint,
-            Transform::identity(),
-            Some(&mask),
-        );
+        match prev {
+            Some((p, t)) => {
+                let t = t.clamp(0.0, 1.0);
+                layer(p, alpha * (1.0 - t));
+                layer(d, alpha * t);
+            }
+            None => layer(d, alpha),
+        }
     }
-    ui::stroke_rounded(pm, px, py, pw, ph, r, s.max(1.0), d.edge.fade(alpha));
+    ui::stroke_rounded(pm, px, py, pw, ph, r, s.max(1.0), tokens::LINE.fade(alpha));
 }
 
-/// The "+N" pill under the stack.
-fn render_more(n: usize, open: bool, hover: bool, s: f32) -> Option<Pixmap> {
-    let label = if open {
-        "Show fewer".to_string()
-    } else {
-        format!("+{n} more")
-    };
-    let ls = label_style(s).color(if hover { tokens::PAPER } else { tokens::MUTE });
-    let w = tw(&label, &ls, s) + 28.0;
-    let mut pm = Pixmap::new((CARD_W * s).ceil() as u32, (MORE_H * s).ceil() as u32)?;
+/// The "+N" pill under the stack, centred in a `CARD_W` column at `ox`.
+/// Returns its x and width (logical, relative to `ox`).
+#[allow(clippy::too_many_arguments)]
+fn paint_more(
+    pm: &mut Pixmap,
+    n: usize,
+    open: bool,
+    hover: bool,
+    ox: f32,
+    y: f32,
+    s: f32,
+    fill: &Fill,
+) -> (f32, f32) {
+    let label = if open { "Show fewer".to_string() } else { format!("+{n}") };
+    let st = btn_style(s).size(12.5 * s).color(if hover { TEXT } else { TEXT_2 });
+    let w = tw(&label, &st, s) + 28.0;
     let x = (CARD_W - w) / 2.0;
-    ui::fill_rounded(
-        &mut pm,
-        x * s,
-        0.0,
-        w * s,
-        MORE_H * s,
-        MORE_H / 2.0 * s,
-        tokens::INK,
-    );
-    ui::stroke_rounded(
-        &mut pm,
-        x * s,
-        0.0,
-        w * s,
-        MORE_H * s,
-        MORE_H / 2.0 * s,
-        s.max(1.0),
-        tokens::LINE,
-    );
-    let base = (MORE_H / 2.0 * s + ui::cap_height(&ls) / 2.0).round();
-    ui::draw_text_baseline(&mut pm, &label, ((x + 14.0) * s).round(), base, &ls);
-    Some(pm)
+    let (px, py, pw, ph, r) = ((ox + x) * s, y * s, w * s, MORE_H * s, MORE_H / 2.0 * s);
+    if let Some(p) = ui::rounded_rect_path(px, py, pw, ph, r) {
+        fill_surface(pm, &p, fill, 1.0);
+        if hover {
+            ui::fill_rounded(pm, px, py, pw, ph, r, FILL);
+        }
+    }
+    ui::stroke_rounded(pm, px, py, pw, ph, r, s.max(1.0), tokens::LINE);
+    let b = ((y + MORE_H / 2.0) * s + ui::cap_height(&st) / 2.0).round();
+    ui::draw_text_baseline(pm, &label, ((ox + x + 14.0) * s).round(), b, &st);
+    (x, w)
 }
 
 // ---------------------------------------------------------------- window thread
@@ -1615,6 +1540,8 @@ struct Input {
     inputs: Vec<(i32, i32, i32, i32)>,
     /// Window-px rects of clickable things (hand cursor).
     buttons: Vec<(i32, i32, i32, i32)>,
+    /// Window-px rects of cards a click gives the keyboard to.
+    keyable: Vec<(i32, i32, i32, i32)>,
 }
 
 thread_local! {
@@ -1658,8 +1585,13 @@ unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         match msg {
             WM_MOUSEACTIVATE => {
                 let p = window_point(hwnd);
-                let on_input = INPUT.with(|i| i.borrow().inputs.iter().any(|r| inside(r, p)));
-                if on_input {
+                let take = INPUT.with(|i| {
+                    let i = i.borrow();
+                    i.inputs.iter().any(|r| inside(r, p))
+                        || (i.keyable.iter().any(|r| inside(r, p))
+                            && !i.buttons.iter().any(|r| inside(r, p)))
+                });
+                if take {
                     let fg = GetForegroundWindow();
                     if fg != hwnd {
                         INPUT.with(|i| i.borrow_mut().prev_fg = Some(fg.0 as isize));
@@ -1755,22 +1687,33 @@ unsafe extern "system" fn body_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     }
 }
 
+/// Size and position springs: quick and just short of bouncy (~220 ms,
+/// no visible overshoot).
+const MORPH: (f32, f32) = (420.0, 38.0);
+
 struct Card {
     id: String,
     agent: Agent,
     stale: bool,
     pending_at: Instant,
-    activity: Instant,
     hover_until: Option<Instant>,
+    /// When a finished card (or the "Remembered" line) goes on its own.
+    expires: Option<Instant>,
+    /// The user asked for this card (island row, notice): it shows even
+    /// while running with presence "hotkey".
+    opened: bool,
     y: Spring,
     h: Spring,
     appear: Spring,
+    /// 0 → 1: cross-fade from `prev` to the current content.
+    xfade: Spring,
     leaving: bool,
     fresh: bool,
     draft: String,
     scroll: f32,
     drive: Drive,
     cache: Option<(CardView, Drawn)>,
+    prev: Option<Drawn>,
     brain: Option<BrainView>,
 }
 
@@ -1784,27 +1727,31 @@ impl Card {
         } else {
             now
         };
+        let expires = (!agent.status.is_active()).then(|| now + FINISHED_FOR);
         Self {
             id: agent.id.clone(),
             agent,
             stale: false,
             pending_at,
-            activity: now,
             hover_until: None,
-            y: Spring::new(0.0),
-            h: Spring::new(SLIM_H),
-            appear: Spring::new(0.0).with(300.0, 26.0),
+            expires,
+            opened: false,
+            y: Spring::new(0.0).with(MORPH.0, MORPH.1),
+            h: Spring::new(ROW_H).with(MORPH.0, MORPH.1),
+            appear: Spring::new(0.0).with(300.0, 30.0),
+            xfade: Spring::new(1.0).with(520.0, 46.0),
             leaving: false,
             fresh: true,
             draft: String::new(),
             scroll: 0.0,
             drive: Drive::Off,
             cache: None,
+            prev: None,
             brain: None,
         }
     }
 
-    /// A "Saved to the brain" card (it leaves on its own once idle).
+    /// The "Remembered" line for a fact (it leaves on its own).
     fn brain(fact: Fact, now: Instant) -> Self {
         let readers = agents::list()
             .into_iter()
@@ -1819,13 +1766,43 @@ impl Card {
             ..Default::default()
         };
         Self {
-            brain: Some(BrainView { fact, readers }),
+            brain: Some(BrainView {
+                fact,
+                readers,
+                undone: false,
+            }),
+            expires: Some(now + NOTICE_FOR),
             ..Self::new(agent, now)
         }
     }
 
     fn kind(&self) -> Kind {
         kind(&self.agent)
+    }
+
+    /// Waiting on the user: opens by itself and stays until handled.
+    fn asking(&self) -> bool {
+        self.brain.is_none() && matches!(self.kind(), Kind::Approval | Kind::Questions)
+    }
+
+    /// A click gives this card the keyboard (Enter has something to do).
+    fn keyable(&self) -> bool {
+        self.brain.is_none()
+            && matches!(
+                self.kind(),
+                Kind::Approval | Kind::Questions | Kind::Done | Kind::Failed | Kind::Stopped
+            )
+    }
+
+    /// Shows without being called: asks, finished agents, the brain line,
+    /// and any card the user opened. Running agents only with presence
+    /// "auto_hide" / "always" (with "hotkey" the palette shows them).
+    fn shows(&self, presence: Presence) -> bool {
+        self.brain.is_some()
+            || self.asking()
+            || !self.agent.status.is_active()
+            || self.opened
+            || presence != Presence::Hotkey
     }
 
     fn pending_left(&self, now: Instant) -> f32 {
@@ -1835,12 +1812,25 @@ impl Card {
     }
 }
 
+/// A new rendering cross-fades (rather than swaps) when the card opens or
+/// closes, changes state or its line of text changes.
+fn morphs(old: &CardView, new: &CardView) -> bool {
+    old.expanded != new.expanded
+        || kind(&old.agent) != kind(&new.agent)
+        || old.agent.steps.last() != new.agent.steps.last()
+        || old.brain.as_ref().map(|b| b.undone) != new.brain.as_ref().map(|b| b.undone)
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// The glass texture under the card window, and what it was made for:
+/// (backdrop, x0, top, width, opacity bits).
+type GlassKey = (usize, i32, i32, u32, u32);
 
 struct Cards {
     cards: Vec<Card>,
@@ -1849,6 +1839,8 @@ struct Cards {
     mon: MonitorInfo,
     /// Card id with the focused follow-up box.
     focus: Option<String>,
+    /// Card id that has the keyboard itself (Enter = its primary action).
+    kb: Option<String>,
     hovered: Option<(String, Hit)>,
     show_all: bool,
     more_hover: bool,
@@ -1865,6 +1857,13 @@ struct Cards {
     cache_scale: f32,
     /// The agent `quick` is recording a spoken follow-up for.
     listening: Option<String>,
+    /// Windows' "Animation effects" is off: no motion, no fades.
+    reduce: bool,
+    reduce_at: Instant,
+    presence: Presence,
+    glass: Option<(GlassKey, Pixmap)>,
+    /// Our own blurred backdrop while the island (and its glass) is away.
+    own_glass: Option<(Arc<crate::surface::Backdrop>, Instant)>,
 }
 
 fn run() -> anyhow::Result<()> {
@@ -1877,6 +1876,7 @@ fn run() -> anyhow::Result<()> {
         shadow,
         mon: ui::monitor_under_cursor(),
         focus: None,
+        kb: None,
         hovered: None,
         show_all: false,
         more_hover: false,
@@ -1890,6 +1890,11 @@ fn run() -> anyhow::Result<()> {
         spot: (0, 0),
         cache_scale: 0.0,
         listening: None,
+        reduce: crate::surface::reduced_motion(),
+        reduce_at: now,
+        presence: presence(),
+        glass: None,
+        own_glass: None,
     };
     // Agents already waiting on the user (or still running) get their cards.
     for a in agents::list() {
@@ -1963,11 +1968,19 @@ impl Cards {
         };
         let Some(card) = card else { return };
         card.stale = true;
-        card.activity = now;
         match &ev {
-            AgentEvent::Status(Status::Pending) => card.pending_at = now,
-            AgentEvent::Status(Status::Running) => card.scroll = 0.0,
-            AgentEvent::Status(s) if !s.is_active() => card.drive = Drive::Off,
+            AgentEvent::Status(Status::Pending) => {
+                card.pending_at = now;
+                card.expires = None;
+            }
+            AgentEvent::Status(Status::Running) => {
+                card.scroll = 0.0;
+                card.expires = None;
+            }
+            AgentEvent::Status(s) if !s.is_active() => {
+                card.drive = Drive::Off;
+                card.expires = Some(now + FINISHED_FOR);
+            }
             AgentEvent::Drive(d) => card.drive = card.drive.on(d),
             _ => {}
         }
@@ -1985,12 +1998,14 @@ impl Cards {
         self.dirty = true;
     }
 
-    /// The user opened a card (island row, notice, click).
+    /// The user opened a card (island row, notice).
     fn open(&mut self, id: &str, now: Instant) {
         if let Some(c) = self.ensure(id, now) {
-            c.activity = now;
             c.stale = true;
+            c.opened = true;
+            c.hover_until = Some(now + OPENED_FOR);
             if !c.agent.status.is_active() {
+                c.expires = Some(now + OPENED_FOR + AFTER_HOVER);
                 crate::wire::mark_agent_seen(id);
             }
         }
@@ -2003,16 +2018,25 @@ impl Cards {
         self.dirty = true;
     }
 
-    /// Indices of live cards in display order: asks first, then newest first.
+    /// Indices of cards to show, in display order: the brain line, asks,
+    /// running, finished; newest first within each.
     fn order(&self) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..self.cards.len())
-            .filter(|&i| !self.cards[i].leaving)
+            .filter(|&i| !self.cards[i].leaving && self.cards[i].shows(self.presence))
             .collect();
         idx.sort_by_key(|&i| {
             let c = &self.cards[i];
-            let asking = matches!(c.kind(), Kind::Approval | Kind::Questions);
+            let rank = if c.brain.is_some() {
+                0
+            } else if c.asking() {
+                1
+            } else if c.agent.status.is_active() {
+                2
+            } else {
+                3
+            };
             (
-                !asking,
+                rank,
                 std::cmp::Reverse(c.agent.created),
                 std::cmp::Reverse(c.id.clone()),
             )
@@ -2020,13 +2044,19 @@ impl Cards {
         idx
     }
 
-    fn expanded(&self, c: &Card, now: Instant) -> bool {
-        let forced = matches!(c.kind(), Kind::Pending | Kind::Approval | Kind::Questions)
-            || self.focus.as_deref() == Some(c.id.as_str())
-            || self.listening.as_deref() == Some(c.id.as_str())
+    /// The user is with this card: hovering, typing, talking, or it was just
+    /// opened.
+    fn engaged(&self, c: &Card, now: Instant) -> bool {
+        let id = Some(c.id.as_str());
+        self.focus.as_deref() == id
+            || self.kb.as_deref() == id
+            || self.listening.as_deref() == id
             || c.hover_until.is_some_and(|t| now < t)
-            || self.hovered.as_ref().is_some_and(|(h, _)| *h == c.id);
-        forced || now.saturating_duration_since(c.activity) < IDLE_COLLAPSE
+            || self.hovered.as_ref().is_some_and(|(h, _)| *h == c.id)
+    }
+
+    fn expanded(&self, c: &Card, now: Instant) -> bool {
+        c.asking() || self.engaged(c, now)
     }
 
     fn frame(&mut self, now: Instant) {
@@ -2035,6 +2065,15 @@ impl Cards {
             .as_secs_f32()
             .min(0.05);
         self.last = now;
+        if now.saturating_duration_since(self.reduce_at) >= Duration::from_secs(3) {
+            self.reduce_at = now;
+            self.reduce = crate::surface::reduced_motion();
+        }
+        let p = presence();
+        if p != self.presence {
+            self.presence = p;
+            self.dirty = true;
+        }
 
         // ---- inbox
         let msgs = std::mem::take(&mut *INBOX.lock().unwrap());
@@ -2088,7 +2127,7 @@ impl Cards {
                 std::mem::take(&mut i.blurred),
             )
         });
-        if blurred && self.focus.is_some() {
+        if blurred && (self.focus.is_some() || self.kb.is_some()) {
             self.blur(false);
         }
         let s = self.mon.scale;
@@ -2120,11 +2159,16 @@ impl Cards {
             self.dirty = true;
         }
         if hover != self.hovered {
-            // Leaving a card: it stays open a moment (gaps, small moves).
+            // Leaving a card: it stays open a moment (gaps, small moves), and
+            // a timed one waits a little before it goes.
             if let Some((old, _)) = &self.hovered {
                 if hover.as_ref().is_none_or(|(n, _)| n != old) {
                     if let Some(c) = self.cards.iter_mut().find(|c| &c.id == old) {
                         c.hover_until = Some(now + HOVER_LINGER);
+                        c.opened = false;
+                        if let Some(t) = c.expires {
+                            c.expires = Some(t.max(now + AFTER_HOVER));
+                        }
                     }
                 }
             }
@@ -2132,7 +2176,7 @@ impl Cards {
                 let id = id.clone();
                 if let Some(c) = self.find(&id) {
                     c.hover_until = None;
-                    if !c.agent.status.is_active() {
+                    if !c.agent.status.is_active() && c.brain.is_none() {
                         crate::wire::mark_agent_seen(&id);
                     }
                 }
@@ -2157,7 +2201,6 @@ impl Cards {
                 if let Some(c) = self.find(&id) {
                     let max = c.cache.as_ref().map_or(0.0, |(_, d)| d.max_scroll);
                     c.scroll = (c.scroll - d as f32 / 120.0 * 54.0).clamp(0.0, max);
-                    c.activity = now;
                     self.dirty = true;
                 }
             }
@@ -2166,15 +2209,21 @@ impl Cards {
             self.typed(&chars, now);
         }
 
-        // A brain card goes away once it would collapse (it has no slim row).
-        for i in 0..self.cards.len() {
-            let c = &self.cards[i];
-            if c.brain.is_some() && !c.leaving && !self.expanded(c, now) {
-                let c = &mut self.cards[i];
-                c.leaving = true;
-                c.appear.set(0.0);
-                self.dirty = true;
-            }
+        // ---- timed cards leave on their own, unless the user is with them
+        let due: Vec<String> = self
+            .cards
+            .iter()
+            .filter(|c| {
+                !c.leaving
+                    && !c.asking()
+                    && (c.brain.is_some() || !c.agent.status.is_active())
+                    && c.expires.is_some_and(|t| now >= t)
+                    && !self.engaged(c, now)
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        for id in due {
+            self.dismiss(&id);
         }
 
         // ---- content
@@ -2198,6 +2247,7 @@ impl Cards {
                     .filter(|(h, _)| *h == c.id)
                     .map(|(_, h)| *h),
                 focused: self.focus.as_deref() == Some(c.id.as_str()),
+                keyed: self.kb.as_deref() == Some(c.id.as_str()),
                 draft: c.draft.clone(),
                 now: unix,
                 pending_left: c.pending_left(now),
@@ -2209,7 +2259,14 @@ impl Cards {
             };
             if c.cache.as_ref().is_none_or(|(v, _)| *v != view) {
                 if let Some(d) = render_card(&view, s) {
+                    let reduce = self.reduce;
                     let c = &mut self.cards[i];
+                    let morph = c.cache.as_ref().is_some_and(|(old, _)| morphs(old, &view));
+                    if morph && !reduce {
+                        c.prev = c.cache.take().map(|(_, d)| d);
+                        c.xfade.snap(0.0);
+                        c.xfade.set(1.0);
+                    }
                     c.scroll = c.scroll.min(d.max_scroll);
                     c.cache = Some((view, d));
                     self.dirty = true;
@@ -2221,7 +2278,7 @@ impl Cards {
         let mut y = 0.0;
         for &i in &visible {
             let c = &mut self.cards[i];
-            let h = c.cache.as_ref().map_or(SLIM_H, |(_, d)| d.h);
+            let h = c.cache.as_ref().map_or(ROW_H, |(_, d)| d.h);
             if c.fresh {
                 c.fresh = false;
                 c.y.snap(y);
@@ -2242,48 +2299,70 @@ impl Cards {
             }
         }
 
-        // ---- animate
+        // ---- animate (or, with animations off, jump)
+        let reduce = self.reduce;
         let mut moving = false;
+        let mut jumped = false;
         for c in &mut self.cards {
-            moving |= c.y.tick(dt) | c.h.tick(dt) | c.appear.tick(dt);
+            if reduce {
+                for sp in [&mut c.y, &mut c.h, &mut c.appear, &mut c.xfade] {
+                    if !sp.settled() {
+                        sp.snap(sp.target);
+                        jumped = true;
+                    }
+                }
+            }
+            moving |= c.y.tick(dt) | c.h.tick(dt) | c.appear.tick(dt) | c.xfade.tick(dt);
+            if c.prev.is_some() && c.xfade.settled() {
+                c.prev = None;
+            }
         }
         self.cards
             .retain(|c| !(c.leaving && c.appear.value <= 0.01 && c.appear.target == 0.0));
-        if !(moving || self.dirty) {
+        if !(moving || jumped || self.dirty) {
             return;
         }
         self.dirty = false;
         self.draw(order.len().saturating_sub(MAX_VISIBLE));
     }
 
+    /// Gives the card window the keyboard (it is non-activating otherwise).
+    fn take_keys(&self) {
+        unsafe {
+            let h = self.body.hwnd();
+            set_activatable(h, true);
+            let _ = SetForegroundWindow(h);
+            let _ = SetFocus(Some(h));
+        }
+    }
+
     fn click(&mut self, id: &str, hit: Hit, right: bool, now: Instant) {
         let Some(c) = self.find(id) else { return };
-        c.activity = now;
         c.stale = true;
-        let finished = !c.agent.status.is_active();
+        let finished = !c.agent.status.is_active() && c.brain.is_none();
         let ask = c.agent.ask.clone();
+        let keyable = c.keyable();
         if finished {
             crate::wire::mark_agent_seen(id);
         }
         if hit != Hit::Input && self.focus.as_deref() == Some(id) && hit != Hit::Btn(Btn::Send) {
             self.blur(true);
         }
-        let ok = match hit {
-            Hit::Card | Hit::Result => true,
-            Hit::Input => {
-                self.focus = Some(id.to_string());
-                unsafe {
-                    let h = self.body.hwnd();
-                    set_activatable(h, true);
-                    let _ = SetForegroundWindow(h);
-                    let _ = SetFocus(Some(h));
+        match hit {
+            Hit::Card => {
+                if keyable && !right {
+                    self.focus = None;
+                    self.kb = Some(id.to_string());
+                    self.take_keys();
                 }
-                true
             }
-            Hit::Mic => {
-                crate::quick::mic_follow_up(id);
-                true
+            Hit::Result => {}
+            Hit::Input => {
+                self.kb = None;
+                self.focus = Some(id.to_string());
+                self.take_keys();
             }
+            Hit::Mic => crate::quick::mic_follow_up(id),
             Hit::File(i) => {
                 let file = self.find(id).and_then(|c| c.agent.files.get(i).cloned());
                 if let Some(f) = file {
@@ -2293,19 +2372,16 @@ impl Cards {
                         crate::win::open_agent_file(&f);
                     }
                 }
-                true
             }
             Hit::Btn(b) => {
-                if right {
-                    return;
+                if !right {
+                    self.button(id, b, ask, now);
                 }
-                self.button(id, b, ask)
             }
-        };
-        let _ = ok;
+        }
     }
 
-    fn button(&mut self, id: &str, b: Btn, ask: Option<Question>) -> bool {
+    fn button(&mut self, id: &str, b: Btn, ask: Option<Question>, now: Instant) {
         match b {
             Btn::Cancel => {
                 agents::cancel(id);
@@ -2316,14 +2392,23 @@ impl Cards {
             }
             Btn::Retry => {
                 agents::retry(id);
+                self.blur(true);
             }
-            Btn::Dismiss => self.dismiss(id),
             Btn::Show => {
                 agents::desk::show(id);
             }
             Btn::Palette => {
                 crate::wire::mark_agent_seen(id);
+                // The palette takes the foreground itself.
+                self.blur(false);
                 crate::win::push(crate::win::AppEvent::AgentPalette(id.to_string()));
+                if let Some(c) = self.find(id) {
+                    if !c.agent.status.is_active() {
+                        // Its result is in the thread now; the line can go.
+                        c.expires = Some(now + Duration::from_millis(600));
+                        c.hover_until = None;
+                    }
+                }
             }
             Btn::Always => {
                 // Never save over a config.toml that did not load (that would
@@ -2346,28 +2431,47 @@ impl Cards {
                 if let Some(q) = ask {
                     agents::answer(id, q.id, Answer::Allow);
                 }
+                self.blur(true);
             }
             Btn::Once => {
                 if let Some(q) = ask {
                     agents::answer(id, q.id, Answer::AllowOnce);
                 }
+                self.blur(true);
             }
             Btn::Deny => {
                 if let Some(q) = ask {
                     agents::answer(id, q.id, Answer::Deny);
                 }
+                self.blur(true);
             }
             Btn::Send => self.submit(id),
             Btn::Brain => {
                 crate::settings::open_brain();
                 self.dismiss(id);
             }
+            Btn::Undo => {
+                if let Some(c) = self.find(id) {
+                    if let Some(b) = &mut c.brain {
+                        if !b.undone {
+                            if crate::brain::undo(&b.fact.id) {
+                                b.undone = true;
+                                c.expires = Some(now + Duration::from_millis(1400));
+                                c.hover_until = None;
+                            } else {
+                                crate::config::log("cards: brain undo found nothing to undo");
+                            }
+                        }
+                    }
+                }
+            }
         }
-        true
+        self.dirty = true;
     }
 
     fn dismiss(&mut self, id: &str) {
-        if self.focus.as_deref() == Some(id) {
+        let id_owned = Some(id);
+        if self.focus.as_deref() == id_owned || self.kb.as_deref() == id_owned {
             self.blur(true);
         }
         if let Some(c) = self.find(id) {
@@ -2397,8 +2501,70 @@ impl Cards {
         self.dirty = true;
     }
 
+    /// Keys on a card that has the keyboard itself (not its box): Enter =
+    /// the primary action, Esc = close / dismiss, typing starts the box.
+    fn keyed(&mut self, id: &str, units: &[u16], now: Instant) {
+        let chars: Vec<char> = char::decode_utf16(units.iter().copied()).flatten().collect();
+        for (i, &ch) in chars.iter().enumerate() {
+            match ch as u32 {
+                0x0D => {
+                    self.primary(id, now);
+                    return;
+                }
+                0x1B => {
+                    let timed = self.find(id).is_some_and(|c| !c.agent.status.is_active());
+                    if timed {
+                        self.dismiss(id);
+                    } else {
+                        self.blur(true);
+                        if let Some(c) = self.find(id) {
+                            c.hover_until = None;
+                        }
+                    }
+                    return;
+                }
+                u if u < 0x20 => {}
+                _ => {
+                    // Typing on a card with a box starts a follow-up or answer.
+                    let has_box = self.find(id).is_some_and(|c| {
+                        matches!(c.kind(), Kind::Questions | Kind::Done | Kind::Failed | Kind::Stopped)
+                    });
+                    if has_box {
+                        self.kb = None;
+                        self.focus = Some(id.to_string());
+                        let rest: Vec<u16> = chars[i..].iter().collect::<String>().encode_utf16().collect();
+                        self.typed(&rest, now);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Enter on a card: Allow, answer, open the result, or retry.
+    fn primary(&mut self, id: &str, now: Instant) {
+        let Some(c) = self.find(id) else { return };
+        let ask = c.agent.ask.clone();
+        match c.kind() {
+            Kind::Approval => self.button(id, Btn::Once, ask, now),
+            Kind::Questions => {
+                self.kb = None;
+                self.focus = Some(id.to_string());
+            }
+            Kind::Done | Kind::Stopped => self.button(id, Btn::Palette, ask, now),
+            Kind::Failed => self.button(id, Btn::Retry, ask, now),
+            Kind::Pending | Kind::Running => {}
+        }
+        self.dirty = true;
+    }
+
     fn typed(&mut self, units: &[u16], now: Instant) {
-        let Some(id) = self.focus.clone() else { return };
+        let Some(id) = self.focus.clone() else {
+            if let Some(id) = self.kb.clone() {
+                self.keyed(&id, units, now);
+            }
+            return;
+        };
         for ch in char::decode_utf16(units.iter().copied()).flatten() {
             match ch as u32 {
                 0x0D => {
@@ -2407,6 +2573,9 @@ impl Cards {
                 }
                 0x1B => {
                     self.blur(true);
+                    if let Some(c) = self.find(&id) {
+                        c.hover_until = None;
+                    }
                     return;
                 }
                 0x16 => {
@@ -2439,15 +2608,13 @@ impl Cards {
                 }
             }
         }
-        if let Some(c) = self.find(&id) {
-            c.activity = now;
-        }
         self.dirty = true;
     }
 
-    /// Drops text focus; `restore` hands the foreground back to where it was.
+    /// Drops the keyboard; `restore` hands the foreground back to where it was.
     fn blur(&mut self, restore: bool) {
-        if self.focus.take().is_none() {
+        let had = self.focus.take().is_some() | self.kb.take().is_some();
+        if !had {
             return;
         }
         let h = self.body.hwnd();
@@ -2463,7 +2630,8 @@ impl Cards {
         self.dirty = true;
     }
 
-    /// Where the stack hangs: below the island's pill, centred on it.
+    /// Where the stack hangs: below the island's pill, centred on it; with
+    /// the island away, at the top of the monitor the user is on.
     fn place(&mut self) -> (i32, i32) {
         let a = crate::island::handle()
             .map(|h| h.anchor())
@@ -2475,9 +2643,12 @@ impl Cards {
             let top = a.top + ((crate::island::PILL_H + HANG) * s).round() as i32;
             (cx, top)
         } else {
+            if !self.body.visible() {
+                self.mon = ui::monitor_under_cursor();
+            }
             let m = self.mon.rect;
             let s = self.mon.scale;
-            let top = m.y + ((8.0 + crate::island::PILL_H + HANG) * s).round() as i32;
+            let top = m.y + (10.0 * s).round() as i32;
             (m.x + m.w / 2, top)
         }
     }
@@ -2495,17 +2666,20 @@ impl Cards {
             self.shadow_key.clear();
             self.hits.clear();
             self.placed = false;
+            self.glass = None;
+            self.own_glass = None;
             TARGETS.lock().unwrap().clear();
             INPUT.with(|i| {
                 let mut i = i.borrow_mut();
                 i.inputs.clear();
                 i.buttons.clear();
+                i.keyable.clear();
             });
             return;
         }
         let (cx, top) = self.spot;
         let s = self.mon.scale;
-        let drop = 14.0;
+        let drop = 10.0;
         let mut bottom: f32 = 0.0;
         for c in &self.cards {
             if c.appear.value > 0.002 {
@@ -2522,11 +2696,59 @@ impl Cards {
         let Some(mut pm) = Pixmap::new(pw, ph) else {
             return;
         };
+        let x0 = cx - pw as i32 / 2;
+
+        // ---- the material: the island's glass, or our own while it's away
+        let strength = crate::island::glass_strength();
+        let glass = crate::island::glass().or_else(|| {
+            if strength <= 0.0 {
+                return None;
+            }
+            let stale = self
+                .own_glass
+                .as_ref()
+                .is_none_or(|(_, t)| t.elapsed() >= Duration::from_secs(2));
+            if stale {
+                let pad = (30.0 * s) as i32;
+                let rect = crate::capture::Rect {
+                    x: x0 - pad,
+                    y: top - pad,
+                    w: pw as i32 + 2 * pad,
+                    h: (640.0 * s) as i32 + 2 * pad,
+                };
+                self.own_glass = crate::capture::grab_rect(rect)
+                    .ok()
+                    .and_then(|shot| crate::surface::Backdrop::new(&shot, strength))
+                    .map(|b| (b, Instant::now()));
+            }
+            self.own_glass
+                .as_ref()
+                .map(|(b, _)| (b.clone(), crate::surface::glass_opacity(strength)))
+        });
+        match &glass {
+            Some((b, op)) => {
+                let key = (Arc::as_ptr(b) as usize, x0, top, pw, op.to_bits());
+                let fresh = self
+                    .glass
+                    .as_ref()
+                    .is_some_and(|(k, t)| *k == key && t.height() >= ph);
+                if !fresh {
+                    let h = ph.max((640.0 * s) as u32);
+                    self.glass = glass_texture(b, *op, x0, top, pw, h).map(|t| (key, t));
+                }
+            }
+            None => self.glass = None,
+        }
+        let fill = match &self.glass {
+            Some((_, t)) => Fill::Glass(t),
+            None => Fill::Ink,
+        };
+
         let mut hits = Vec::new();
         let mut targets = Vec::new();
         let mut inputs = Vec::new();
         let mut buttons = Vec::new();
-        let x0 = cx - pw as i32 / 2;
+        let mut keyable = Vec::new();
         let mut rects = Vec::new();
         // Bottom cards first so a dropping card slides over the one below.
         for c in self.cards.iter().rev() {
@@ -2538,7 +2760,8 @@ impl Cards {
             let ease = 1.0 - (1.0 - a).powi(3);
             let y = c.y.value - (1.0 - ease) * drop;
             let h = c.h.value.max(1.0);
-            paint_card(&mut pm, d, 0.0, y, h, ease, s);
+            let prev = c.prev.as_ref().map(|p| (p, c.xfade.value));
+            paint_card(&mut pm, d, prev, 0.0, y, h, ease, s, &fill);
             rects.push((y, h, ease));
             if c.leaving || a < 0.5 {
                 continue;
@@ -2561,7 +2784,10 @@ impl Cards {
                     _ => buttons.push(r),
                 }
             }
-            // Alt-hold over a card speaks to its agent; a brain card has none.
+            if c.keyable() {
+                keyable.push((0, (y * s) as i32, pw as i32, (h * s) as i32));
+            }
+            // Alt-hold over a card speaks to its agent; the brain line has none.
             if c.brain.is_some() {
                 continue;
             }
@@ -2575,29 +2801,17 @@ impl Cards {
                 c.id.clone(),
             ));
         }
-        // Hits were pushed bottom card first; later (on top) wins in `rev()` lookup
-        // only within one card, so keep cards' hits grouped: card rect first.
         self.more_rect = None;
         if more {
-            if let Some(mp) = render_more(overflow, self.show_all, self.more_hover, s) {
-                pm.draw_pixmap(
-                    0,
-                    (more_y * s).round() as i32,
-                    mp.as_ref(),
-                    &PixmapPaint::default(),
-                    Transform::identity(),
-                    None,
-                );
-                self.more_rect = Some((CARD_W / 2.0 - 70.0, more_y, 140.0, MORE_H));
-                let r = (
-                    ((CARD_W / 2.0 - 70.0) * s) as i32,
-                    (more_y * s) as i32,
-                    (140.0 * s) as i32,
-                    (MORE_H * s) as i32,
-                );
-                buttons.push(r);
-                rects.push((more_y, MORE_H, 0.6));
-            }
+            let (mx, mw) = paint_more(&mut pm, overflow, self.show_all, self.more_hover, 0.0, more_y, s, &fill);
+            self.more_rect = Some((mx, more_y, mw, MORE_H));
+            buttons.push((
+                (mx * s) as i32,
+                (more_y * s) as i32,
+                (mw * s) as i32,
+                (MORE_H * s) as i32,
+            ));
+            rects.push((more_y, MORE_H, 0.6));
         }
         self.hits = hits;
         self.origin = (x0, top);
@@ -2606,6 +2820,7 @@ impl Cards {
             let mut i = i.borrow_mut();
             i.inputs = inputs;
             i.buttons = buttons;
+            i.keyable = keyable;
         });
         let first = !self.body.visible();
         self.body.present(&pm, x0, top, 1.0);
@@ -2621,7 +2836,7 @@ impl Cards {
             let below = (SHADOW_BELOW * s).ceil();
             if let Some(mut sp) = Pixmap::new(pw + 2 * side as u32, ph + st as u32 + below as u32) {
                 for (y, h, a) in &rects {
-                    let r = tokens::RADIUS_CARD.min(h / 2.0) * s;
+                    let r = RADIUS.min(h / 2.0) * s;
                     ui::soft_shadow(
                         &mut sp,
                         side,
@@ -2653,10 +2868,9 @@ impl Cards {
 
     /// None = animate at display rate; Some(t) = sleep until t (None = forever).
     fn pace(&self, now: Instant) -> Option<Option<Instant>> {
-        let moving = self
-            .cards
-            .iter()
-            .any(|c| !c.y.settled() || !c.h.settled() || !c.appear.settled());
+        let moving = self.cards.iter().any(|c| {
+            !c.y.settled() || !c.h.settled() || !c.appear.settled() || !c.xfade.settled()
+        });
         if moving {
             return None;
         }
@@ -2665,24 +2879,24 @@ impl Cards {
             .iter()
             .filter(|c| c.appear.target > 0.0 && !c.leaving)
             .collect();
-        if shown.iter().any(|c| c.kind() == Kind::Pending) {
+        if shown.iter().any(|c| c.kind() == Kind::Pending && c.brain.is_none()) {
             return None; // the countdown ring
         }
+        // Wake for the elapsed tick, hover lingering and timed cards leaving.
         let mut at: Vec<Instant> = Vec::new();
         for c in &shown {
-            if c.agent.status.is_active() {
-                // The elapsed readout ticks once a second.
+            if c.agent.status.is_active() && c.brain.is_none() {
                 let ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.subsec_millis())
                     .unwrap_or(0);
                 at.push(now + Duration::from_millis(1000 - ms as u64 + 5));
             }
-            if self.expanded(c, now) {
-                at.push(c.activity + IDLE_COLLAPSE);
-                if let Some(t) = c.hover_until {
-                    at.push(t);
-                }
+            if let Some(t) = c.hover_until {
+                at.push(t);
+            }
+            if let Some(t) = c.expires {
+                at.push(t);
             }
         }
         Some(at.into_iter().filter(|t| *t > now).min())
@@ -2714,6 +2928,7 @@ fn clipboard_text() -> Option<String> {
         out
     }
 }
+
 
 // ---------------------------------------------------------------- headless previews
 
@@ -2752,6 +2967,7 @@ mod tests {
             expanded: true,
             hover: None,
             focused: false,
+            keyed: false,
             draft: String::new(),
             now: now_unix(),
             pending_left: 3.4,
@@ -2763,51 +2979,109 @@ mod tests {
         }
     }
 
-    /// Composites shadows + cards over a backdrop, like the desktop would.
-    fn composite(cards: &[CardView], s: f32, light: bool) -> Pixmap {
+    fn approval_view() -> CardView {
+        let mut ap = view(agent(Status::Running));
+        ap.agent.name = "Tidy the Downloads folder".into();
+        ap.agent.plan = vec![
+            "List old installers and archives".into(),
+            "Delete what's older than a year".into(),
+            "Report what was freed".into(),
+        ];
+        ap.agent.steps = vec!["Listing old installers".into(), "Delete 212 old files".into()];
+        ap.agent.ask = Some(Question {
+            id: 7,
+            kind: AskKind::Approval,
+            text: "Delete 212 files older than a year from Downloads (3.4 GB)".into(),
+            detail: "desktop delete C:\\Users\\hecto\\Downloads\\*.msi --older-than 365d".into(),
+            questions: Vec::new(),
+        });
+        ap
+    }
+
+    fn fact() -> Fact {
+        Fact {
+            id: "f1".into(),
+            topic: "Relay pricing".into(),
+            text: "Pro is $10 a seat, was $12 until the March change".into(),
+            source: crate::brain::YOU.into(),
+            created: now_unix() * 1000,
+            updated: now_unix() * 1000,
+            ..Default::default()
+        }
+    }
+
+    fn brain_view(readers: &[&str]) -> CardView {
+        let mut b = view(agent(Status::Done));
+        b.expanded = false;
+        b.brain = Some(BrainView {
+            fact: fact(),
+            readers: readers.iter().map(|r| r.to_string()).collect(),
+            undone: false,
+        });
+        b
+    }
+
+    fn has(d: &Drawn, b: Btn) -> bool {
+        d.hits.iter().any(|h| h.4 == Hit::Btn(b))
+    }
+
+    /// Composites the island, shadows and cards over a backdrop, like the
+    /// desktop would, with the glass made from that backdrop.
+    fn composite(cards: &[CardView], more: usize, s: f32, light: bool) -> Pixmap {
         let drawn: Vec<Drawn> = cards.iter().map(|v| render_card(v, s).unwrap()).collect();
         let pad = 40.0;
-        let total: f32 = drawn.iter().map(|d| d.h + STACK_GAP).sum::<f32>() - STACK_GAP;
-        let (w, h) = (CARD_W + 2.0 * pad, total + 2.0 * pad + 16.0);
+        let island_h = crate::island::PILL_H;
+        let top = pad + island_h + HANG;
+        let mut total: f32 = drawn.iter().map(|d| d.h + STACK_GAP).sum::<f32>() - STACK_GAP;
+        if more > 0 {
+            total += STACK_GAP + MORE_H;
+        }
+        let (w, h) = (CARD_W + 2.0 * pad, top + total + pad + 16.0);
         let mut pm = Pixmap::new((w * s) as u32, (h * s) as u32).unwrap();
-        let (a, b) = if light {
-            (0xECEAE5, 0xD6DAE2)
+        let (a, b, c) = if light {
+            (0xECEAE5, 0xC9D3E3, 0xE9D9C4)
         } else {
-            (0x282C34, 0x16181C)
+            (0x2B3140, 0x14161B, 0x3A2A33)
         };
-        let (a, b) = (Rgba::rgb(a), Rgba::rgb(b));
-        for y in 0..pm.height() {
-            let k = y as f32 / pm.height() as f32;
-            let pw = pm.width() as f32;
-            ui::fill_rect(&mut pm, 0.0, y as f32, pw, 1.0, a.mix(b, k));
+        let (a, b, c) = (Rgba::rgb(a), Rgba::rgb(b), Rgba::rgb(c));
+        let (pw, ph) = (pm.width(), pm.height());
+        for (i, p) in pm.pixels_mut().iter_mut().enumerate() {
+            let (x, y) = (i as u32 % pw, i as u32 / pw);
+            let col = a.mix(b, y as f32 / ph as f32).mix(c, x as f32 / pw as f32 * 0.6);
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(col.r, col.g, col.b, 255).unwrap();
         }
-        let mut y = pad;
+        // The glass, as the island makes it from what's behind.
+        let mut tex = pm.clone();
+        let ink = [tokens::INK.r, tokens::INK.g, tokens::INK.b];
+        let op = crate::surface::glass_opacity(60.0);
+        for p in tex.pixels_mut() {
+            let c = [p.red() as f32 / 255.0, p.green() as f32 / 255.0, p.blue() as f32 / 255.0];
+            let [r, g, b] = crate::surface::glass_pixel(c, ink, op);
+            *p = tiny_skia::PremultipliedColorU8::from_rgba(r, g, b, 255).unwrap();
+        }
+        let fill = Fill::Glass(&tex);
+        // The island pill they hang from.
+        let iw = 176.0;
+        let ix = (w - iw) / 2.0;
+        let r = island_h / 2.0;
+        ui::shadow(&mut pm, ix * s, pad * s, iw * s, island_h * s, r * s, s);
+        if let Some(p) = ui::rounded_rect_path(ix * s, pad * s, iw * s, island_h * s, r * s) {
+            fill_surface(&mut pm, &p, &fill, 1.0);
+        }
+        ui::stroke_rounded(&mut pm, ix * s, pad * s, iw * s, island_h * s, r * s, s, tokens::LINE);
+        ui::fill_circle(&mut pm, (ix + 22.0) * s, (pad + r) * s, 5.0 * s, tokens::PAPER);
+        let mut y = top;
         for d in &drawn {
-            ui::shadow(
-                &mut pm,
-                pad * s,
-                y * s,
-                CARD_W * s,
-                d.h * s,
-                tokens::RADIUS_CARD * s,
-                s,
-            );
+            ui::shadow(&mut pm, pad * s, y * s, CARD_W * s, d.h * s, RADIUS.min(d.h / 2.0) * s, s);
             y += d.h + STACK_GAP;
         }
-        let mut y = pad;
+        let mut y = top;
         for d in &drawn {
-            // paint_card works in logical px from the pixmap origin.
-            let mut layer = Pixmap::new(pm.width(), pm.height()).unwrap();
-            paint_card(&mut layer, d, pad, y, d.h, 1.0, s);
-            pm.draw_pixmap(
-                0,
-                0,
-                layer.as_ref(),
-                &PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
+            paint_card(&mut pm, d, None, pad, y, d.h, 1.0, s, &fill);
             y += d.h + STACK_GAP;
+        }
+        if more > 0 {
+            paint_more(&mut pm, more, false, false, pad, y, s, &fill);
         }
         pm
     }
@@ -2822,20 +3096,79 @@ mod tests {
     }
 
     #[test]
-    fn cards_measure_and_hit() {
+    fn running_is_one_line_until_opened() {
         let v = view(agent(Status::Running));
         let d = render_card(&v, 1.0).unwrap();
         assert!(d.h > 150.0 && d.h < 400.0, "{}", d.h);
-        assert!(d.hits.iter().any(|h| h.4 == Hit::Btn(Btn::Stop)));
+        assert!(has(&d, Btn::Stop) && has(&d, Btn::Palette));
         assert!(d.hits.iter().any(|h| h.4 == Hit::Input));
         let mut slim = v.clone();
         slim.expanded = false;
-        assert_eq!(render_card(&slim, 1.0).unwrap().h, SLIM_H);
+        let d = render_card(&slim, 1.0).unwrap();
+        assert_eq!(d.h, ROW_H);
+        assert!(!has(&d, Btn::Stop), "calm by default: no buttons at rest");
         let lines = md_lines("**Cheapest**: KLM at €89\n\n- one\n- two", 300.0);
         assert!(lines.len() >= 4);
     }
 
-    fn previews() -> Vec<(&'static str, Vec<CardView>)> {
+    #[test]
+    fn approval_offers_allow_and_dont_allow() {
+        let v = approval_view();
+        let d = render_card(&v, 1.0).unwrap();
+        assert!(has(&d, Btn::Once) && has(&d, Btn::Deny) && has(&d, Btn::Always));
+        let mut drive = v.clone();
+        drive.drive = Drive::Asking;
+        let d = render_card(&drive, 1.0).unwrap();
+        assert!(has(&d, Btn::Once) && has(&d, Btn::Deny) && !has(&d, Btn::Always));
+    }
+
+    #[test]
+    fn finished_cards_are_one_line_with_one_action() {
+        let mut v = view(agent(Status::Done));
+        v.expanded = false;
+        let d = render_card(&v, 1.0).unwrap();
+        assert_eq!(d.h, ROW_H);
+        assert!(has(&d, Btn::Palette));
+        let mut f = view(agent(Status::Failed));
+        f.expanded = false;
+        let d = render_card(&f, 1.0).unwrap();
+        assert_eq!(d.h, ROW_H);
+        assert!(has(&d, Btn::Retry));
+    }
+
+    #[test]
+    fn brain_line_has_undo_then_see_all() {
+        let v = brain_view(&["Writer"]);
+        let d = render_card(&v, 1.0).unwrap();
+        assert_eq!(d.h, ROW_H);
+        assert!(has(&d, Btn::Undo));
+        let mut open = v.clone();
+        open.expanded = true;
+        let d = render_card(&open, 1.0).unwrap();
+        assert!(has(&d, Btn::Brain) && has(&d, Btn::Undo));
+        assert!(!d.hits.iter().any(|h| h.4 == Hit::Input));
+        let mut undone = v;
+        undone.brain.as_mut().unwrap().undone = true;
+        assert!(!has(&render_card(&undone, 1.0).unwrap(), Btn::Undo));
+    }
+
+    #[test]
+    fn hotkey_presence_shows_only_notices() {
+        let now = Instant::now();
+        let running = Card::new(agent(Status::Running), now);
+        assert!(!running.shows(Presence::Hotkey));
+        assert!(running.shows(Presence::AutoHide) && running.shows(Presence::Always));
+        let mut asking = Card::new(approval_view().agent, now);
+        assert!(asking.shows(Presence::Hotkey));
+        asking.agent.ask = None;
+        asking.opened = true;
+        assert!(asking.shows(Presence::Hotkey), "opened from the island");
+        let done = Card::new(agent(Status::Done), now);
+        assert!(done.shows(Presence::Hotkey));
+        assert!(done.expires.is_some(), "a finished card fades by itself");
+    }
+
+    fn previews() -> Vec<(&'static str, Vec<CardView>, usize)> {
         let mut out = Vec::new();
 
         let mut p = view(agent(Status::Pending));
@@ -2843,32 +3176,27 @@ mod tests {
         p.agent.steps.clear();
         p.agent.started = None;
         p.agent.name = "Tidy the Downloads folder".into();
-        out.push(("pending", vec![p.clone()]));
+        p.expanded = false;
+        out.push(("pending", vec![p.clone()], 0));
 
         let mut r = view(agent(Status::Running));
-        r.hover = Some(Hit::Btn(Btn::Stop));
-        out.push(("running", vec![r.clone()]));
+        r.expanded = false;
+        out.push(("running", vec![r.clone()], 0));
+        let mut rh = view(agent(Status::Running));
+        rh.hover = Some(Hit::Btn(Btn::Stop));
+        out.push(("running-hover", vec![rh.clone()], 0));
 
-        let mut ap = view(agent(Status::Running));
-        ap.agent.name = "Tidy the Downloads folder".into();
-        ap.agent.plan = vec![
-            "List old installers and archives".into(),
-            "Delete what's older than a year".into(),
-            "Report what was freed".into(),
-        ];
-        ap.agent.steps = vec![
-            "Listing old installers".into(),
-            "Delete 212 old files".into(),
-        ];
-        ap.agent.ask = Some(Question {
-            id: 7,
-            kind: AskKind::Approval,
-            text: "Delete 212 files older than a year from Downloads (3.4 GB)".into(),
-            detail: "desktop delete C:\\Users\\hecto\\Downloads\\*.msi --older-than 365d".into(),
-            questions: Vec::new(),
-        });
-        ap.hover = Some(Hit::Btn(Btn::Always));
-        out.push(("asking-approval", vec![ap.clone()]));
+        let mut drv = r.clone();
+        drv.drive = Drive::Driving;
+        drv.agent.name = "Fill in the expense form".into();
+        out.push(("running-driving", vec![drv.clone()], 0));
+
+        let ap = approval_view();
+        out.push(("asking-approval", vec![ap.clone()], 0));
+        let mut apk = ap.clone();
+        apk.keyed = true;
+        apk.hover = Some(Hit::Btn(Btn::Always));
+        out.push(("asking-approval-keyed", vec![apk], 0));
 
         let mut q = view(agent(Status::Running));
         q.agent.name = "Book a table for Friday".into();
@@ -2885,7 +3213,7 @@ mod tests {
         });
         q.focused = true;
         q.draft = "Four of us, 19:30 is perfect".into();
-        out.push(("questions", vec![q.clone()]));
+        out.push(("questions", vec![q.clone()], 0));
 
         let mut d = view(agent(Status::Done));
         d.agent.ended = Some(d.agent.started.unwrap() + 133);
@@ -2895,8 +3223,11 @@ mod tests {
             PathBuf::from(r"C:\agents\x\trip.ics"),
             PathBuf::from(r"C:\agents\x\screenshots-of-every-fare.zip"),
         ];
+        let mut dc = d.clone();
+        dc.expanded = false;
+        out.push(("done", vec![dc.clone()], 0));
         d.hover = Some(Hit::File(0));
-        out.push(("done-with-files", vec![d.clone()]));
+        out.push(("done-hover", vec![d.clone()], 0));
 
         let mut long = d.clone();
         long.agent.result = (1..=14)
@@ -2905,86 +3236,52 @@ mod tests {
             .join("\n");
         long.scroll = 40.0;
         long.hover = None;
-        out.push(("done-scrolling", vec![long]));
+        out.push(("done-scrolling", vec![long], 0));
 
         let mut f = view(agent(Status::Failed));
         f.agent.ended = Some(f.agent.started.unwrap() + 19);
         f.agent.error = Some("The Claude CLI exited: rate limited. Try again in a minute.".into());
         f.agent.files.clear();
-        f.hover = Some(Hit::Btn(Btn::Retry));
-        out.push(("failed", vec![f.clone()]));
+        let mut fc = f.clone();
+        fc.expanded = false;
+        fc.hover = Some(Hit::Btn(Btn::Retry));
+        out.push(("failed", vec![fc], 0));
+        out.push(("failed-hover", vec![f], 0));
 
-        let mut c1 = r.clone();
-        c1.expanded = false;
-        c1.hover = None;
-        let mut c2 = d.clone();
-        c2.expanded = false;
-        c2.agent.name = "Summarise the Q3 deck".into();
-        let mut c3 = ap.clone();
-        c3.expanded = false;
-        c3.hover = None;
-        out.push(("collapsed", vec![c3, c1, c2]));
+        out.push(("brain", vec![brain_view(&["Launch post", "Pricing page copy"])], 0));
+        let mut bh = brain_view(&["Launch post", "Pricing page copy", "Investor update email", "Weekly notes"]);
+        bh.expanded = true;
+        bh.hover = Some(Hit::Btn(Btn::Undo));
+        out.push(("brain-hover", vec![bh], 0));
+        let mut none = brain_view(&[]);
+        none.expanded = true;
+        out.push(("brain-no-agents", vec![none], 0));
 
-        let mut stack_r = r.clone();
-        stack_r.hover = None;
-        let mut slim_d = d.clone();
-        slim_d.expanded = false;
-        out.push(("stack", vec![ap.clone(), stack_r.clone(), slim_d]));
-
-        let fact = Fact {
-            id: "f1".into(),
-            topic: "Relay pricing".into(),
-            text: "Pro is $10 a seat (was $12)".into(),
-            source: crate::brain::YOU.into(),
-            created: now_unix() * 1000,
-            updated: now_unix() * 1000,
-            ..Default::default()
-        };
-        let mut b = view(agent(Status::Done));
-        b.brain = Some(BrainView {
-            fact: fact.clone(),
-            readers: vec!["Launch post".into(), "Pricing page copy".into(), "Investor update email".into()],
-        });
-        b.hover = Some(Hit::Btn(Btn::Brain));
-        let mut stack_r2 = stack_r.clone();
-        stack_r2.expanded = false;
-        out.push(("brain", vec![b.clone(), stack_r2]));
-        let mut none = b.clone();
-        none.brain = Some(BrainView { fact, readers: Vec::new() });
-        none.hover = None;
-        out.push(("brain-no-agents", vec![none]));
+        let mut r2 = r.clone();
+        r2.agent.name = "Summarise the Q3 deck".into();
+        r2.agent.steps = vec!["Reading slide 12 of 40".into()];
+        r2.agent.started = Some(now_unix() - 312);
+        let mut d2 = dc.clone();
+        d2.agent.name = "Rename the holiday photos".into();
+        out.push(("stack", vec![ap.clone(), r.clone(), d2.clone()], 2));
+        out.push(("stack-calm", vec![r.clone(), r2, dc], 0));
         out
     }
 
-    #[test]
-    fn brain_card_has_open_and_close() {
-        let mut v = view(agent(Status::Done));
-        v.brain = Some(BrainView {
-            fact: Fact { id: "f".into(), topic: "T".into(), text: "x".into(), source: "you".into(), ..Default::default() },
-            readers: vec!["Writer".into()],
-        });
-        let d = render_card(&v, 1.0).unwrap();
-        assert!(d.hits.iter().any(|h| h.4 == Hit::Btn(Btn::Brain)));
-        assert!(d.hits.iter().any(|h| h.4 == Hit::Btn(Btn::Dismiss)));
-        assert!(!d.hits.iter().any(|h| h.4 == Hit::Input));
-    }
-
     /// `SCREENBUDDY_CARDS_PNG=<dir> cargo test cards` writes previews of every
-    /// card state.
+    /// card state, over a light and a dark desktop.
     #[test]
     fn cards_render_previews() {
         let dir = std::env::var("SCREENBUDDY_CARDS_PNG").ok();
         let s = 2.0;
-        for (name, cards) in previews() {
-            let pm = composite(&cards, s, true);
-            let dark = composite(&cards, s, false);
+        for (name, cards, more) in previews() {
+            let light = composite(&cards, more, s, true);
+            let dark = composite(&cards, more, s, false);
             if let Some(dir) = &dir {
                 let _ = std::fs::create_dir_all(dir);
                 let p = std::path::Path::new(dir);
-                pm.save_png(p.join(format!("{name}.png"))).unwrap();
-                if matches!(name, "running" | "stack") {
-                    dark.save_png(p.join(format!("{name}-dark.png"))).unwrap();
-                }
+                light.save_png(p.join(format!("{name}.png"))).unwrap();
+                dark.save_png(p.join(format!("{name}-dark.png"))).unwrap();
             }
         }
     }

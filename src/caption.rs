@@ -132,12 +132,13 @@ impl Default for View {
     }
 }
 
-/// Geist Mono (embedded by `ui`); Medium stands in for bold.
+/// Geist (embedded by `ui`), the cards' and palette's body face; Medium
+/// stands in for bold.
 fn face(bold: bool) -> Option<&'static fontdue::Font> {
     Some(crate::ui::font(if bold {
-        crate::ui::Face::MonoMedium
+        crate::ui::Face::SansMedium
     } else {
-        crate::ui::Face::Mono
+        crate::ui::Face::Sans
     }))
 }
 
