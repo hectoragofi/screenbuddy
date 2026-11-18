@@ -26,7 +26,6 @@ use crate::ui::tokens::{self, Rgba};
 use crate::ui::{self, Face, Layer, MonitorInfo, Spring, TextStyle};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2289,9 +2288,9 @@ impl Cards {
                 let file = self.find(id).and_then(|c| c.agent.files.get(i).cloned());
                 if let Some(f) = file {
                     if right {
-                        reveal(&f);
+                        crate::win::reveal(&f);
                     } else {
-                        open_file(&f);
+                        crate::win::open_agent_file(&f);
                     }
                 }
                 true
@@ -2678,27 +2677,6 @@ impl Cards {
         }
         Some(at.into_iter().filter(|t| *t > now).min())
     }
-}
-
-fn open_file(p: &Path) {
-    let file = crate::util::wide(&p.to_string_lossy());
-    let verb = crate::util::wide("open");
-    unsafe {
-        windows::Win32::UI::Shell::ShellExecuteW(
-            None,
-            PCWSTR(verb.as_ptr()),
-            PCWSTR(file.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        );
-    }
-}
-
-fn reveal(p: &Path) {
-    let _ = std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", p.display()))
-        .spawn();
 }
 
 fn clipboard_text() -> Option<String> {

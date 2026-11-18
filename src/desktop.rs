@@ -154,7 +154,11 @@ pub fn needs_approval(args: &[String], intent: &str) -> bool {
     };
     let cmd = args[cmd_i].to_lowercase();
     if cmd == "open" {
-        return false; // navigation only; the user asked for it
+        // A web page or an app by name is navigation; a file, share or other
+        // URI scheme can run things, so the user decides.
+        // Same argument `exec` hands to ShellExecute.
+        let target = args.get(cmd_i + 1);
+        return target.is_some_and(|t| !web_url(t) && !bare_name(t));
     }
     if matches!(cmd.as_str(), "close-app" | "dismiss-all-notifications" | "clipboard-clear") {
         return true;
@@ -165,6 +169,10 @@ pub fn needs_approval(args: &[String], intent: &str) -> bool {
         .skip(cmd_i + 1)
         .filter(|(_, a)| !a.starts_with('-'))
         .collect();
+    // Launching an app by name is harmless; launching a path runs that file.
+    if cmd == "launch" && positional.iter().any(|(_, a)| a.contains(['/', '\\', ':'])) {
+        return true;
+    }
     // The typed text is content, not the action: typing "I'll send it" is fine.
     let payload = if matches!(cmd.as_str(), "type" | "set-value" | "clipboard-set") {
         positional.last().map(|p| p.0)
@@ -661,6 +669,25 @@ pub fn quick_open(question: &str) -> Option<QuickOpen> {
     None
 }
 
+/// An http(s) address, which opens in the browser.
+fn web_url(target: &str) -> bool {
+    let t = target.trim().to_ascii_lowercase();
+    t.starts_with("http://") || t.starts_with("https://")
+}
+
+/// An app or site asked for by name ("notepad", "spotify"): no path, drive,
+/// URI scheme or file extension.
+fn bare_name(target: &str) -> bool {
+    let t = target.trim();
+    !t.is_empty() && !t.contains(['/', '\\', ':', '.', '%'])
+}
+
+/// Why `open` won't take this target: programs and scripts never run this way.
+fn open_refusal(target: &str) -> Option<String> {
+    (!web_url(target) && crate::win::runnable(target.trim()))
+        .then(|| format!("open won't run programs or scripts ({})", target.trim()))
+}
+
 /// Opens a URL or app name with the user's default handler.
 pub fn open_target(target: &str) -> Result<(), String> {
     use windows::core::PCWSTR;
@@ -835,6 +862,9 @@ pub fn exec(exe: &std::path::Path, args: &[String], intent: &str, ctx: &Ctx) -> 
         let Some(target) = args.get(1) else {
             return json!({"ok": false, "error": {"message": "open needs a URL or app name"}}).to_string();
         };
+        if let Some(e) = open_refusal(target) {
+            return json!({"ok": false, "error": {"message": e}}).to_string();
+        }
         return match open_target(target) {
             Ok(()) => json!({"ok": true, "data": {"opened": target}}).to_string(),
             Err(e) => json!({"ok": false, "error": {"message": e}}).to_string(),
@@ -924,6 +954,32 @@ mod tests {
         // no intent of its own: unsure, so ask
         assert!(ask(&["click", "@s1:e2"], "click @s1:e2"));
         assert!(ask(&["press", "return"], ""));
+    }
+    #[test]
+    fn open_and_launch_policy() {
+        let ask = |a: &[&str], i: &str| needs_approval(&v(a), i);
+        // web pages and apps by name are navigation
+        assert!(!ask(&["open", "https://example.com/a?b=1"], "Open the docs"));
+        assert!(!ask(&["open", "HTTP://example.com"], ""));
+        assert!(!ask(&["open", "spotify"], "Open Spotify"));
+        assert!(!ask(&["launch", "Notepad"], ""));
+        assert!(!ask(&["launch", "--cdp", "9222", "Edge"], "Start Edge"));
+        // files, shares and other schemes can run things: ask
+        assert!(ask(&["open", r"C:\Users\me\report.docx"], "Open the report"));
+        assert!(ask(&["open", "report.docx"], "Open the report"));
+        assert!(ask(&["open", r"\\server\share\a.pdf"], "Open the file"));
+        assert!(ask(&["open", "file:///C:/x/a.pdf"], "Open the file"));
+        assert!(ask(&["open", "ms-settings:display"], "Open display settings"));
+        assert!(ask(&["open", "search-ms:query=x"], "Search"));
+        assert!(ask(&["launch", r"C:\tmp\payload.exe"], "Launch the tool"));
+        assert!(ask(&["launch", "./tool"], "Launch the tool"));
+        // programs and scripts are refused outright
+        for t in ["x.bat", "X.BAT", "x.bat.", "x.bat ", r"C:\a\b.HTA", "y.txt:z.exe", "file:///C:/x.cmd"] {
+            assert!(open_refusal(t).is_some(), "{t}");
+        }
+        for t in ["https://example.com/setup.exe", "spotify", "report.pdf", "ms-settings:display"] {
+            assert!(open_refusal(t).is_none(), "{t}");
+        }
     }
     #[test]
     fn cursor_overlay_gets_the_expected_image_name() {

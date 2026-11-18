@@ -377,13 +377,13 @@ impl View {
                         .corner_radius(tokens::RADIUS_CHIP);
                     let r = ui.add(chip).on_hover_text(f.display().to_string());
                     if r.clicked() {
-                        crate::win::shell_open(f);
+                        crate::win::open_agent_file(f);
                     }
                     if ui
                         .add(egui::Button::new(label("Reveal")).frame(false))
                         .clicked()
                     {
-                        reveal(f);
+                        crate::win::reveal(f);
                     }
                 }
             });
@@ -449,13 +449,6 @@ impl View {
 fn section(ui: &mut egui::Ui, name: &str) {
     ui.add_space(8.0);
     ui.label(label(name));
-}
-
-/// Opens Explorer with the file selected.
-fn reveal(path: &std::path::Path) {
-    let _ = std::process::Command::new("explorer.exe")
-        .arg(format!("/select,{}", path.display()))
-        .spawn();
 }
 
 #[cfg(test)]

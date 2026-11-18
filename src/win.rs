@@ -302,6 +302,43 @@ pub fn shell_open(path: &std::path::Path) {
     }
 }
 
+/// File types that run code when opened (programs, scripts, shortcuts,
+/// installers, registry merges).
+const RUNNABLE_EXTS: &[&str] = &[
+    "exe", "bat", "cmd", "com", "scr", "pif", "lnk", "js", "jse", "vbs", "vbe", "wsf", "wsh",
+    "hta", "ps1", "msi", "msp", "cpl", "jar", "reg", "url",
+];
+
+/// True when opening `target` would run code: its file name (or any NTFS
+/// stream name after a `:`) has a runnable extension. Windows drops trailing
+/// dots and spaces from names, so "x.bat." and "x.bat " count as x.bat.
+pub fn runnable(target: &str) -> bool {
+    let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+    name.split(':').any(|part| {
+        let part = part.trim_end_matches(['.', ' ']);
+        part.rsplit_once('.').is_some_and(|(_, ext)| {
+            RUNNABLE_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext))
+        })
+    })
+}
+
+/// Opens Explorer with the file selected.
+pub fn reveal(path: &std::path::Path) {
+    let _ = std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn();
+}
+
+/// Opens a file an agent produced. Programs and scripts are only shown in
+/// Explorer: one click on a chip must never run what an agent wrote.
+pub fn open_agent_file(path: &std::path::Path) {
+    if runnable(&path.to_string_lossy()) {
+        reveal(path);
+    } else {
+        shell_open(path);
+    }
+}
+
 pub fn message_box(text: &str) {
     let t = wide(text);
     let c = wide("screenbuddy");
@@ -351,5 +388,20 @@ mod tests {
         assert_eq!(parse_hotkey("Alt+F12").unwrap().1, VK_F12.0 as u32);
         assert!(parse_hotkey("Space").is_err());
         assert!(parse_hotkey("Ctrl+Nope").is_err());
+    }
+    #[test]
+    fn runnable_files() {
+        for t in [
+            "x.bat", "X.BAT", "x.bat.", "x.bat ", "x.bat. . ", r"C:\out\report.hta",
+            "//srv/share/a.LNK", "x.txt:evil.exe", "x.bat::$DATA", "C:x.ps1", "a.Url",
+        ] {
+            assert!(runnable(t), "{t}");
+        }
+        for t in [
+            "report.pdf", "notes.txt", r"C:\out\batch", "x.bat.txt", "notepad", "bat", ".bat2",
+            r"C:\dir.exe\file.md",
+        ] {
+            assert!(!runnable(t), "{t}");
+        }
     }
 }
