@@ -903,6 +903,13 @@ impl Palette {
                         x.agents.push(id);
                     }
                 }
+                Ev::Remembered(f) => {
+                    crate::cards::brain_saved(&f);
+                    crate::caption::send(crate::caption::Cmd::Notice {
+                        text: format!("Saved to the brain \u{00b7} {}", f.topic),
+                        id: crate::cards::brain_card_id(&f),
+                    });
+                }
                 Ev::Done(conv) => {
                     if self.exchanges.last().is_some_and(|x| x.error.is_none()) {
                         crate::island::buddy(crate::island::BuddyState::Done);

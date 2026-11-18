@@ -25,8 +25,20 @@ pub const DRAW_PROMPT: &str = "You can also point at things on their screen with
 
 pub const DRAW_DESC: &str = "Point at something on the user's screen. Use only when the user needs to locate a UI element and words alone would leave them searching; never for decoration or emphasis. Coordinates are screenshot pixels, origin top-left. Kinds: box (x,y,w,h outline around the target; the default choice), circle (x,y center, r), highlight (x,y,w,h translucent fill for a text span or region), arrow (x,y tail -> x2,y2 head on a small target), text (a label at x,y), diagram (a Mermaid diagram drawn on a dark card with its top-left at x,y; put the source in `mermaid`, optional w caps the card width; place it in empty space beside what it explains, not over it). One shape is usually right.";
 
-fn anthropic_tools(draw: bool, desktop: bool, agents: bool, walk: bool) -> Value {
+fn anthropic_tools(draw: bool, desktop: bool, agents: bool, walk: bool, brain: bool) -> Value {
     let mut tools = Vec::new();
+    if brain {
+        tools.push(json!({
+            "name": "remember",
+            "description": crate::brain::REMEMBER_DESC,
+            "input_schema": crate::brain::remember_schema()
+        }));
+        tools.push(json!({
+            "name": "recall",
+            "description": crate::brain::RECALL_DESC,
+            "input_schema": crate::brain::recall_schema()
+        }));
+    }
     if walk {
         tools.push(json!({
             "name": "start_walkthrough",
@@ -103,6 +115,8 @@ pub enum Ev {
     Done(Conversation),
     /// The brain handed work to a background agent (see `agents`).
     Spawned(crate::agents::AgentId),
+    /// The brain saved a fact the user stated (see `brain`).
+    Remembered(crate::brain::Fact),
 }
 
 /// Provider-specific conversation history, handed to the worker per turn
@@ -255,7 +269,34 @@ impl Out {
             ("desktop", Some(exe)) => self.desktop(&input, exe),
             ("spawn_agent", _) => self.spawn_agent(&input),
             ("start_walkthrough", _) => crate::walk::request(&input),
+            ("remember", _) => self.remember(&input),
+            ("recall", _) => (
+                crate::brain::recall_text(&crate::brain::recall(input["query"].as_str().unwrap_or(""))),
+                false,
+            ),
             _ => ("error: unknown tool".into(), true),
+        }
+    }
+
+    /// `remember` from the brain: saves the fact (from the user) and tells the UI.
+    fn remember(&self, input: &Value) -> (String, bool) {
+        match crate::brain::remember_input(input, crate::brain::YOU) {
+            Ok(f) => {
+                let n = crate::agents::list().iter().filter(|a| a.status.is_active()).count();
+                let text = format!(
+                    "Saved to the brain: {}: {}.{} Don't relay it to agents yourself. If saving was the whole point, confirm in a few words; otherwise just carry on.",
+                    f.topic,
+                    f.text,
+                    match n {
+                        0 => " Agents will read it when they start.".to_string(),
+                        1 => " The running agent picks it up on its own.".to_string(),
+                        n => format!(" The {n} running agents pick it up on their own."),
+                    }
+                );
+                self.send(Ev::Remembered(f));
+                (text, false)
+            }
+            Err(e) => (e, true),
         }
     }
 
@@ -412,6 +453,15 @@ fn system_prompt(cfg: &Config) -> String {
         p.push_str("\n\n");
         p.push_str(crate::walk::PROMPT);
     }
+    if crate::brain::enabled(cfg) && (cfg.provider != "openai" || cfg.openai.tools) {
+        p.push_str("\n\n");
+        p.push_str(crate::brain::ROUTER_PROMPT);
+        let block = crate::brain::prompt_block();
+        if !block.is_empty() {
+            p.push_str("\n\n");
+            p.push_str(&block);
+        }
+    }
     if !cfg.extra_instructions.trim().is_empty() {
         p.push_str("\n\n");
         p.push_str(cfg.extra_instructions.trim());
@@ -536,7 +586,7 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
             "messages": conv.anthropic,
             "stream": true,
             "output_config": {"effort": cfg.effort},
-            "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some(), crate::agents::router_enabled(&turn.cfg), crate::walk::router_enabled(&turn.cfg)), &turn.cfg),
+            "tools": crate::vision::anthropic_tools(anthropic_tools(turn.cfg.drawing.enabled, exe.is_some(), crate::agents::router_enabled(&turn.cfg), crate::walk::router_enabled(&turn.cfg), crate::brain::enabled(&turn.cfg)), &turn.cfg),
         });
         if turn.cfg.vision.web_search {
             if let Some(t) = body["tools"].as_array_mut() {
@@ -765,6 +815,10 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
             }
             if crate::walk::router_enabled(&turn.cfg) {
                 tools.push(json!({"type": "function", "function": {"name": "start_walkthrough", "description": crate::walk::DESC, "parameters": crate::walk::schema()}}));
+            }
+            if crate::brain::enabled(&turn.cfg) {
+                tools.push(json!({"type": "function", "function": {"name": "remember", "description": crate::brain::REMEMBER_DESC, "parameters": crate::brain::remember_schema()}}));
+                tools.push(json!({"type": "function", "function": {"name": "recall", "description": crate::brain::RECALL_DESC, "parameters": crate::brain::recall_schema()}}));
             }
             tools.extend(crate::vision::openai_tools(&turn.cfg));
             if !tools.is_empty() {
@@ -1135,6 +1189,9 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
     if crate::walk::router_enabled(full_cfg) {
         allowed_list.push("mcp__screenbuddy__start_walkthrough");
     }
+    if crate::brain::enabled(full_cfg) {
+        allowed_list.extend(["mcp__screenbuddy__remember", "mcp__screenbuddy__recall"]);
+    }
     allowed_list.extend(crate::vision::cli_allowed(full_cfg));
     let web = full_cfg.vision.web_search;
     if web {
@@ -1350,6 +1407,11 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
                             if b["name"].as_str().is_some_and(|n| n.ends_with("start_walkthrough")) =>
                         {
                             let _ = crate::walk::request(&b["input"]);
+                        }
+                        Some("tool_use")
+                            if b["name"].as_str().is_some_and(|n| n.ends_with("__remember")) =>
+                        {
+                            let _ = out.remember(&b["input"]);
                         }
                         // Partial streaming unavailable: fall back to the full message text.
                         Some("text") if !streamed_this_msg => {

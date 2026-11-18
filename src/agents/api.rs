@@ -38,8 +38,13 @@ fn tools(desktop: bool) -> Vec<(&'static str, &'static str, Value)> {
         v.push(("desktop", crate::desktop::DESC, crate::desktop::schema()));
     }
     v.push(("window_screenshot", super::desk::SHOT_DESC, super::desk::shot_schema()));
-    if super::drive::enabled(&crate::config::load().0) {
+    let cfg = crate::config::load().0;
+    if super::drive::enabled(&cfg) {
         v.push(("drive", super::drive::DESC, super::drive::schema()));
+    }
+    if crate::brain::enabled(&cfg) {
+        v.push(("recall", crate::brain::RECALL_DESC, crate::brain::recall_schema()));
+        v.push(("remember", crate::brain::AGENT_REMEMBER_DESC, crate::brain::remember_schema()));
     }
     v
 }
@@ -59,8 +64,18 @@ fn inside(cwd: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(cwd.join(p))
 }
 
-/// Runs one tool call; returns (text, is_error).
+/// Runs one tool call; returns (text, is_error). Brain facts someone else
+/// saved since the last call ride along as `[Brain update]` lines.
 fn call(name: &str, input: &Value, job: &TurnJob, sink: &Sink) -> (String, bool) {
+    let (mut text, is_error) = match sink.brain_call(name, input) {
+        Some(r) => r,
+        None => run_tool(name, input, job, sink),
+    };
+    text.push_str(&sink.brain_updates());
+    (text, is_error)
+}
+
+fn run_tool(name: &str, input: &Value, job: &TurnJob, sink: &Sink) -> (String, bool) {
     match name {
         "report_plan" => {
             sink.plan(
@@ -326,8 +341,11 @@ fn openai(job: &TurnJob, sink: &Sink) -> Result<String, String> {
         .map(|(n, d, s)| json!({"type": "function", "function": {"name": n, "description": d, "parameters": s}}))
         .collect();
     let mut msgs = load_history(&job.cwd, job.first);
-    if msgs.is_empty() {
-        msgs.push(json!({"role": "system", "content": super::agent_prompt(&job.cfg, desktop)}));
+    // Fresh each turn, so a follow-up sees the brain as it is now.
+    let system = json!({"role": "system", "content": super::agent_prompt(&job.cfg, desktop)});
+    match msgs.first_mut() {
+        Some(m) if m["role"] == "system" => *m = system,
+        _ => msgs.insert(0, system),
     }
     let mut content = vec![json!({"type": "text", "text": job.prompt})];
     if let Some(img) = &job.image {

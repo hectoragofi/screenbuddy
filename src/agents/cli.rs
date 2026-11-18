@@ -164,6 +164,9 @@ pub(crate) fn run(job: &TurnJob, sink: &Sink) -> Result<String, String> {
     if super::drive::enabled(cfg) {
         allowed.push("mcp__screenbuddy__drive");
     }
+    if crate::brain::enabled(cfg) {
+        allowed.extend(["mcp__screenbuddy__recall", "mcp__screenbuddy__remember"]);
+    }
     let allowed = allowed.join(" ");
     let system = super::agent_prompt(cfg, desktop);
     let model = if cfg.agents.model.trim().is_empty() {
@@ -319,7 +322,9 @@ fn died(proc: &mut Child, err: &std::sync::Mutex<String>) -> String {
 /// `{"kind":"ask","questions":[..]}` -> `{"answer": "..."}`;
 /// `{"kind":"desk","args","out","t0"}` -> "ok" (a desktop action ran);
 /// `{"kind":"desk_windows"}` -> `{"windows":[{hwnd,title}]}`;
-/// `{"kind":"drive","input"}` -> `{"text","is_error"}`.
+/// `{"kind":"drive","input"}` -> `{"text","is_error"}`;
+/// `{"kind":"brain","name","input"}` -> `{"text","is_error"}` (recall / remember);
+/// `{"kind":"brain_updates"}` -> `{"text"}` (facts saved since it last looked).
 fn serve(listener: std::net::TcpListener, sink: Sink, done: Arc<AtomicBool>) {
     let _ = listener.set_nonblocking(true);
     std::thread::spawn(move || {
@@ -340,6 +345,13 @@ fn serve(listener: std::net::TcpListener, sink: Sink, done: Arc<AtomicBool>) {
                         } else if req["kind"] == "desk_windows" {
                             let w: Vec<Value> = sink.desk_windows().into_iter().map(|(h, t)| json!({"hwnd": h, "title": t})).collect();
                             json!({"windows": w}).to_string()
+                        } else if req["kind"] == "brain" {
+                            let (text, is_error) = sink
+                                .brain_call(req["name"].as_str().unwrap_or(""), &req["input"])
+                                .unwrap_or(("error: the brain is off".into(), true));
+                            json!({"text": text, "is_error": is_error}).to_string()
+                        } else if req["kind"] == "brain_updates" {
+                            json!({"text": sink.brain_updates()}).to_string()
                         } else if req["kind"] == "drive" {
                             let (text, is_error) = super::drive::call(&sink, &req["input"]);
                             json!({"text": text, "is_error": is_error}).to_string()

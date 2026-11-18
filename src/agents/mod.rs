@@ -494,6 +494,8 @@ impl Runtime {
                 ctl: ctl.clone(),
                 always: cfg.agents.always_approve,
                 waiting: Arc::default(),
+                brain_seen: Arc::new(AtomicU64::new(crate::brain::now_ms())),
+                brain: crate::brain::enabled(&cfg),
             };
             let res = if ctl.stop.load(Ordering::SeqCst) {
                 Err("stopped".into())
@@ -665,6 +667,9 @@ pub(crate) struct Sink {
     always: bool,
     /// Asks in progress; the stall watchdog ignores silence while > 0.
     waiting: Arc<AtomicU64>,
+    /// Brain facts saved after this (unix ms) are news to this turn.
+    brain_seen: Arc<AtomicU64>,
+    brain: bool,
 }
 
 impl Sink {
@@ -775,6 +780,54 @@ impl Sink {
         self.rt.get(&self.id).map(|a| desk::windows_of(&a)).unwrap_or_default()
     }
 
+    /// `recall` / `remember` from the agent; None = not a brain tool.
+    pub fn brain_call(&self, name: &str, input: &Value) -> Option<(String, bool)> {
+        if !self.brain {
+            return None;
+        }
+        match name {
+            "recall" => {
+                let hits = crate::brain::recall(input["query"].as_str().unwrap_or(""));
+                if let Some(first) = hits.first() {
+                    let more = if hits.len() > 1 { format!(" (+{})", hits.len() - 1) } else { String::new() };
+                    self.step(&format!("Checked the brain: {}{more}", first.text));
+                }
+                Some((crate::brain::recall_text(&hits), false))
+            }
+            "remember" => {
+                let me = self.rt.get(&self.id).map(|a| a.name).unwrap_or_else(|| "an agent".into());
+                Some(match crate::brain::remember_input(input, &me) {
+                    Ok(f) => {
+                        self.step(&format!("Saved to the brain: {}", f.text));
+                        (format!("Saved to the brain: {}: {}", f.topic, f.text), false)
+                    }
+                    Err(e) => (e, true),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Facts someone else saved since this turn last looked, as
+    /// `[Brain update]` lines for the next tool result ("" = none).
+    pub fn brain_updates(&self) -> String {
+        if !self.brain {
+            return String::new();
+        }
+        let seen = self.brain_seen.load(Ordering::SeqCst);
+        let news = crate::brain::since(seen);
+        let Some(last) = news.iter().map(|f| f.updated).max() else {
+            return String::new();
+        };
+        self.brain_seen.fetch_max(last, Ordering::SeqCst);
+        let me = self.rt.get(&self.id).map(|a| a.name).unwrap_or_default();
+        let news: Vec<_> = news.into_iter().filter(|f| f.source != me).collect();
+        if let Some(f) = news.last() {
+            self.step(&format!("From the brain: {}", f.text));
+        }
+        crate::brain::update_lines(&news)
+    }
+
     /// `ask_user`: returns the text handed back to the model.
     pub fn questions(&self, qs: Vec<String>) -> String {
         let qs: Vec<String> = qs
@@ -812,6 +865,10 @@ pub(crate) fn agent_prompt(cfg: &Config, desktop: bool) -> String {
     }
     if drive::enabled(cfg) {
         p.push_str("\n\nNever move the user's real mouse or type on their keyboard unless they explicitly asked to watch you do it ('show me', 'do it while I watch'); then use the `drive` tool, which asks them first and pauses you if they touch anything. Call it with action `stop` when you're done driving.");
+    }
+    if crate::brain::enabled(cfg) {
+        p.push_str("\n\n");
+        p.push_str(&crate::brain::agent_section());
     }
     if !cfg.extra_instructions.trim().is_empty() {
         p.push_str("\n\n");
@@ -901,8 +958,13 @@ pub fn mcp_tools(desktop: bool) -> Vec<Value> {
         );
     }
     v.push(json!({"name": "window_screenshot", "description": desk::SHOT_DESC, "inputSchema": desk::shot_schema()}));
-    if drive::enabled(&crate::config::load().0) {
+    let cfg = crate::config::load().0;
+    if drive::enabled(&cfg) {
         v.push(json!({"name": "drive", "description": drive::DESC, "inputSchema": drive::schema()}));
+    }
+    if crate::brain::enabled(&cfg) {
+        v.push(json!({"name": "recall", "description": crate::brain::RECALL_DESC, "inputSchema": crate::brain::recall_schema()}));
+        v.push(json!({"name": "remember", "description": crate::brain::AGENT_REMEMBER_DESC, "inputSchema": crate::brain::remember_schema()}));
     }
     v
 }
@@ -942,8 +1004,40 @@ pub fn mcp_call(name: &str, args: &Value) -> Option<(String, bool)> {
             None => ("error: screenbuddy is not reachable".into(), true),
         }),
         "spawn_agent" if !is_agent_mcp() => Some(("ok".into(), false)),
+        // The parent runs these (it knows the agent and shows the step).
+        "recall" | "remember" if is_agent_mcp() => Some(
+            match cli::ask_parent_line(&json!({"kind": "brain", "name": name, "input": args})) {
+                Some(line) => {
+                    let v: Value = serde_json::from_str(&line).unwrap_or_default();
+                    (
+                        v["text"].as_str().unwrap_or("error: no reply").to_string(),
+                        v["is_error"].as_bool().unwrap_or(true),
+                    )
+                }
+                None => ("error: screenbuddy is not reachable".into(), true),
+            },
+        ),
+        // The palette's CLI: the parent reads the call from the stream and saves it.
+        "remember" => Some(("Saved to the brain. Agents will pick it up on their own.".into(), false)),
+        // Read-only: the palette's CLI looks it up right here.
+        "recall" => Some((
+            crate::brain::recall_text(&crate::brain::recall(args["query"].as_str().unwrap_or(""))),
+            false,
+        )),
         _ => None,
     }
+}
+
+/// Inside `screenbuddy --mcp` for an agent: brain facts saved since this
+/// turn last looked, to append to a tool result ("" = none).
+pub fn mcp_brain_updates() -> String {
+    if !is_agent_mcp() {
+        return String::new();
+    }
+    cli::ask_parent_line(&json!({"kind": "brain_updates"}))
+        .and_then(|l| serde_json::from_str::<Value>(&l).ok())
+        .and_then(|v| v["text"].as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 /// `spawn_agent` as an MCP tool for the palette's Claude CLI (the parent reads

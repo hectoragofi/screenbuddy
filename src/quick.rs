@@ -398,6 +398,19 @@ impl Quick {
                     t.answer.push_str(&note);
                     caption::send(Cmd::Append(note));
                 }
+                Ok(llm::Ev::Remembered(f)) => {
+                    // Said aloud, saved for everyone: note it on the caption
+                    // and show who reads it on the cards.
+                    let sep = if t.answer.trim().is_empty() { "" } else { "\n\n" };
+                    let note = format!("{sep}Saved to the brain \u{00b7} {}", f.topic);
+                    if !t.streaming {
+                        t.streaming = true;
+                        status(Status::Streaming);
+                    }
+                    t.answer.push_str(&note);
+                    caption::send(Cmd::Append(note));
+                    crate::cards::brain_saved(&f);
+                }
                 Ok(llm::Ev::Draw(input, reply)) => {
                     let color = config::hex_rgb(&self.cfg.drawing.color).unwrap_or([10, 132, 255]);
                     let r = overlay::parse_draw(&input, &t.cap, color).map(|call| {

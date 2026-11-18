@@ -65,6 +65,10 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
             if crate::agents::router_enabled(&crate::config::load().0) {
                 tools.push(crate::agents::mcp_spawn_tool());
             }
+            if crate::brain::enabled(&crate::config::load().0) {
+                tools.push(json!({"name": "remember", "description": crate::brain::REMEMBER_DESC, "inputSchema": crate::brain::remember_schema()}));
+                tools.push(json!({"name": "recall", "description": crate::brain::RECALL_DESC, "inputSchema": crate::brain::recall_schema()}));
+            }
             if crate::walk::router_enabled(&crate::config::load().0) {
                 tools.push(json!({"name": "start_walkthrough", "description": crate::walk::DESC, "inputSchema": crate::walk::schema()}));
             }
@@ -87,6 +91,8 @@ fn handle(req: &Value) -> Result<Value, (i64, String)> {
                 Some(n) if crate::vision::is_tool(n) => return Ok(crate::vision::mcp_call(n, &p["arguments"])),
                 _ => return Err((-32602, format!("unknown tool {}", p["name"]))),
             };
+            // A running agent learns facts saved after its turn began.
+            let text = text + &crate::agents::mcp_brain_updates();
             Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
         }
         m => Err((-32601, format!("method not found: {m}"))),
