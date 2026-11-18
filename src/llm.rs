@@ -151,6 +151,44 @@ pub struct Turn {
     /// Extra images attached by the user (e.g. an image file from Explorer).
     pub attachments: Vec<Image>,
     pub cancel: Arc<AtomicBool>,
+    /// The ongoing thread's window. Some: the provider history is rebuilt
+    /// from it (text only, the last few turns) instead of growing.
+    pub thread: Option<crate::thread::Context>,
+}
+
+/// The thread window as plain user / assistant messages (no images, no tool
+/// rounds): the same shape for Anthropic and OpenAI-compatible APIs.
+fn window_messages(t: &crate::thread::Context) -> Vec<Value> {
+    t.turns
+        .iter()
+        .flat_map(|(q, a)| {
+            [
+                json!({"role": "user", "content": q}),
+                json!({"role": "assistant", "content": a}),
+            ]
+        })
+        .collect()
+}
+
+/// The thread window as text, to seed a fresh Claude CLI session.
+fn window_preamble(t: &crate::thread::Context) -> String {
+    if t.turns.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("[The conversation so far, most recent turns:]
+
+");
+    for (q, a) in &t.turns {
+        s.push_str(&format!("User: {q}
+
+Assistant: {a}
+
+"));
+    }
+    s.push_str("[Now the user says:]
+
+");
+    s
 }
 
 /// Sender that wakes the UI after each event.
@@ -470,6 +508,16 @@ fn system_prompt(cfg: &Config) -> String {
 }
 
 fn question_text(turn: &Turn) -> String {
+    let q = question_body(turn);
+    match turn.thread.as_ref().map(|t| t.earlier.as_str()) {
+        Some(e) if !e.is_empty() => format!("[{e}]
+
+{q}"),
+        _ => q,
+    }
+}
+
+fn question_body(turn: &Turn) -> String {
     match &turn.image {
         Some(img) => format!(
             "[Screenshot attached: {}x{} px]{}\n\n{}",
@@ -571,6 +619,9 @@ fn anthropic(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<
         content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(&img.jpeg)}}));
     }
     content.push(json!({"type": "text", "text": question_text(turn)}));
+    if let Some(t) = &turn.thread {
+        conv.anthropic = window_messages(t);
+    }
     conv.anthropic
         .push(json!({"role": "user", "content": content}));
 
@@ -777,7 +828,11 @@ fn openai(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()>
     } else {
         cfg.api_key.trim().to_string()
     };
-    if conv.openai.is_empty() {
+    if let Some(t) = &turn.thread {
+        conv.openai = window_messages(t);
+        conv.openai
+            .insert(0, json!({"role": "system", "content": system_prompt(&turn.cfg)}));
+    } else if conv.openai.is_empty() {
         conv.openai
             .push(json!({"role": "system", "content": system_prompt(&turn.cfg)}));
     }
@@ -1290,6 +1345,11 @@ fn spawn_cli(cfg: &Config, resume: Option<&str>) -> anyhow::Result<CliProc> {
 }
 
 fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result<()> {
+    // The thread rotated: drop the session (and a process resumed into it).
+    let fresh = turn.thread.as_ref().is_some_and(|t| t.cli_fresh);
+    if fresh && conv.cli_session.take().is_some() {
+        *conv.cli.lock().unwrap() = None;
+    }
     // Use the warm process if there is one; otherwise start (or resume) now.
     let mut proc = {
         let mut guard = conv.cli.lock().unwrap();
@@ -1301,7 +1361,13 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
                     spawn_cli(&turn.cfg, conv.cli_session.as_deref())?
                 }
             }
-            None => spawn_cli(&turn.cfg, conv.cli_session.as_deref())?,
+            None => match conv.cli_session.as_deref() {
+                None => match take_spare(&turn.cfg) {
+                    Some(p) => p,
+                    None => spawn_cli(&turn.cfg, None)?,
+                },
+                resume => spawn_cli(&turn.cfg, resume)?,
+            },
         }
     };
     *proc.approver.lock().unwrap() = Some(out.clone());
@@ -1314,6 +1380,9 @@ fn claude_cli(turn: &Turn, conv: &mut Conversation, out: &Out) -> anyhow::Result
         content.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64(&img.jpeg)}}));
     }
     let mut text = question_text(turn);
+    if let Some(t) = turn.thread.as_ref().filter(|t| t.cli_fresh) {
+        text = window_preamble(t) + &text;
+    }
     if let Some(note) = conv.pending_note.take() {
         text.push_str(&format!("\n\n[Earlier in this conversation: {note}]"));
     }
@@ -1589,6 +1658,33 @@ mod tests {
     }
 
     #[test]
+    fn thread_window_is_text_only() {
+        // Older turns had screenshots; what goes out is their text alone.
+        let mut th = crate::thread::Thread::default();
+        for i in 0..30 {
+            th.push(&format!("q{i}"), &format!("a{i}"), None);
+        }
+        let ctx = th.context(6, "anthropic", true);
+        let msgs = window_messages(&ctx);
+        assert_eq!(msgs.len(), 12);
+        assert!(msgs.iter().all(|m| m["content"].is_string()), "no image blocks");
+        assert_eq!(msgs[0]["content"], "q24");
+        let turn = Turn {
+            cfg: Config::default(),
+            conv: Default::default(),
+            question: "now".into(),
+            image: None,
+            attachments: Vec::new(),
+            cancel: Default::default(),
+            thread: Some(ctx.clone()),
+        };
+        assert!(question_text(&turn).starts_with("[Earlier in this chat"));
+        let pre = window_preamble(&ctx);
+        assert!(pre.contains("User: q29") && !pre.contains("q23
+"));
+    }
+
+    #[test]
     fn cli_that_dies_is_an_error_not_a_hang() {
         // The test binary itself rejects claude's flags and exits at once,
         // like a CLI that crashes before answering.
@@ -1605,6 +1701,7 @@ mod tests {
             image: None,
             attachments: Vec::new(),
             cancel: Default::default(),
+            thread: None,
         };
         let mut conv = Conversation::default();
         let t = Instant::now();
@@ -1631,6 +1728,7 @@ mod tests {
             }),
             attachments: Vec::new(),
             cancel: Default::default(),
+            thread: None,
         };
         let mut conv = turn.conv.clone();
         conv.anthropic.push(json!({"role": "user", "content": "q"}));

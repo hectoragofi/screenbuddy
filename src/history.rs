@@ -30,21 +30,6 @@ pub struct Chat {
     pub exchanges: Vec<SavedExchange>,
 }
 
-impl Chat {
-    /// Text handed to the model when a past chat is continued, so every
-    /// provider gets the earlier turns without provider-specific state.
-    pub fn preamble(&self) -> String {
-        let mut s = String::from(
-            "This continues an earlier conversation with the user. Earlier turns (the screenshot from back then is not available; a current one is attached):\n\n",
-        );
-        for x in &self.exchanges {
-            s.push_str(&format!("User: {}\n\nAssistant: {}\n\n", x.question.trim(), x.answer.trim()));
-        }
-        s.push_str("Now the user asks:\n\n");
-        s
-    }
-}
-
 /// Writes `chat.json` and `chat.md` into `dir`.
 pub fn write(dir: &Path, chat: &Chat) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
@@ -366,12 +351,6 @@ mod tests {
         assert!(e.matches(&terms("")));
         assert!(e.snippet(&terms("pointer")).unwrap().contains("pointer"));
         assert_eq!(e.title, "What is this error?");
-    }
-
-    #[test]
-    fn preamble_has_turns() {
-        let p = sample().preamble();
-        assert!(p.contains("User: Fix it") && p.contains("Assistant: Check for None."));
     }
 
     #[test]

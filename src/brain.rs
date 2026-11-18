@@ -314,8 +314,18 @@ pub fn edit(id: &str, text: &str) -> Result<Fact, String> {
 pub fn since(ms: u64) -> Vec<Fact> {
     global().since(ms)
 }
+/// Brain facts, then turns of the thread that fell out of its window, sharing
+/// the 8-result cap (an empty query lists facts only).
 pub fn recall(query: &str) -> Vec<Fact> {
-    global().recall(query)
+    let mut v = global().recall(query);
+    let room = RECALL_MAX.saturating_sub(v.len());
+    v.extend(crate::thread::recall(query, room).into_iter().map(|text| Fact {
+        topic: "Earlier in this chat".into(),
+        text,
+        source: "this chat".into(),
+        ..Default::default()
+    }));
+    v
 }
 pub fn prompt_block() -> String {
     global().prompt_block()

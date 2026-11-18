@@ -29,6 +29,7 @@ pub enum AppEvent {
     /// Alt tapped twice: open the palette.
     AltDoubleTap,
     /// Continue a saved conversation (a quick-ask caption was clicked).
+    #[allow(dead_code)] // quick asks now land on the thread; kept for History links
     OpenChat(std::path::PathBuf),
     /// An agent card's "Open in palette": its full chat in the palette.
     AgentPalette(String),

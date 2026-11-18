@@ -1160,6 +1160,7 @@ fn ask_model(
             }),
             attachments: Vec::new(),
             cancel: cancel.clone(),
+            thread: None,
         },
         llm::Out::new(tx, egui::Context::default()),
     );

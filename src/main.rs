@@ -24,6 +24,7 @@ mod palette;
 mod quick;
 mod settings;
 mod surface;
+mod thread;
 mod tray;
 mod ui;
 mod uia;
@@ -345,6 +346,7 @@ fn headless(q: &str) -> i32 {
         }),
         attachments: Vec::new(),
         cancel: Default::default(),
+        thread: None,
     };
     llm::spawn(turn, llm::Out::new(tx, egui::Context::default()));
     let mut code = 0;
