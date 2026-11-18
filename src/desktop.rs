@@ -68,15 +68,66 @@ pub fn outdated(v: &str) -> bool {
     parse(v) < parse(MIN_VERSION)
 }
 
+/// Flags of agent-desktop commands that take a value.
+const VALUED: &[&str] = &[
+    "--timeout",
+    "--timeout-ms",
+    "--arg",
+    "--env",
+    "--cwd",
+    "--session",
+    "--agent-id",
+    "--trace",
+    "--screenshot",
+    "-w",
+    "--wait-for",
+    "--wait-for-gone",
+    "--wait-timeout",
+    "--app",
+    "--window",
+    "--window-id",
+    "--max-depth",
+    "--surface",
+    "--root",
+];
+
+/// Indices of the positional arguments, flags and their values skipped; the
+/// first one is the command. The one parser for every policy over `args`.
+fn positionals(args: &[String]) -> Vec<usize> {
+    let mut pos = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') {
+            let takes = VALUED.contains(&a.as_str())
+                || (a == "--cdp" && args.get(i + 1).is_some_and(|n| n.parse::<u16>().is_ok()));
+            i += if takes && !a.contains('=') { 2 } else { 1 };
+            continue;
+        }
+        pos.push(i);
+        i += 1;
+    }
+    pos
+}
+
+/// The command (lowercase) and its first positional argument.
+pub(crate) fn command(args: &[String]) -> (String, Option<String>) {
+    let pos = positionals(args);
+    (
+        pos.first().map(|&i| args[i].to_lowercase()).unwrap_or_default(),
+        pos.get(1).map(|&i| args[i].clone()),
+    )
+}
+
 pub fn is_read_only(args: &[String]) -> bool {
-    let Some(cmd) = args.iter().find(|a| !a.starts_with('-')) else {
+    let Some(&cmd) = positionals(args).first() else {
         return true;
     };
     // `--help` on anything is harmless.
     if args.iter().any(|a| a == "--help" || a == "-h") {
         return true;
     }
-    READ_ONLY.contains(&cmd.as_str()) && !args.iter().any(|a| a == "--headed")
+    READ_ONLY.contains(&args[cmd].as_str()) && !args.iter().any(|a| a == "--headed")
 }
 
 /// Words that mark an action as destructive, outbound or about money.
@@ -145,30 +196,54 @@ fn risky_text(s: &str) -> bool {
 /// command line, keys like Enter / Delete / Alt+F4, and typed text that ends in
 /// a newline. When the model gave no intent of its own, anything beyond plainly
 /// harmless commands (focus, scroll, launch...) asks too: when unsure, ask.
+///
+/// A click-like action on a ref is also judged by the element's own name from
+/// the snapshot that produced the ref, so a Send button described as
+/// "Continue" still asks; a ref from no snapshot seen here asks too.
 pub fn needs_approval(args: &[String], intent: &str) -> bool {
+    risk(args, intent, true)
+}
+
+/// The same judgement for a step whose kind the user already allowed (drive
+/// mode's real mouse and keyboard): risky words, keys, typed text that ends in
+/// a newline, or a risky target element still ask; a missing intent alone
+/// does not.
+pub fn risky_step(args: &[String], intent: &str, element: Option<&str>) -> bool {
+    element.is_some_and(risky_text) || risk(args, intent, false)
+}
+
+/// Commands that press, pick or flip the element their ref names.
+const ACTIVATE: &[&str] = &[
+    "click", "double-click", "triple-click", "select", "toggle", "check", "uncheck",
+];
+
+fn risk(args: &[String], intent: &str, strict: bool) -> bool {
     if is_read_only(args) {
         return false;
     }
-    let Some(cmd_i) = args.iter().position(|a| !a.starts_with('-')) else {
+    let pos = positionals(args);
+    let Some(&cmd_i) = pos.first() else {
         return false;
     };
     let cmd = args[cmd_i].to_lowercase();
     if cmd == "open" {
-        // A web page or an app by name is navigation; a file, share or other
-        // URI scheme can run things, so the user decides.
+        // A web page or an installed app by name is navigation; a file, share,
+        // other URI scheme or a name that resolves to a file an agent could
+        // have written can run things, so the user decides.
         // Same argument `exec` hands to ShellExecute.
-        let target = args.get(cmd_i + 1);
-        return target.is_some_and(|t| !web_url(t) && !bare_name(t));
+        let Some(t) = pos.get(1).map(|&i| args[i].as_str()) else {
+            return false;
+        };
+        if web_target(t).is_some() {
+            return false;
+        }
+        return !bare_name(t)
+            || !matches!(crate::win::bare_launch(t.trim()), crate::win::Launch::Installed(_));
     }
     if matches!(cmd.as_str(), "close-app" | "dismiss-all-notifications" | "clipboard-clear") {
         return true;
     }
-    let positional: Vec<(usize, &String)> = args
-        .iter()
-        .enumerate()
-        .skip(cmd_i + 1)
-        .filter(|(_, a)| !a.starts_with('-'))
-        .collect();
+    let positional: Vec<(usize, &String)> = pos[1..].iter().map(|&i| (i, &args[i])).collect();
     // Launching an app by name is harmless; launching a path runs that file.
     if cmd == "launch" && positional.iter().any(|(_, a)| a.contains(['/', '\\', ':'])) {
         return true;
@@ -185,6 +260,15 @@ pub fn needs_approval(args: &[String], intent: &str) -> bool {
     {
         return true; // a trailing newline usually sends
     }
+    // The element itself, not the model's words about it.
+    if ACTIVATE.contains(&cmd.as_str()) {
+        for (_, r) in positional.iter().filter(|(_, a)| a.starts_with('@')) {
+            match ref_name(r) {
+                Some(name) if !risky_text(&name) => {}
+                _ => return true, // risky, or a ref from no snapshot seen here
+            }
+        }
+    }
     let described = args
         .iter()
         .enumerate()
@@ -197,10 +281,7 @@ pub fn needs_approval(args: &[String], intent: &str) -> bool {
     }
     let no_intent = intent.trim().is_empty() || intent.trim() == args.join(" ");
     if matches!(cmd.as_str(), "press" | "key-down") {
-        let key = positional
-            .first()
-            .map(|p| p.1.to_lowercase().replace(' ', ""))
-            .unwrap_or_default();
+        let key = positional.first().map(|p| canon_key(p.1)).unwrap_or_default();
         if RISKY_KEYS.contains(&key.as_str()) {
             let local = key.contains("return") || key.contains("enter");
             let safe = local && words(intent).iter().any(|w| SAFE_ENTER.contains(&w.as_str()));
@@ -213,7 +294,25 @@ pub fn needs_approval(args: &[String], intent: &str) -> bool {
             return true;
         }
     }
-    no_intent && !BENIGN.contains(&cmd.as_str())
+    strict && no_intent && !BENIGN.contains(&cmd.as_str())
+}
+
+/// "Shift + Ctrl + W" -> "ctrl+shift+w": modifiers in one order, so a combo
+/// matches [`RISKY_KEYS`] however it was written.
+pub(crate) fn canon_key(spec: &str) -> String {
+    const MODS: &[&str] = &["ctrl", "shift", "alt", "cmd"];
+    let mut parts: Vec<String> = spec
+        .split('+')
+        .map(|p| p.trim().to_lowercase())
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.as_str() {
+            "control" => "ctrl".into(),
+            "win" | "meta" | "super" => "cmd".into(),
+            _ => p,
+        })
+        .collect();
+    parts.sort_by_key(|p| MODS.iter().position(|m| m == p).unwrap_or(MODS.len()));
+    parts.join("+")
 }
 
 /// Finds the native agent-desktop binary: configured path, PATH, or the
@@ -298,11 +397,31 @@ pub fn parse(input: &Value) -> Result<(Vec<String>, String), String> {
 
 /// Runs one command and returns its JSON output (truncated for the model).
 pub fn run(exe: &std::path::Path, args: &[String]) -> String {
+    clip(run_full(exe, args))
+}
+
+/// Cuts output down to what the model gets.
+fn clip(mut out: String) -> String {
+    const MAX: usize = 40_000;
+    if out.len() > MAX {
+        let mut cut = MAX;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str(
+            "\n…[truncated: use --root <ref>, --app, -i or --compact to narrow the snapshot]",
+        );
+    }
+    out
+}
+
+/// Runs one command and returns its whole output.
+fn run_full(exe: &std::path::Path, args: &[String]) -> String {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    const MAX: usize = 40_000;
 
     let spawn = |flags: u32| {
         Command::new(exe)
@@ -354,16 +473,6 @@ pub fn run(exe: &std::path::Path, args: &[String]) -> String {
     let mut out = out_t.join().unwrap_or_default();
     if out.trim().is_empty() {
         out = err_t.join().unwrap_or_default();
-    }
-    if out.len() > MAX {
-        let mut cut = MAX;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.truncate(cut);
-        out.push_str(
-            "\n…[truncated: use --root <ref>, --app, -i or --compact to narrow the snapshot]",
-        );
     }
     out
 }
@@ -682,14 +791,64 @@ fn bare_name(target: &str) -> bool {
     !t.is_empty() && !t.contains(['/', '\\', ':', '.', '%'])
 }
 
+/// The web address an `open` target means: an http(s) URL, a known site name
+/// ("youtube") or a host with a web suffix ("example.com/a"), the same way the
+/// palette's [`quick_open`] reads them.
+fn web_target(target: &str) -> Option<String> {
+    let t = target.trim();
+    if web_url(t) {
+        return Some(t.to_string());
+    }
+    if t.contains(['\\', ':']) {
+        return None; // a path or another scheme, never a site
+    }
+    quick_open(&format!("open {t}"))
+        .map(|q| q.target)
+        .filter(|u| web_url(u))
+}
+
 /// Why `open` won't take this target: programs and scripts never run this way.
 fn open_refusal(target: &str) -> Option<String> {
     (!web_url(target) && crate::win::runnable(target.trim()))
         .then(|| format!("open won't run programs or scripts ({})", target.trim()))
 }
 
+/// Runs `open <target>`: a site in the browser, an installed app by its full
+/// path, anything else (already approved) with the default handler.
+fn open_cmd(target: &str) -> Result<String, String> {
+    if let Some(url) = web_target(target) {
+        return open_in(&url, None).map(|()| url);
+    }
+    if let Some(e) = open_refusal(target) {
+        return Err(e);
+    }
+    let t = target.trim();
+    if !bare_name(t) {
+        return open_in(t, None).map(|()| t.to_string());
+    }
+    // A bare name is resolved here, never through this process's current
+    // directory (an agent's folder): the full path of an installed app, or the
+    // name itself from the user's profile folder.
+    let home = std::env::var("USERPROFILE").ok();
+    match crate::win::bare_launch(t) {
+        crate::win::Launch::Installed(p) => {
+            let p = p.to_string_lossy().into_owned();
+            open_in(&p, home.as_deref()).map(|()| p)
+        }
+        crate::win::Launch::Planted(p) if crate::win::runnable(&p.to_string_lossy()) => {
+            Err(format!("open won't run programs or scripts ({})", p.display()))
+        }
+        _ => open_in(t, home.as_deref()).map(|()| t.to_string()),
+    }
+}
+
 /// Opens a URL or app name with the user's default handler.
 pub fn open_target(target: &str) -> Result<(), String> {
+    open_in(target, None)
+}
+
+/// ShellExecute "open", in `dir` when given.
+fn open_in(target: &str, dir: Option<&str>) -> Result<(), String> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -700,13 +859,14 @@ pub fn open_target(target: &str) -> Result<(), String> {
     let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     let t = wide(target);
     let verb = wide("open");
+    let d = dir.map(wide);
     let r = unsafe {
         ShellExecuteW(
             None,
             PCWSTR(verb.as_ptr()),
             PCWSTR(t.as_ptr()),
             PCWSTR::null(),
-            PCWSTR::null(),
+            d.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
             SW_SHOWNORMAL,
         )
     };
@@ -858,15 +1018,13 @@ fn apeiron_focus(args: &[String]) -> Option<String> {
 /// Runs a command inside the conversation's session. Before an action, the
 /// agent's cursor overlay is (re)enabled with the step's intent as its label.
 pub fn exec(exe: &std::path::Path, args: &[String], intent: &str, ctx: &Ctx) -> String {
-    if args.first().is_some_and(|a| a.eq_ignore_ascii_case("open")) {
-        let Some(target) = args.get(1) else {
+    let (cmd, target) = command(args);
+    if cmd == "open" {
+        let Some(target) = target else {
             return json!({"ok": false, "error": {"message": "open needs a URL or app name"}}).to_string();
         };
-        if let Some(e) = open_refusal(target) {
-            return json!({"ok": false, "error": {"message": e}}).to_string();
-        }
-        return match open_target(target) {
-            Ok(()) => json!({"ok": true, "data": {"opened": target}}).to_string(),
+        return match open_cmd(&target) {
+            Ok(opened) => json!({"ok": true, "data": {"opened": opened}}).to_string(),
             Err(e) => json!({"ok": false, "error": {"message": e}}).to_string(),
         };
     }
@@ -907,11 +1065,111 @@ pub fn exec(exe: &std::path::Path, args: &[String], intent: &str, ctx: &Ctx) -> 
             ));
         }
     }
-    let out = run(exe, &args);
+    let out = run_full(exe, &args);
     if args.first().is_some_and(|a| a.eq_ignore_ascii_case("snapshot")) {
         remember_snapshot_window(&ctx.session, &out);
     }
-    out
+    remember_refs(&out, is_read_only(&args));
+    clip(out)
+}
+
+/// What the refs of recent snapshots point at (name, bounds), so approval can
+/// judge the element an action hits instead of only the model's words.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Elem {
+    name: String,
+    bounds: Option<[f64; 4]>,
+}
+
+/// Snapshots kept, newest last.
+const KEEP_SNAPSHOTS: usize = 32;
+
+/// (snapshot id, its refs) for the latest snapshots this process saw.
+static REFS: Mutex<Vec<(String, HashMap<String, Elem>)>> = Mutex::new(Vec::new());
+
+/// Every element carrying a `ref_id` in agent-desktop output.
+fn collect_refs(v: &Value, out: &mut Vec<(String, Elem)>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(r) = m.get("ref_id").and_then(Value::as_str) {
+                let b = m.get("bounds").unwrap_or(&Value::Null);
+                let bounds = match (b["x"].as_f64(), b["y"].as_f64(), b["width"].as_f64(), b["height"].as_f64()) {
+                    (Some(x), Some(y), Some(w), Some(h)) => Some([x, y, w, h]),
+                    _ => None,
+                };
+                let name = m.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                out.push((r.to_string(), Elem { name, bounds }));
+            }
+            m.values().for_each(|c| collect_refs(c, out));
+        }
+        Value::Array(a) => a.iter().for_each(|c| collect_refs(c, out)),
+        _ => {}
+    }
+}
+
+/// "@s8f3k2p9:e8" -> "s8f3k2p9".
+fn snapshot_of(r: &str) -> Option<&str> {
+    r.strip_prefix('@')?.split_once(':').map(|(s, _)| s)
+}
+
+/// Notes the refs in a command's output. Observing commands (snapshot, find,
+/// get...) add refs; an action's output only fills in refs already known, so
+/// a ref the user was asked about once does not become known by being used.
+fn remember_refs(out: &str, observed: bool) {
+    if !out.contains("\"ref_id\"") {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(out) else { return };
+    let mut found = Vec::new();
+    collect_refs(&v, &mut found);
+    let mut snaps = REFS.lock().unwrap();
+    for (r, e) in found {
+        let Some(sid) = snapshot_of(&r) else { continue };
+        let i = match snaps.iter().position(|(s, _)| s == sid) {
+            Some(i) => i,
+            None if observed => {
+                snaps.push((sid.to_string(), HashMap::new()));
+                snaps.len() - 1
+            }
+            None => continue,
+        };
+        let refs = &mut snaps[i].1;
+        let known = match refs.get_mut(&r) {
+            Some(k) => k,
+            None if observed => refs.entry(r).or_default(),
+            None => continue,
+        };
+        if !e.name.is_empty() {
+            known.name = e.name;
+        }
+        if e.bounds.is_some() {
+            known.bounds = e.bounds;
+        }
+    }
+    let over = snaps.len().saturating_sub(KEEP_SNAPSHOTS);
+    snaps.drain(..over);
+}
+
+/// The element name behind a ref; None when no snapshot seen here made it.
+fn ref_name(r: &str) -> Option<String> {
+    let sid = snapshot_of(r)?;
+    let snaps = REFS.lock().unwrap();
+    let (_, refs) = snaps.iter().rev().find(|(s, _)| s == sid)?;
+    refs.get(r).map(|e| e.name.clone())
+}
+
+/// The name of the smallest element at a screen point, from the newest
+/// snapshot that had bounds there (drive mode clicks by coordinates).
+pub(crate) fn element_at(x: i32, y: i32) -> Option<String> {
+    let (x, y) = (x as f64, y as f64);
+    let snaps = REFS.lock().unwrap();
+    snaps.iter().rev().find_map(|(_, refs)| {
+        refs.values()
+            .filter_map(|e| e.bounds.map(|b| (e, b)))
+            .filter(|(_, [bx, by, bw, bh])| x >= *bx && y >= *by && x < bx + bw && y < by + bh)
+            .min_by(|a, b| (a.1[2] * a.1[3]).total_cmp(&(b.1[2] * b.1[3])))
+            .map(|(e, _)| e.name.clone())
+    })
 }
 
 #[cfg(test)]
@@ -932,6 +1190,13 @@ mod tests {
     }
     #[test]
     fn approval_policy() {
+        remember_refs(
+            r#"{"ok":true,"data":{"snapshot_id":"s1","tree":{"role":"window","name":"Outlook","children":[
+                {"role":"listitem","name":"Downloads","ref_id":"@s1:e2"},
+                {"role":"edit","name":"Message","ref_id":"@s1:e3"},
+                {"role":"button","name":"OK","ref_id":"@s1:e9"}]}}}"#,
+            true,
+        );
         let ask = |a: &[&str], i: &str| needs_approval(&v(a), i);
         // reading and everyday actions run right away
         assert!(!ask(&["snapshot", "--app", "Slack"], "Read Slack"));
@@ -954,6 +1219,76 @@ mod tests {
         // no intent of its own: unsure, so ask
         assert!(ask(&["click", "@s1:e2"], "click @s1:e2"));
         assert!(ask(&["press", "return"], ""));
+    }
+    #[test]
+    fn one_parser_for_flags_with_values() {
+        // A flag's value is never the command.
+        assert!(!is_read_only(&v(&["--session", "snapshot", "click", "@s1:e2"])));
+        assert!(!is_read_only(&v(&["--app", "snapshot", "click", "@s1:e2"])));
+        assert!(!is_read_only(&v(&["--max-depth", "find", "close-app", "Word"])));
+        assert!(is_read_only(&v(&["snapshot", "--app", "click", "-i"])));
+        assert!(is_read_only(&v(&["--session", "s", "snapshot", "--surface", "menu"])));
+        assert!(needs_approval(&v(&["--session", "snapshot", "close-app", "Word"]), "Look at Word"));
+        assert_eq!(command(&v(&["--session", "x", "open", "y"])), ("open".into(), Some("y".into())));
+        assert_eq!(command(&v(&["launch", "--cdp", "9222", "Edge"])).1, Some("Edge".into()));
+    }
+    #[test]
+    fn element_names_decide_too() {
+        remember_refs(
+            r#"{"ok":true,"data":{"snapshot_id":"selem","tree":{"role":"window","name":"Shop","children":[
+                {"role":"button","name":"Place order","ref_id":"@selem:e1"},
+                {"role":"button","name":"Next","ref_id":"@selem:e2"},
+                {"role":"edit","name":"Add a comment","ref_id":"@selem:e3"},
+                {"role":"button","name":"","ref_id":"@selem:e4"}]}}}"#,
+            true,
+        );
+        let ask = |a: &[&str], i: &str| needs_approval(&v(a), i);
+        // The model calls it "Continue"; the element says otherwise.
+        assert!(ask(&["click", "@selem:e1"], "Continue"));
+        assert!(ask(&["toggle", "@selem:e1"], "Continue"));
+        assert!(!ask(&["click", "@selem:e2"], "Continue"));
+        assert!(!ask(&["click", "@selem:e4"], "Open the menu"));
+        // Typing into a field is not pressing it.
+        assert!(!ask(&["type", "@selem:e3", "nice"], "Type the note"));
+        // A ref from no snapshot seen here: unsure, so ask.
+        assert!(ask(&["click", "@snever:e1"], "Continue"));
+        assert!(ask(&["click", "@selem:e99"], "Continue"));
+        // An action's output does not make an unknown ref known.
+        remember_refs(r#"{"ok":true,"data":{"element":{"ref_id":"@sact:e1"}}}"#, false);
+        assert!(ref_name("@sact:e1").is_none());
+        // `get` fills in bounds; drive finds the smallest element at a point.
+        remember_refs(
+            r#"{"ok":true,"data":{"ref_id":"@selem:e1","bounds":{"x":5000.0,"y":5000.0,"width":40.0,"height":20.0}}}"#,
+            true,
+        );
+        remember_refs(
+            r#"{"ok":true,"data":{"ref_id":"@selem:e2","bounds":{"x":4900.0,"y":4900.0,"width":400.0,"height":400.0}}}"#,
+            true,
+        );
+        assert_eq!(ref_name("@selem:e1").as_deref(), Some("Place order"));
+        assert_eq!(element_at(5010, 5010).as_deref(), Some("Place order"));
+        assert_eq!(element_at(5200, 5200).as_deref(), Some("Next"));
+        assert_eq!(element_at(-9000, -9000), None);
+    }
+    #[test]
+    fn keys_match_however_written() {
+        assert_eq!(canon_key("Shift + Ctrl + W"), "ctrl+shift+w");
+        assert_eq!(canon_key("F4+alt"), "alt+f4");
+        assert!(needs_approval(&v(&["press", "shift+ctrl+w"]), "Leave the tab"));
+        assert!(needs_approval(&v(&["press", "F4+Alt"]), "Leave the app"));
+    }
+    #[test]
+    fn open_reads_sites_like_the_palette() {
+        let w = |t| web_target(t);
+        assert_eq!(w("youtube").as_deref(), Some("https://www.youtube.com"));
+        assert_eq!(w("youtube.com").as_deref(), Some("https://youtube.com"));
+        assert_eq!(w("HTTPS://example.com/a").as_deref(), Some("HTTPS://example.com/a"));
+        for t in ["notepad", "payload", "report.docx", "x.bat", r"\\srv\share\x.com", "C:x.com", "ms-settings:display"] {
+            assert_eq!(w(t), None, "{t}");
+        }
+        // Sites never ask, whatever files sit around.
+        assert!(!needs_approval(&v(&["open", "youtube"]), "Open YouTube"));
+        assert!(!needs_approval(&v(&["open", "youtube.com"]), "Open YouTube"));
     }
     #[test]
     fn open_and_launch_policy() {

@@ -14,6 +14,7 @@
 //! (so `show` can focus them).
 
 use super::{AgentEvent, Sink};
+use crate::desktop::command;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -232,46 +233,6 @@ impl Book {
         }
         out
     }
-}
-
-/// Flags of agent-desktop commands that take a value.
-const VALUED: &[&str] = &[
-    "--timeout",
-    "--arg",
-    "--env",
-    "--cwd",
-    "--session",
-    "--agent-id",
-    "--trace",
-    "--screenshot",
-    "-w",
-    "--wait-for",
-    "--wait-for-gone",
-    "--wait-timeout",
-    "--app",
-    "--window",
-];
-
-/// The command and its first positional argument (flag values skipped).
-fn command(args: &[String]) -> (String, Option<String>) {
-    let mut pos = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a.starts_with('-') {
-            let takes = VALUED.contains(&a.as_str())
-                || (a == "--cdp" && args.get(i + 1).is_some_and(|n| n.parse::<u16>().is_ok()));
-            i += if takes && !a.contains('=') { 2 } else { 1 };
-            continue;
-        }
-        pos.push(a.clone());
-        i += 1;
-    }
-    let mut it = pos.into_iter();
-    (
-        it.next().map(|s| s.to_lowercase()).unwrap_or_default(),
-        it.next(),
-    )
 }
 
 /// A pid anywhere in agent-desktop's JSON output (`pid`, `process_id`, `processId`).

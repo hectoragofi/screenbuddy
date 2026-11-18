@@ -145,6 +145,9 @@ pub trait Input: Send {
 pub trait Ui: Send + Sync {
     fn name(&self) -> String;
     fn ask(&self, text: &str, detail: &str) -> bool;
+    /// One risky step, through the same policy as `desktop` actions
+    /// (always-approve, an earlier "yes to all", or ask now).
+    fn approve(&self, text: &str, detail: &str) -> bool;
     fn event(&self, ev: DriveEvent);
     fn stopped(&self) -> bool;
 }
@@ -169,7 +172,7 @@ pub enum Action {
     Stop,
 }
 
-pub(crate) const DESC: &str = "Use the user's REAL mouse and keyboard while they watch. Only when the user explicitly asked to watch you do it ('show me', 'do it while I watch', 'do it on my screen'); otherwise always work in the background with `desktop`. The first call asks the user for permission; if the user touches the mouse or keyboard you're paused until they let you continue. Coordinates are physical screen pixels (from `desktop` bounds or a screenshot). Actions: move, click (button left|right|middle, double), type (text), press (keys like 'ctrl+s'), scroll (amount: +down/-up notches), stop (give control back when you're done driving). `why` is shown to the user in the permission prompt.";
+pub(crate) const DESC: &str = "Use the user's REAL mouse and keyboard while they watch. Only when the user explicitly asked to watch you do it ('show me', 'do it while I watch', 'do it on my screen'); otherwise always work in the background with `desktop`. The first call asks the user for permission; steps that delete, close, send, submit or pay (keys like Enter or Alt+F4 included) ask again; if the user touches the mouse or keyboard you're paused until they let you continue. Coordinates are physical screen pixels (from `desktop` bounds or a screenshot). Actions: move, click (button left|right|middle, double), type (text), press (keys like 'ctrl+s'), scroll (amount: +down/-up notches), stop (give control back when you're done driving). `why` is shown to the user in the permission prompt.";
 
 pub(crate) fn schema() -> Value {
     json!({
@@ -275,6 +278,67 @@ pub fn keys(spec: &str) -> Result<Vec<u16>, String> {
     }
     Ok(out)
 }
+
+/// "ctrl+w" back from virtual-key codes (the names `keys` reads).
+fn key_spec(vks: &[u16]) -> String {
+    let name = |vk: u16| -> String {
+        match vk {
+            0x11 => "ctrl".into(),
+            0x10 => "shift".into(),
+            0x12 => "alt".into(),
+            0x5B => "win".into(),
+            0x0D => "enter".into(),
+            0x09 => "tab".into(),
+            0x1B => "esc".into(),
+            0x20 => "space".into(),
+            0x08 => "backspace".into(),
+            0x2E => "delete".into(),
+            0x2D => "insert".into(),
+            0x24 => "home".into(),
+            0x23 => "end".into(),
+            0x21 => "pageup".into(),
+            0x22 => "pagedown".into(),
+            0x25 => "left".into(),
+            0x26 => "up".into(),
+            0x27 => "right".into(),
+            0x28 => "down".into(),
+            0x70..=0x87 => format!("f{}", vk - 0x6F),
+            _ => char::from(vk as u8).to_ascii_lowercase().to_string(),
+        }
+    };
+    vks.iter().map(|&k| name(k)).collect::<Vec<_>>().join("+")
+}
+
+/// What the step does, for the approval prompt.
+fn summary(a: &Action) -> String {
+    match a {
+        Action::Click { x: Some(x), y: Some(y), .. } => format!("click at {x},{y}"),
+        Action::Click { .. } => "click".into(),
+        Action::Type(t) => {
+            let short: String = t.chars().take(80).collect();
+            format!("type \"{}\"", short.trim_end())
+        }
+        Action::Press(k) => format!("press {}", key_spec(k)),
+        Action::Move(..) | Action::Scroll { .. } | Action::Stop => String::new(),
+    }
+}
+
+/// The `desktop` risk check for a drive step: the `why`, the key pressed, typed
+/// text that presses Enter, and the element under a click when a snapshot
+/// showed it. Moves and scrolls never ask.
+pub fn risky(a: &Action, why: &str, element: Option<&str>) -> bool {
+    let args: Vec<String> = match a {
+        Action::Move(..) | Action::Scroll { .. } | Action::Stop => return false,
+        Action::Click { .. } => vec!["click".into()],
+        // Every newline is a real Enter press, so it counts as a submitting one.
+        Action::Type(t) if t.contains(['\n', '\r']) => vec!["type".into(), format!("{t}\n")],
+        Action::Type(t) => vec!["type".into(), t.clone()],
+        Action::Press(k) => vec!["press".into(), key_spec(k)],
+    };
+    crate::desktop::risky_step(&args, why, element)
+}
+
+pub(crate) const STEP_DECLINED: &str = "The user declined this step. Don't retry it; find another way or stop and say so.";
 
 /// Mouse glide: this many steps, this far apart.
 const GLIDE_STEPS: i32 = 14;
@@ -442,6 +506,21 @@ impl Session {
         if let Err(e) = self.ensure(ui, why) {
             return (e, true);
         }
+        // Driving was allowed; a step that deletes, sends or pays still asks.
+        let element = match action {
+            Action::Click { x, y, .. } => {
+                let (x, y) = x.zip(*y).unwrap_or_else(|| input.cursor());
+                crate::desktop::element_at(x, y)
+            }
+            _ => None,
+        };
+        if risky(action, why, element.as_deref()) {
+            let s = summary(action);
+            let text = if why.is_empty() { &s } else { why };
+            if !ui.approve(text, &format!("drive {s}")) {
+                return (STEP_DECLINED.into(), true);
+            }
+        }
         let mut seq = ops(action, input.cursor());
         let mut i = 0;
         while i < seq.len() {
@@ -530,6 +609,9 @@ impl Ui for Sink {
             Sink::ask(self, AskKind::Approval, text, detail, Vec::new()),
             Answer::Allow | Answer::AllowOnce
         )
+    }
+    fn approve(&self, text: &str, detail: &str) -> bool {
+        Sink::approve(self, text, detail)
     }
     fn event(&self, ev: DriveEvent) {
         match ev {
@@ -1099,6 +1181,9 @@ mod tests {
             self.asked.lock().unwrap().push(text.into());
             self.answers.lock().unwrap().pop().unwrap_or(false)
         }
+        fn approve(&self, text: &str, detail: &str) -> bool {
+            self.ask(&format!("approve: {text} ({detail})"), "")
+        }
         fn event(&self, ev: DriveEvent) {
             self.events.lock().unwrap().push(ev);
         }
@@ -1299,6 +1384,54 @@ mod tests {
         assert!(!err);
         assert_eq!(inp.sent.len(), n + 4);
         assert_eq!(ui.asked.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn risky_steps_ask_again() {
+        let click = Action::Click { x: Some(1), y: Some(1), button: Button::Left, double: false };
+        // Routine moves, clicks, typing and keys stay quiet.
+        assert!(!risky(&Action::Move(5, 5), "Delete everything", None));
+        assert!(!risky(&click, "", None));
+        assert!(!risky(&click, "Open the File menu", Some("File")));
+        assert!(!risky(&Action::Type("I'll send it".into()), "", None));
+        assert!(!risky(&Action::Press(keys("ctrl+s").unwrap()), "", None));
+        assert!(!risky(&Action::Press(keys("enter").unwrap()), "Run the search", None));
+        // The why, the key, a submitting newline, or the element under the click.
+        assert!(risky(&click, "Click Send", None));
+        assert!(risky(&click, "Continue", Some("Pay now")));
+        assert!(risky(&Action::Press(keys("alt+f4").unwrap()), "", None));
+        assert!(risky(&Action::Press(keys("shift+ctrl+w").unwrap()), "", None));
+        assert!(risky(&Action::Press(keys("delete").unwrap()), "", None));
+        assert!(risky(&Action::Press(keys("enter").unwrap()), "", None));
+        assert!(risky(&Action::Type("see you
+".into()), "", None));
+        assert!(risky(&Action::Type("a
+b".into()), "Write a note", None));
+        assert_eq!(key_spec(&keys("ctrl+shift+F4").unwrap()), "ctrl+shift+f4");
+    }
+
+    #[test]
+    fn risky_step_after_the_drive_yes() {
+        let s = Session::default();
+        // Drive yes, then no to the Enter press: nothing typed for it.
+        let ui = FakeUi::new(&[true, false, true]);
+        let mut inp = fake(&s, None);
+        let (_, err) = s.run(&ui, &mut inp, &Action::Type("hi".into()), "");
+        assert!(!err);
+        let n = inp.sent.len();
+        let (t, err) = s.run(&ui, &mut inp, &Action::Press(vec![0x0D]), "");
+        assert!(err);
+        assert_eq!(t, STEP_DECLINED);
+        assert_eq!(inp.sent.len(), n);
+        assert_eq!(s.state(), State::Driving); // only that step was refused
+        // A yes lets it through.
+        let (_, err) = s.run(&ui, &mut inp, &Action::Press(vec![0x12, 0x73]), "Leave the app");
+        assert!(!err);
+        assert_eq!(inp.sent.len(), n + 4);
+        let asked = ui.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 3);
+        assert_eq!(asked[1], "approve: press enter (drive press enter)");
+        assert_eq!(asked[2], "approve: Leave the app (drive press alt+f4)");
     }
 
     #[test]

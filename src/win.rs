@@ -306,8 +306,141 @@ pub fn shell_open(path: &std::path::Path) {
 /// installers, registry merges).
 const RUNNABLE_EXTS: &[&str] = &[
     "exe", "bat", "cmd", "com", "scr", "pif", "lnk", "js", "jse", "vbs", "vbe", "wsf", "wsh",
-    "hta", "ps1", "msi", "msp", "cpl", "jar", "reg", "url",
+    "hta", "ps1", "msi", "msp", "cpl", "jar", "reg", "url", "msc",
 ];
+
+/// What a bare name ("notepad") would start through ShellExecute.
+#[derive(Debug, PartialEq)]
+pub enum Launch {
+    /// An installed app: App Paths or a PATH folder, outside the places agents write.
+    Installed(std::path::PathBuf),
+    /// Something of that name sits where an agent can write (the current
+    /// directory, screenbuddy's data and agent folders, temp): maybe planted.
+    Planted(std::path::PathBuf),
+    /// Nothing known.
+    Unknown,
+}
+
+/// `path` lies in (or is) `dir`, compared the way Windows does (case-blind,
+/// either slash, `..` resolved where the path exists).
+fn under(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = p.to_string_lossy().to_lowercase().replace('/', "\\");
+        s.strip_prefix(r"\\?\").unwrap_or(&s).trim_end_matches('\\').to_string()
+    };
+    let (p, d) = (norm(path), norm(dir));
+    !d.is_empty() && (p == d || p.starts_with(&format!("{d}\\")))
+}
+
+/// Where `name` would come from, in ShellExecute's places: the `writable`
+/// folders first (anything of that name there, bare or with an executable or
+/// runnable extension, counts as planted), then the App Paths entry, then each
+/// absolute `path` folder with an extension from `exts` (PATHEXT: "exe"...).
+pub fn locate(
+    name: &str,
+    writable: &[std::path::PathBuf],
+    app_path: Option<std::path::PathBuf>,
+    path: &[std::path::PathBuf],
+    exts: &[String],
+) -> Launch {
+    // App execution aliases (WindowsApps) are reparse points `metadata` can't follow.
+    let exists = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok();
+    let with_ext = |d: &std::path::Path, exts: &mut dyn Iterator<Item = &str>| {
+        exts.map(|e| d.join(format!("{name}.{e}"))).find(|p| exists(p))
+    };
+    for w in writable {
+        let bare = w.join(name);
+        if exists(&bare) {
+            return Launch::Planted(bare);
+        }
+        let mut any = exts.iter().map(String::as_str).chain(RUNNABLE_EXTS.iter().copied());
+        if let Some(p) = with_ext(w, &mut any) {
+            return Launch::Planted(p);
+        }
+    }
+    let inside = |p: &std::path::Path| writable.iter().any(|w| under(p, w));
+    if let Some(p) = app_path.filter(|p| p.is_absolute() && exists(p)) {
+        return if inside(&p) {
+            Launch::Planted(p)
+        } else {
+            Launch::Installed(p)
+        };
+    }
+    for d in path.iter().filter(|d| d.is_absolute() && !inside(d)) {
+        if let Some(p) = with_ext(d, &mut exts.iter().map(String::as_str)) {
+            return Launch::Installed(p);
+        }
+    }
+    Launch::Unknown
+}
+
+/// The App Paths registration for `name`.exe (per user, then machine).
+fn app_path(name: &str) -> Option<std::path::PathBuf> {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    let key = format!(r"Software\Microsoft\Windows\CurrentVersion\App Paths\{name}.exe");
+    [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE].into_iter().find_map(|root| {
+        let v: String = RegKey::predef(root).open_subkey(&key).ok()?.get_value("").ok()?;
+        Some(std::path::PathBuf::from(expand_env(v.trim().trim_matches('"'))))
+    })
+}
+
+/// "%ProgramFiles%\x" -> "C:\Program Files\x" (REG_EXPAND_SZ values).
+fn expand_env(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('%') {
+            Some(j) => {
+                match std::env::var(&after[..j]) {
+                    Ok(v) => out.push_str(&v),
+                    Err(_) => out.push_str(&rest[i..i + j + 2]),
+                }
+                rest = &after[j + 1..];
+            }
+            None => {
+                out.push_str(&rest[i..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// [`locate`] with this machine's folders. Writable places are the current
+/// directory (an agent's folder in its `--mcp` child), screenbuddy's data
+/// folder (all agent folders) and temp, unless one is under Windows or
+/// Program Files (an autostart's System32, say).
+pub fn bare_launch(name: &str) -> Launch {
+    let env = |k: &str| std::env::var_os(k).map(std::path::PathBuf::from);
+    let protected: Vec<std::path::PathBuf> = ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|k| env(k))
+        .collect();
+    let writable: Vec<std::path::PathBuf> = [
+        std::env::current_dir().ok(),
+        Some(crate::config::data_dir()),
+        Some(std::env::temp_dir()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|w| !protected.iter().any(|p| under(w, p)))
+    .collect();
+    let path: Vec<std::path::PathBuf> = env("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC".into())
+        .split(';')
+        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    locate(name, &writable, app_path(name), &path, &exts)
+}
 
 /// True when opening `target` would run code: its file name (or any NTFS
 /// stream name after a `:`) has a runnable extension. Windows drops trailing
@@ -403,5 +536,55 @@ mod tests {
         ] {
             assert!(!runnable(t), "{t}");
         }
+    }
+    #[test]
+    fn bare_names_resolve_outside_agent_folders() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("screenbuddy-locate-{n}"));
+        let (work, bin, app) = (root.join("agent"), root.join("bin"), root.join("App"));
+        for d in [&work, &bin, &app] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(work.join("payload.bat"), b"x").unwrap();
+        std::fs::write(work.join("notes"), b"x").unwrap();
+        std::fs::write(work.join("tool.exe"), b"x").unwrap();
+        std::fs::write(bin.join("tool.exe"), b"x").unwrap();
+        std::fs::write(bin.join("editor.cmd"), b"x").unwrap();
+        std::fs::write(app.join("Spot.exe"), b"x").unwrap();
+        let exts: Vec<String> = ["com", "exe", "bat", "cmd"].iter().map(|s| s.to_string()).collect();
+        let writable = std::slice::from_ref(&work);
+        let path = [std::path::PathBuf::from("."), work.clone(), bin.clone()];
+        let at = |name: &str, app_path: Option<std::path::PathBuf>| {
+            locate(name, writable, app_path, &path, &exts)
+        };
+        // Planted in the agent's folder: never "installed", even when PATH has one too.
+        assert_eq!(at("payload", None), Launch::Planted(work.join("payload.bat")));
+        assert_eq!(at("notes", None), Launch::Planted(work.join("notes")));
+        assert_eq!(at("tool", None), Launch::Planted(work.join("tool.exe")));
+        // Installed: a PATH folder outside the writable ones, or App Paths.
+        assert_eq!(at("editor", None), Launch::Installed(bin.join("editor.cmd")));
+        assert_eq!(at("spot", Some(app.join("Spot.exe"))), Launch::Installed(app.join("Spot.exe")));
+        // An App Paths entry pointing into an agent folder is no install.
+        let sneaky = work.join("SUB").join("x.exe");
+        std::fs::create_dir_all(sneaky.parent().unwrap()).unwrap();
+        std::fs::write(&sneaky, b"x").unwrap();
+        assert_eq!(at("spot", Some(sneaky.clone())), Launch::Planted(sneaky));
+        // Nothing known, or a relative registration.
+        assert_eq!(at("nothing", None), Launch::Unknown);
+        assert_eq!(at("nothing", Some("x.exe".into())), Launch::Unknown);
+        assert!(under(&work.join("a"), &std::path::PathBuf::from(work.to_string_lossy().to_uppercase().replace('\\', "/"))));
+        assert!(!under(&root.join("agent2"), &work));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn expands_registry_paths() {
+        // SAFETY: test-only, single variable no other test reads.
+        unsafe { std::env::set_var("SB_TEST_DIR", r"C:\Apps") };
+        assert_eq!(expand_env(r"%SB_TEST_DIR%\x.exe"), r"C:\Apps\x.exe");
+        assert_eq!(expand_env(r"%SB_NOPE_X%\x.exe"), r"%SB_NOPE_X%\x.exe");
+        assert_eq!(expand_env("50%"), "50%");
     }
 }
