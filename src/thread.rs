@@ -301,7 +301,18 @@ fn path() -> PathBuf {
     crate::config::data_dir().join("thread.json")
 }
 
+/// The thread while History is off: kept in memory for this run only.
+static MEM: Mutex<Option<Thread>> = Mutex::new(None);
+
+/// History off means nothing about the conversation is written to disk.
+fn on_disk() -> bool {
+    crate::config::load().0.history
+}
+
 pub fn load() -> Thread {
+    if !on_disk() {
+        return MEM.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    }
     std::fs::read_to_string(path())
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -310,6 +321,12 @@ pub fn load() -> Thread {
 
 fn save(t: &Thread) {
     let p = path();
+    if !on_disk() {
+        *MEM.lock().unwrap_or_else(|e| e.into_inner()) = Some(t.clone());
+        // Turning History off also drops what was saved before.
+        let _ = std::fs::remove_file(&p);
+        return;
+    }
     let tmp = p.with_extension("json.tmp");
     let ok = serde_json::to_string(t)
         .map_err(std::io::Error::other)
